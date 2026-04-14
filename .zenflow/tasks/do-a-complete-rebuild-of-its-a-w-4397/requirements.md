@@ -24,39 +24,47 @@ The app is purely client-side (no backend), using `localStorage` for persistence
 
 The following bugs and defects have been identified in the current codebase and must be resolved in the rebuild:
 
-### Critical
+### Critical (User-Reported)
 
-1. **`sanitizeFilenamePart` duplication** — The function is defined both inside `app.js` (line ~528) and exported from `recording-utils.js`. The `app.js` copy is not imported from `recording-utils.js`, creating two inconsistent implementations. The rebuild must use a single source of truth (imported from `recording-utils.js`).
+1. **Credential import does not save** — When the Import Credentials modal is opened on the Joe Fortune or Ignition tab, the user pastes credentials and clicks confirm, but nothing is saved to the list. Root causes to investigate and fix:
+   - `state.importCredSite` may not be set at the time `confirmImportCred` runs (e.g. if the modal was opened without correctly setting the site context)
+   - `onImportCredInput` may fail to recognise pasted credential formats, leaving `importCredParsed` empty so the confirm button stays permanently disabled
+   - The event binding for `confirmImportCred` must be verified to fire on the correct element
+   - After saving, `renderAll()` must reflect the newly added credentials immediately
+   - **Fix requirement**: Any credential text pasted in the format `user:pass`, `user|pass`, `user;pass`, `user,pass`, or `user\tpass` must be parsed, previewed with a count, and persisted on confirm. Empty lines and comment lines (`#`) must be silently skipped. The confirm button must be enabled as soon as at least one valid credential is detected.
 
-2. **Excessive `renderAll()` calls in hot loops** — `renderAll()` calls every render function (dashboard, cards, working, joe, ignition, sessions, settings) on every single card/credential check iteration. For lists of 50+ cards at 7 concurrent workers, this causes severe UI jank and blocking. The rebuild must debounce or throttle render calls during active run loops, and use targeted renders where possible.
+2. **Debug screenshots show the webapp UI, not automation results** — The current implementation uses `html2canvas` to capture the app's own DOM (the credentials list tab). This is meaningless because it shows the same UI the user already sees — it does not show what happened during the simulated automation check or why a result was returned. Users expect debug screenshots to explain the outcome.
+   - **Fix requirement**: Remove the html2canvas-based "debug screenshot" feature entirely. Replace it with a **Simulation Result Detail** system: after each check (PPSR or login), store a structured result record containing the credential/card tested, the outcome reason string, the simulated URL visited, the timestamp, and the duration. These result records must be displayed in the Debug Screenshots modal as formatted cards (not images), clearly showing the outcome reason and what the simulated engine reported. This gives users meaningful insight into results without misleading "screenshots" of their own app.
 
-3. **`AbortSignal.timeout()` browser compatibility** — `detectIP()` uses `AbortSignal.timeout(4000)` which is not supported in Safari <16. Must use a compatible fallback (manual `AbortController` + `setTimeout`).
+3. **`sanitizeFilenamePart` duplication** — Defined both inside `app.js` and exported from `recording-utils.js` without being imported. The rebuild must use a single source of truth (imported from `recording-utils.js`).
 
-4. **Recording `recorder.onstop` race** — If `recorder.state` is already `'inactive'` when `stopRunRecording` is called, `finalize()` is called synchronously which is correct, but the `state.recordingActive` is not cleared before `finalize` runs, risking re-entrant calls. Must ensure `state.recordingActive = null` is set atomically before finalizing.
+4. **Excessive `renderAll()` calls in hot loops** — `renderAll()` calls every render function on every single card/credential check iteration. For large lists this causes severe UI jank. The rebuild must debounce/throttle render calls during active run loops and use targeted renders where possible.
 
-5. **File import only handles cards** — The "Import File" button in Settings only parses cards (`smartParseCards`) from the file. It should also attempt to detect credential format and ask the user which type to import, or at minimum document that it is card-only.
+5. **`AbortSignal.timeout()` browser compatibility** — Used in `detectIP()`, not supported in Safari <16. Must use a compatible fallback (manual `AbortController` + `setTimeout`).
 
-6. **Export All Logins only exports working credentials** — `exportAllCredsBtn` filters `creds.filter(c => c.status === CredStatus.WORKING)`. This is confusing since the label says "Export All Logins". Either the label should say "Export Working Logins" or it should export all (separate requirement below).
+6. **Recording `recorder.onstop` race** — `state.recordingActive` is not cleared before `finalize()` runs, risking re-entrant calls. Must set `state.recordingActive = null` atomically before finalizing.
+
+7. **File import only handles cards** — The "Import File" button in Settings only runs `smartParseCards`. Must label clearly as card-only or prompt user for import type.
+
+8. **"Export All Logins" label misleading** — The button only exports working credentials. Must be relabelled "Export Working Logins".
 
 ### Non-Critical / Hardening
 
-7. **No guard against corrupted `Set` state after reload** — `state.selectedCardIds`, `state.selectedJoeIds`, `state.selectedIgnIds` are `Set` instances that are reset on each boot, which is correct. However if `renderAll()` is called before `wireEvents()` completes, a DOM reference may be null. Boot order must be guaranteed.
+9. **Boot order not guaranteed** — If `renderAll()` fires before `wireEvents()` completes, a DOM reference may be null. Boot order must be strictly: `loadAll()` → `wireEvents()` → `renderAll()`.
 
-8. **`saveDebugShots` localStorage quota handling** — The current code catches quota errors and trims to 6. However the second `setItem` attempt inside the catch is also not guarded against failure. Must use a recursive trim-and-retry.
+10. **`saveDebugShots` quota handling incomplete** — The second `setItem` attempt inside the catch block is not guarded. Must use recursive trim-and-retry.
 
-9. **`maskedNumber` edge case** — For cards with length exactly 9 (≤8 check), the function returns the full number unmasked. Should mask any card with length > 8.
+11. **`maskedNumber` edge case** — Cards with exactly 9 digits are returned unmasked (condition is `<= 8`). Must mask any card with length > 8.
 
-10. **`cardPipe` used in display** — Working cards show the full card number in pipe format (`cardPipe`) in the Working tab. This is intentional (user needs to copy them) but the tooltip says "Click to copy" yet it only fires on the `<li>` level, not on specific copy buttons. The UX should be consistent.
+12. **`testHistory` field inconsistency** — Card history uses `h.result`; credential history uses `h.status`. Must standardize per entity type throughout all renders.
 
-11. **`testHistory` references `h.result` vs `h.status`** — Card test history entries use `h.result` (line ~1045) but credential test history entries use `h.status` (line ~1143). Both patterns exist. The rebuild must standardize on one field name per entity type and ensure all renders use the correct field.
+13. **Activity log not persisted** — `state.activity` is never written to localStorage. Must persist it (capped at 100 entries).
 
-12. **Activity log not persisted** — `state.activity` is never saved to localStorage, so the dashboard "Recent Activity" list is lost on reload. Must either persist it or explicitly accept this as by-design.
+14. **`ipBanner` IP validation missing** — Any truthy string from the API triggers the banner. Must validate it is a real IP before displaying.
 
-13. **`ipBanner` shown even if fetch resolves with non-IP** — The detectIP function only checks `if (ip)` which is truthy for any non-empty string. Should validate that `ip` is a valid IP address format before displaying.
+15. **`simulateLogin` uses display name in seed** — Seed generation uses `siteName` ("Joe Fortune") instead of stable ID (`'joe'`). Must use the stable ID so results are deterministic regardless of label changes.
 
-14. **`simulateLogin` site parameter** — `simulateLogin(cred, siteName, loginUrl)` receives `siteName` (e.g., "Joe Fortune") as the `site` parameter but later uses it in seed generation. This seed should remain deterministic regardless of display name changes, so the seed must use the stable site ID (`'joe'` / `'ign'`), not the display name.
-
-15. **`stopRun` / `stopLoginChecks` do not await recording stop** — Both use `void stopRunRecording(...)` (fire-and-forget). If the blob is still being finalized when the user immediately imports new cards, partial data may be appended. Must await the recording stop.
+16. **`stopRun` / `stopLoginChecks` fire-and-forget recording stop** — Both use `void stopRunRecording(...)`. Must await to prevent partial blob corruption.
 
 ---
 
@@ -124,16 +132,16 @@ The rebuilt app must preserve all existing functionality:
 - Confirm modal (generic, reusable)
 - Progress overlay (shown during runs with %, working/dead counts, Stop button)
 - Run Recordings modal (list of recordings with open/download/clear)
-- Debug Screenshots modal (grid with open/download/clear)
+- Simulation Result Details modal (replaces Debug Screenshots): shows structured result cards per check — card/credential tested, outcome reason, simulated URL, timestamp, duration. No images. Accessible via the "Screenshots" button in Sessions tab (button relabelled "Results").
 
 ### Cross-cutting
 - Dark/Light/System theme with persistence
 - Toast notifications (info, success, error)
 - Keyboard shortcut: Escape closes the top-most open modal
 - IP detection banner (dismissible)
-- localStorage persistence for: cards, sessions, credentials (joe + ign), settings, API key, debug screenshots
+- localStorage persistence for: cards, sessions, credentials (joe + ign), settings, API key, simulation result details (capped at 50 entries)
 - Run recordings via MediaRecorder API (falls back gracefully if unavailable)
-- Debug screenshots via html2canvas (falls back gracefully if unavailable)
+- No html2canvas dependency — the debug screenshot system is removed entirely
 - All concurrency runs use an AbortController so they can be stopped mid-run
 - Cards in `TESTING` state are reset to `UNTESTED` when a run is stopped
 
