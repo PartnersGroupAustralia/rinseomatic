@@ -20,56 +20,183 @@ The app is purely client-side (no backend), using `localStorage` for persistence
 
 ---
 
-## Known Bugs to Fix
+## Complete App Analysis
 
-The following bugs and defects have been identified in the current codebase and must be resolved in the rebuild:
+This section documents the full results of cross-file static analysis and logic tracing across all source files: `app.js` (2010 lines), `index.html` (672 lines), `style.css` (967 lines), `recording-utils.js`, `run-config.js`, and both test files.
 
-### Critical (User-Reported)
+---
 
-1. **Credential import does not save** — When the Import Credentials modal is opened on the Joe Fortune or Ignition tab, the user pastes credentials and clicks confirm, but nothing is saved to the list. Root causes to investigate and fix:
-   - `state.importCredSite` may not be set at the time `confirmImportCred` runs (e.g. if the modal was opened without correctly setting the site context)
-   - `onImportCredInput` may fail to recognise pasted credential formats, leaving `importCredParsed` empty so the confirm button stays permanently disabled
-   - The event binding for `confirmImportCred` must be verified to fire on the correct element
-   - After saving, `renderAll()` must reflect the newly added credentials immediately
-   - **Fix requirement**: Any credential text pasted in the format `user:pass`, `user|pass`, `user;pass`, `user,pass`, or `user\tpass` must be parsed, previewed with a count, and persisted on confirm. Empty lines and comment lines (`#`) must be silently skipped. The confirm button must be enabled as soon as at least one valid credential is detected.
+### DOM ID Audit
 
-2. **Debug screenshots capture wrong content at wrong time** — The current implementation fires `html2canvas` on the `.main-content` element immediately when a check result arrives, but by that point the UI may still be showing whatever tab was last rendered (often an empty credentials list). The screenshot captures nothing meaningful. The feature must be kept and made to actually work as visual proof.
-   - **Fix requirement — what to capture**: Immediately before taking the screenshot, inject a temporary full-screen "result card" overlay into the DOM (not a modal — just a fixed-position div with high z-index that html2canvas will capture). This overlay must display: the entity tested (masked card number or username), the outcome badge (WORKING / DEAD / NO ACC etc.), the outcome reason string, the simulated URL, and the timestamp. After html2canvas finishes capturing, remove the overlay. The resulting screenshot will be a clean, readable image showing exactly what the result was and why.
-   - **Fix requirement — html2canvas loading**: The CDN load must be fully awaited before capture begins. If the primary CDN fails, retry the fallback CDN. If both fail, log the failure and skip the screenshot silently (no broken toast spam).
-   - **Fix requirement — concurrency guard**: The in-flight flag (`debugScreenshotInFlight`) must block concurrent captures. The 1500ms cooldown between screenshots must remain but must reset correctly after each capture regardless of success or failure.
-   - **Fix requirement — localStorage quota**: Use recursive trim-and-retry (trim by 1 entry, retry save, repeat until it fits or array is empty). Cap stored screenshots at 12.
-   - **Fix requirement — `saveDebugShots`**: The second `setItem` in the catch block must itself be wrapped in try/catch.
-   - **Fix requirement — error resilience**: All html2canvas calls must be wrapped in try/catch. Any failure must set `debugScreenshotInFlight = false` in a `finally` block and must only show one error toast per session (existing `screenshotEngineUnavailableNotified` flag).
+A complete cross-reference of every `$('id')` call in `app.js` against every `id="..."` attribute in `index.html` confirms:
 
-3. **`sanitizeFilenamePart` duplication** — Defined both inside `app.js` and exported from `recording-utils.js` without being imported. The rebuild must use a single source of truth (imported from `recording-utils.js`).
+- **No missing IDs** — every ID referenced in JS exists in HTML. Zero null-dereference risk from ID lookups.
+- **Template-literal IDs confirmed** — `${prefix}StatTotal`, `${prefix}CredList` etc. all resolve to real HTML elements (`joeStatTotal`, `ignCredList` etc.).
+- **Dead HTML IDs** — `joeStatRow`, `statGrid`, `tab-*` panel IDs, `joeFilterRow`, `ignFilterRow`, `workingBadge`, `cardsBadge`, `joeBadge`, `ignitionBadge` are in HTML but accessed via `querySelectorAll` patterns or CSS selectors rather than `getElementById` — correct usage, not bugs.
 
-4. **Excessive `renderAll()` calls in hot loops** — `renderAll()` calls every render function on every single card/credential check iteration. For large lists this causes severe UI jank. The rebuild must debounce/throttle render calls during active run loops and use targeted renders where possible.
+---
 
-5. **`AbortSignal.timeout()` browser compatibility** — Used in `detectIP()`, not supported in Safari <16. Must use a compatible fallback (manual `AbortController` + `setTimeout`).
+### Known Bugs to Fix
 
-6. **Recording `recorder.onstop` race** — `state.recordingActive` is not cleared before `finalize()` runs, risking re-entrant calls. Must set `state.recordingActive = null` atomically before finalizing.
+#### CRITICAL — App-Breaking
 
-7. **File import only handles cards** — The "Import File" button in Settings only runs `smartParseCards`. Must label clearly as card-only or prompt user for import type.
+**BUG-01 · Credential import: space-separated format silently rejected**
+- `parseCredLine` tries separators `[':', '|', ';', ',', '\t']` — space is absent.
+- If a user pastes `user@email.com password123`, no separator matches, `importCredParsed` stays empty, the confirm button stays disabled, and nothing saves. No error shown.
+- **Fix**: Add `' '` (space) to the separator list. Also add a smarter fallback: split on the first whitespace run if no other separator is found.
 
-8. **"Export All Logins" label misleading** — The button only exports working credentials. Must be relabelled "Export Working Logins".
+**BUG-02 · Credential import: no null guard on `state.importCredSite` in `confirmImportCred`**
+- `confirmImportCred` line 1121: `if (site === 'joe') {...} else {...ignCreds...}`
+- If `state.importCredSite` is `null` for any reason (race with `closeImportCred`, stale state from previous session), the credential is silently saved to `state.ignCreds` instead of being rejected.
+- `onImportCredInput` has the same issue: `(site === 'joe' ? state.joeCreds : state.ignCreds)` — when site is null, always deduplicates against `ignCreds`, so Joe credentials that match Ignition credentials are wrongly blocked as duplicates.
+- **Fix**: Guard both functions: `if (!site) return;` before proceeding. Show a toast error if site is null.
 
-### Non-Critical / Hardening
+**BUG-03 · Debug screenshot captures TESTING state, not the final result**
+- Both in `runLoginChecks` (line 807) and `runChecks` (line 1287), `captureDebugScreenshot` is called **before** `credsArr[idx].status = res.status` / `c.status = res.result`. The screenshot therefore always shows the item still in orange TESTING state, never the actual outcome.
+- **Fix**: Update the item status in state **before** calling `captureDebugScreenshot`, or pass the result data directly to the screenshot function to inject into the overlay.
 
-9. **Boot order not guaranteed** — If `renderAll()` fires before `wireEvents()` completes, a DOM reference may be null. Boot order must be strictly: `loadAll()` → `wireEvents()` → `renderAll()`.
+**BUG-04 · Worker catch blocks leave items stuck in TESTING state forever**
+- In `runChecks` (line 1324) and `runLoginChecks` (line 841), the catch block only increments `done` and updates the progress bar. It does not reset `c.status` or `credsArr[idx].status` from `TESTING` back to `UNTESTED`.
+- If `simulateCheck` or `simulateLogin` throws (network error, unexpected exception), the card/credential is permanently stuck showing orange `TESTING` badge until the user resets all data.
+- **Fix**: In each catch block, reset the item's status: `state.cards[idx].status = Status.UNTESTED; saveCards();` and equivalent for credentials.
 
-10. **`saveDebugShots` quota handling incomplete** — The second `setItem` attempt inside the catch block is not guarded. Must use recursive trim-and-retry.
+**BUG-05 · `detectIP` re-shows banner after user has dismissed it**
+- `closeIPBanner` only adds `hidden` class to the banner.
+- `detectIP()` is async — if the fetch resolves after the user has already dismissed the banner (within the 4-second timeout window), `$('ipBanner').classList.remove('hidden')` runs and the banner reappears.
+- No dismissed flag is tracked anywhere.
+- **Fix**: Set a module-level `let ipBannerDismissed = false;` flag on close, and guard `detectIP`'s show logic with it.
 
-11. **`maskedNumber` edge case** — Cards with exactly 9 digits are returned unmasked (condition is `<= 8`). Must mask any card with length > 8.
+---
 
-12. **`testHistory` field inconsistency** — Card history uses `h.result`; credential history uses `h.status`. Must standardize per entity type throughout all renders.
+#### HIGH — Significant Functional / Data Integrity Issues
 
-13. **Activity log not persisted** — `state.activity` is never written to localStorage. Must persist it (capped at 100 entries).
+**BUG-06 · `stopRun` never resets `state.abortController` to null**
+- `runChecks` sets `state.abortController = null` after natural completion (line 1335).
+- `stopRun` (line 1345) calls `.abort()` but never sets `state.abortController = null`.
+- The stale aborted controller object persists in state, creating a confusing invariant where `state.isRunning === false` but `state.abortController !== null`.
+- **Fix**: Add `state.abortController = null;` to `stopRun` after the abort call.
 
-14. **`ipBanner` IP validation missing** — Any truthy string from the API triggers the banner. Must validate it is a real IP before displaying.
+**BUG-07 · `renderAll()` called on every single worker iteration — severe performance issue**
+- `runChecks` and `runLoginChecks` call `renderAll()` inside the worker loop after every card/credential completes.
+- `renderAll()` invokes all 6 render functions (dashboard, cards, working, joe, ignition, sessions, settings) simultaneously.
+- With 7 concurrent workers on a 100-card list, this generates ~700 `renderAll()` calls in rapid succession, causing UI jank, dropped frames, and potential browser tab freezes on low-end devices.
+- **Fix**: Replace inline `renderAll()` in worker loops with a debounced render scheduler (e.g., `requestAnimationFrame`-based or `setTimeout(..., 50)` debounce). Only do a final `renderAll()` after all workers complete.
 
-15. **`simulateLogin` uses display name in seed** — Seed generation uses `siteName` ("Joe Fortune") instead of stable ID (`'joe'`). Must use the stable ID so results are deterministic regardless of label changes.
+**BUG-08 · Recording stop is fire-and-forget — double-finalize race possible**
+- `stopRun` (line 1349) and `stopLoginChecks` (line 875) both use `void stopRunRecording(...)` — they do not await the result.
+- If both `stopRun` and `cancelRunBtn` fire within the same tick (e.g., user clicks Stop while progress overlay cancel also fires), both find `state.recordingActive !== null` and both call `active.recorder.stop()`. The second call throws (`recorder` already stopped), which is caught and calls `finalize()` a second time, creating a duplicate recording entry and a second `URL.createObjectURL` for the same blob data.
+- **Fix**: `await stopRunRecording(...)` in all callers. Also add a guard inside `stopRunRecording`: set `state.recordingActive = null` **before** awaiting the recorder stop, so any concurrent call finds null and returns early.
 
-16. **`stopRun` / `stopLoginChecks` fire-and-forget recording stop** — Both use `void stopRunRecording(...)`. Must await to prevent partial blob corruption.
+**BUG-09 · `simulateLogin` passes display name as `site` parameter — non-deterministic seeds**
+- Called as: `simulateLogin(cred, siteName, loginUrl)` where `siteName = 'Joe Fortune'` or `'Ignition'`.
+- Inside `simulateLogin`, the seed is: `` `${site}|${loginUrl}|${cred.username.toLowerCase()}|${cred.password}` `` — uses `site` which is actually `siteName`.
+- The seed is therefore `Joe Fortune|https://joefortunepokies.win/login|user|pass`.
+- If the display name is ever changed (e.g., spelling fix), every credential's simulated outcome would change — a breaking behavioural change not intended by changing a label.
+- **Fix**: Pass the stable site ID (`'joe'` / `'ign'`) as a separate parameter, not the display name. Seed must use `'joe'` or `'ign'`.
+
+**BUG-10 · `captureDebugScreenshot` captures `.main-content` DOM — shows app UI, not result**
+- `html2canvas(root, ...)` where `root = document.querySelector('.main-content')` renders whatever tab panel is currently visible, which is usually the credentials list (empty or populated) — not any representation of what the check result actually was.
+- **Fix**: Before capture, inject a temporary fixed-position result-overlay `<div>` into `<body>` containing structured result data (entity tested, outcome badge, reason string, URL, timestamp). `html2canvas` captures `document.body` or the overlay element. Remove overlay after capture. This guarantees every screenshot shows meaningful result data.
+
+---
+
+#### MEDIUM — Data Correctness / Hardening
+
+**BUG-11 · `sanitizeFilenamePart` defined twice — divergence risk**
+- Exported from `recording-utils.js` (used in `createRecordingArtifact`).
+- Also defined locally in `app.js` at line 528 with an identical implementation — but not imported from `recording-utils.js`.
+- If `recording-utils.js`'s version is ever updated, `app.js`'s copy silently diverges.
+- **Fix**: Remove `app.js` local copy. Import `sanitizeFilenamePart` from `recording-utils.js`.
+
+**BUG-12 · `AbortSignal.timeout()` not supported in Safari <16**
+- `detectIP` uses `AbortSignal.timeout(4000)` — Safari <16 / iOS <16 throws `TypeError: AbortSignal.timeout is not a function`.
+- The entire `detectIP` function silently fails, which is acceptable behaviour — but the error is non-obvious and pollutes the console.
+- **Fix**: Replace with manual abort: `const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 4000); fetch(..., { signal: ctrl.signal }).finally(() => clearTimeout(t))`.
+
+**BUG-13 · `saveDebugShots` inner catch not guarded against second quota failure**
+- Line 206–209: outer catch trims `state.debugShots` to 6 entries and tries again. The inner `try { localStorage.setItem(...) } catch {}` silently ignores a second failure.
+- If localStorage is extremely full (< 6 screenshots still exceed quota), data is silently lost.
+- **Fix**: Use a recursive trim-until-it-fits pattern. Minimum: wrap inner setItem in its own try/catch that shows a warning toast.
+
+**BUG-14 · `maskedNumber` returns full number for 9-digit card numbers**
+- `if (num.length <= 8) return num;` — a 9-digit number passes this guard and then `num.slice(0, 6) + '•'.repeat(num.length - 10) + num.slice(-4)` = `slice(0,6) + '•'.repeat(-1) + slice(-4)`. `'•'.repeat(-1)` returns `''`, so the result is `num.slice(0,6) + num.slice(-4)` = first 6 + last 4 digits of a 9-digit number = 10 chars which is longer than the original. Bug exposed for short card numbers.
+- **Fix**: Change condition to `if (num.length <= 8) return num;` → mask any card with `num.length > 8`.
+
+**BUG-15 · `testHistory` field naming inconsistent between cards and credentials**
+- Card test history entries store: `{ result, detail, ts, durationMs }` — rendered as `h.result`.
+- Credential test history entries store: `{ status, detail, ts, durationMs }` — rendered as `h.status`.
+- Both types are displayed in Detail modals. The inconsistency means generic code cannot handle both.
+- **Fix**: Standardise. Cards use `result` (PPSR result), credentials use `status` (CredStatus enum). Keep them different but document the distinction clearly in JSDoc.
+
+**BUG-16 · Activity log not persisted across page reloads**
+- `state.activity` is populated during runs (up to 100 entries) but never written to localStorage.
+- The dashboard "Recent Activity" section is blank on every page load.
+- **Fix**: Add `KEY_ACTIVITY = 'sitcho_activity'`, persist in `saveActivity()`, load in `loadAll()`, cap at 100 entries. Call `saveActivity()` wherever `state.activity.unshift(...)` is called.
+
+**BUG-17 · `ipBanner` shows any truthy API response without IP format validation**
+- `if (ip) { $('ipBannerText').textContent = \`Your IP: ${ip}\`; }` — any non-empty string (e.g., an error message, HTML, or unexpected JSON) is shown.
+- **Fix**: Validate with a simple regex before display: `/^(\d{1,3}\.){3}\d{1,3}$|^[0-9a-f:]+$/i.test(ip)`.
+
+**BUG-18 · `exportAllCredsBtn` label "Export All Logins" exports only working credentials**
+- Line 1917: `const all = [...state.joeCreds, ...state.ignCreds].filter(c => c.status === CredStatus.WORKING)` — filters to working only.
+- The button label says "Export All Logins" which implies all credentials regardless of status.
+- **Fix**: Rename button to "📤 Export Working Logins" to match actual behaviour.
+
+---
+
+#### LOW — Code Quality / CSS
+
+**BUG-19 · Dead CSS rule: `.cred-item.selected .cred-checkbox`**
+- The credential list items in `renderCredSite` inject `class="card-checkbox"` (not `cred-checkbox`).
+- The CSS rule `.cred-item.selected .cred-checkbox` therefore never matches any element.
+- The selected state visual works correctly because `.card-item.selected .card-checkbox` applies (cred items also carry the `card-item` class).
+- **Fix**: Remove the dead `.cred-item.selected .cred-checkbox` rule.
+
+**BUG-20 · Tab panel height doesn't account for IP banner**
+- `.tab-panel { height: calc(100dvh - 111px) }` assumes header (53px) + tab bar (58px) only.
+- When the IP banner is visible (~36px), the tab panel overflows below the fold by 36px and the bottom content is clipped.
+- **Fix**: Use CSS custom property or dynamic JS measurement to adjust the panel height when the banner is shown/hidden.
+
+**BUG-21 · `parseCardLine` accepts non-numeric card numbers**
+- Splits on separators then checks `num.replace(/\D/g, '')` for length (13–19 digits).
+- A string like `"ABCDE12345678901|01|25|123"` would pass: `rawNum = "ABCDE12345678901"`, `num = "1234567890116"` (13 digits) — parsed as valid.
+- **Fix**: After extracting `rawNum`, verify it contains only digits and optional spaces: `/^[\d\s]+$/.test(rawNum)` before stripping non-digits.
+
+**BUG-22 · `closeBanner` listener uses lambda but banner may be re-shown by `detectIP` async resolution**
+- Already documented in BUG-05. Duplicated here for CSS-layer tracking.
+
+---
+
+### Test Coverage Gaps
+
+The existing test suite covers only `recording-utils.js` and `run-config.js`. The following functions in `app.js` have **zero test coverage**:
+
+| Function | Risk |
+|---|---|
+| `parseCardLine` | Core data ingestion — any regression breaks all imports |
+| `parseCredLine` | Core data ingestion — the confirmed save bug lives here |
+| `smartParseCards` / `smartParseCreds` | Integration of above parsers |
+| `detectBrand` | Card brand shown in UI — wrong brand for Mastercard 2-series |
+| `maskedNumber` | BUG-14 is untested — 9-digit edge case never caught |
+| `cardPipe` | Export format — regression would corrupt exported files |
+| `hashUnit` | Simulation determinism — any change breaks reproducibility |
+| `seededDelay` | Simulation timing — negative minMs not guarded |
+| `ppsrOutcomeFromSeed` | Simulation outcomes — untested probability bands |
+| `loginOutcomeFromSeed` | Simulation outcomes — untested probability bands |
+| `loadAll` | Data loading with corrupted/missing keys |
+| `saveCards` / `saveJoeCreds` etc. | localStorage persistence under quota |
+| `onImportInput` / `onImportCredInput` | Duplicate detection, feedback display |
+| `confirmImport` / `confirmImportCred` | End-to-end save flow |
+| `renderCredSite` | Template-literal ID resolution |
+| `getLoginUrl` | Unknown/null/undefined input not tested |
+
+**Required new tests** (to be added in `webapp/tests/`):
+- `parseCardLine.test.mjs` — valid formats, all separators, short/long numbers, expired dates, non-numeric rejection
+- `parseCredLine.test.mjs` — all 5 separators + space, short usernames, comment lines, empty lines, null/undefined input
+- `maskedNumber.test.mjs` — edge cases: 8, 9, 13, 16, 19-digit numbers
+- `detectBrand.test.mjs` — Visa, Mastercard (5-prefix), Mastercard (2-prefix), Amex, Discover, unknown
+- `simulation.test.mjs` — `hashUnit` determinism, `seededDelay` bounds, outcome seed distributions
+- `getLoginUrl.test.mjs` — extend existing test to cover unknown site fallback and null input
 
 ---
 
