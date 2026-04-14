@@ -33,8 +33,13 @@ The following bugs and defects have been identified in the current codebase and 
    - After saving, `renderAll()` must reflect the newly added credentials immediately
    - **Fix requirement**: Any credential text pasted in the format `user:pass`, `user|pass`, `user;pass`, `user,pass`, or `user\tpass` must be parsed, previewed with a count, and persisted on confirm. Empty lines and comment lines (`#`) must be silently skipped. The confirm button must be enabled as soon as at least one valid credential is detected.
 
-2. **Debug screenshots show the webapp UI, not automation results** — The current implementation uses `html2canvas` to capture the app's own DOM (the credentials list tab). This is meaningless because it shows the same UI the user already sees — it does not show what happened during the simulated automation check or why a result was returned. Users expect debug screenshots to explain the outcome.
-   - **Fix requirement**: Remove the html2canvas-based "debug screenshot" feature entirely. Replace it with a **Simulation Result Detail** system: after each check (PPSR or login), store a structured result record containing the credential/card tested, the outcome reason string, the simulated URL visited, the timestamp, and the duration. These result records must be displayed in the Debug Screenshots modal as formatted cards (not images), clearly showing the outcome reason and what the simulated engine reported. This gives users meaningful insight into results without misleading "screenshots" of their own app.
+2. **Debug screenshots capture wrong content at wrong time** — The current implementation fires `html2canvas` on the `.main-content` element immediately when a check result arrives, but by that point the UI may still be showing whatever tab was last rendered (often an empty credentials list). The screenshot captures nothing meaningful. The feature must be kept and made to actually work as visual proof.
+   - **Fix requirement — what to capture**: Immediately before taking the screenshot, inject a temporary full-screen "result card" overlay into the DOM (not a modal — just a fixed-position div with high z-index that html2canvas will capture). This overlay must display: the entity tested (masked card number or username), the outcome badge (WORKING / DEAD / NO ACC etc.), the outcome reason string, the simulated URL, and the timestamp. After html2canvas finishes capturing, remove the overlay. The resulting screenshot will be a clean, readable image showing exactly what the result was and why.
+   - **Fix requirement — html2canvas loading**: The CDN load must be fully awaited before capture begins. If the primary CDN fails, retry the fallback CDN. If both fail, log the failure and skip the screenshot silently (no broken toast spam).
+   - **Fix requirement — concurrency guard**: The in-flight flag (`debugScreenshotInFlight`) must block concurrent captures. The 1500ms cooldown between screenshots must remain but must reset correctly after each capture regardless of success or failure.
+   - **Fix requirement — localStorage quota**: Use recursive trim-and-retry (trim by 1 entry, retry save, repeat until it fits or array is empty). Cap stored screenshots at 12.
+   - **Fix requirement — `saveDebugShots`**: The second `setItem` in the catch block must itself be wrapped in try/catch.
+   - **Fix requirement — error resilience**: All html2canvas calls must be wrapped in try/catch. Any failure must set `debugScreenshotInFlight = false` in a `finally` block and must only show one error toast per session (existing `screenshotEngineUnavailableNotified` flag).
 
 3. **`sanitizeFilenamePart` duplication** — Defined both inside `app.js` and exported from `recording-utils.js` without being imported. The rebuild must use a single source of truth (imported from `recording-utils.js`).
 
@@ -132,16 +137,16 @@ The rebuilt app must preserve all existing functionality:
 - Confirm modal (generic, reusable)
 - Progress overlay (shown during runs with %, working/dead counts, Stop button)
 - Run Recordings modal (list of recordings with open/download/clear)
-- Simulation Result Details modal (replaces Debug Screenshots): shows structured result cards per check — card/credential tested, outcome reason, simulated URL, timestamp, duration. No images. Accessible via the "Screenshots" button in Sessions tab (button relabelled "Results").
+- Debug Screenshots modal (grid of captured result screenshots with open/download/clear). Each screenshot is taken via html2canvas of a temporary injected result overlay, not the app tab itself, so the image shows the actual check outcome.
 
 ### Cross-cutting
 - Dark/Light/System theme with persistence
 - Toast notifications (info, success, error)
 - Keyboard shortcut: Escape closes the top-most open modal
 - IP detection banner (dismissible)
-- localStorage persistence for: cards, sessions, credentials (joe + ign), settings, API key, simulation result details (capped at 50 entries)
+- localStorage persistence for: cards, sessions, credentials (joe + ign), settings, API key, debug screenshots (capped at 12)
 - Run recordings via MediaRecorder API (falls back gracefully if unavailable)
-- No html2canvas dependency — the debug screenshot system is removed entirely
+- Debug screenshots via html2canvas (CDN lazy-loaded, both CDNs tried, falls back gracefully if both unavailable)
 - All concurrency runs use an AbortController so they can be stopped mid-run
 - Cards in `TESTING` state are reset to `UNTESTED` when a run is stopped
 
