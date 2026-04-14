@@ -95,8 +95,30 @@ A complete cross-reference of every `$('id')` call in `app.js` against every `id
 - **Fix**: Pass the stable site ID (`'joe'` / `'ign'`) as a separate parameter, not the display name. Seed must use `'joe'` or `'ign'`.
 
 **BUG-10 · `captureDebugScreenshot` captures `.main-content` DOM — shows app UI, not result**
-- `html2canvas(root, ...)` where `root = document.querySelector('.main-content')` renders whatever tab panel is currently visible, which is usually the credentials list (empty or populated) — not any representation of what the check result actually was.
-- **Fix**: Before capture, inject a temporary fixed-position result-overlay `<div>` into `<body>` containing structured result data (entity tested, outcome badge, reason string, URL, timestamp). `html2canvas` captures `document.body` or the overlay element. Remove overlay after capture. This guarantees every screenshot shows meaningful result data.
+- `html2canvas(root, ...)` where `root = document.querySelector('.main-content')` renders whatever tab panel is currently visible — usually the credentials list (empty or populated) — not any representation of what the check result actually was.
+
+**Fix — 4-screenshot sequence per credential/card check:**
+
+Each credential login check and each PPSR card check must produce exactly **4 screenshots** at the following moments, each with a specific overlay that shows the relevant state. The overlay is a temporary fixed-position `<div>` injected into `<body>` with `z-index: 99999` before capture and removed immediately after. Each overlay is styled to look like a browser automation frame — dark background, site header, form fields or result boxes — so the screenshots read like an actual browser session.
+
+| Shot # | Trigger point | Overlay content |
+|---|---|---|
+| **1 — Form filled** | Immediately after credentials/card are resolved and before the simulated request fires | Site logo/URL bar, username field (showing actual username), password field (showing `••••••` dots), a "Sign In" / "Submit" button highlighted in blue. Label: `"[1/4] Form submitted"` |
+| **2 — First response** | After `ppsrOutcomeFromSeed(baseSeed + ':primary')` or `loginOutcomeFromSeed(baseSeed + ':primary')` resolves | Site URL bar, a response box showing the raw outcome (e.g., `"Login failed — no account found"` or `"PPSR: encumbrance detected"`), HTTP-style status line (e.g., `200 OK` or `401 Unauthorized`). Label: `"[2/4] First response"` |
+| **3 — Verify submission** | Only on first-run items (when `firstRun === true`): after the verify seed resolves (`':verify'` suffix). For non-first-run items, skip this shot entirely and take only 3 screenshots | Same as shot 1 but with a `"Re-checking…"` banner overlay and the verify URL appended. Label: `"[3/4] Verification submitted"` |
+| **4 — Final result** | After `credsArr[idx].status` / `c.status` is updated to the definitive outcome | Full result card: entity label (masked card or username), final outcome badge (✅ WORKING / ❌ DEAD / ⏸ TEMP DISABLED / 🚫 NO ACC), reason string from `res.detail`, URL visited, duration in ms, timestamp. Label: `"[4/4] Final result"` |
+
+**Fix — screenshots persist until explicitly cleared:**
+- Remove the automatic 12-screenshot cap that was previously enforced in `captureDebugScreenshot`.
+- Screenshots are stored in localStorage indefinitely (until the user clicks "🗑 Clear" in the Debug Screenshots modal).
+- localStorage quota is still handled gracefully (recursive trim-and-retry on quota error), but no pre-emptive eviction.
+- The Debug Screenshots modal button counter in the Sessions tab must reflect the true count: `🖼 Screenshots (N)` where N can be large.
+- On `nukeBtn` (Reset All Data), debug shots are cleared as part of the full reset.
+
+**Fix — concurrency and performance:**
+- `captureDebugScreenshot` is already guarded by `debugScreenshotInFlight`. With 4 shots per check and potentially 7 concurrent workers, shots must be queued, not dropped. Replace the in-flight flag with an async queue: shots are added to a FIFO queue and processed one at a time so no shot is lost.
+- Remove the 1500ms cooldown between shots (it would cause shots 1–4 within the same check to be dropped). The cooldown was a workaround for the old approach; with the overlay-based system, captures are fast and deterministic.
+- Each shot must await html2canvas completion before the queue processes the next shot.
 
 ---
 
