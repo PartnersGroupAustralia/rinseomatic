@@ -1,0 +1,76 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - generic [ref=e3]:
+      - generic [ref=e4]: ⚡ Sitchomatic
+      - generic [ref=e5]:
+        - generic [ref=e6]: ● Idle
+        - button "☀️" [ref=e7] [cursor=pointer]
+  - navigation [ref=e8]:
+    - button "⚡ Dashboard" [ref=e9] [cursor=pointer]:
+      - generic [ref=e10]: ⚡
+      - generic [ref=e11]: Dashboard
+    - button "💳 Cards 2" [ref=e12] [cursor=pointer]:
+      - generic [ref=e13]: 💳
+      - generic [ref=e14]: Cards
+      - generic [ref=e15]: "2"
+    - button "✅ Working" [ref=e16] [cursor=pointer]:
+      - generic [ref=e17]: ✅
+      - generic [ref=e18]: Working
+    - button "🎰 Joe" [ref=e19] [cursor=pointer]:
+      - generic [ref=e20]: 🎰
+      - generic [ref=e21]: Joe
+    - button "🔥 Ignition" [ref=e22] [cursor=pointer]:
+      - generic [ref=e23]: 🔥
+      - generic [ref=e24]: Ignition
+    - button "📋 Sessions" [ref=e25] [cursor=pointer]:
+      - generic [ref=e26]: 📋
+      - generic [ref=e27]: Sessions
+    - button "⚙️ Settings" [ref=e28] [cursor=pointer]:
+      - generic [ref=e29]: ⚙️
+      - generic [ref=e30]: Settings
+  - main [ref=e31]:
+    - generic [ref=e33]:
+      - generic [ref=e34]:
+        - generic [ref=e35]:
+          - generic [ref=e36]:
+            - generic [ref=e37]: 💳
+            - generic [ref=e38]: "2"
+          - generic [ref=e39]: Total Cards
+        - generic [ref=e40]:
+          - generic [ref=e41]:
+            - generic [ref=e42]: ✅
+            - generic [ref=e43]: "0"
+          - generic [ref=e44]: Working
+        - generic [ref=e45]:
+          - generic [ref=e46]:
+            - generic [ref=e47]: ❌
+            - generic [ref=e48]: "0"
+          - generic [ref=e49]: Dead
+        - generic [ref=e50]:
+          - generic [ref=e51]:
+            - generic [ref=e52]: ❓
+            - generic [ref=e53]: "2"
+          - generic [ref=e54]: Untested
+      - generic [ref=e55]:
+        - generic [ref=e56]:
+          - generic [ref=e57]: PPSR Success Rate
+          - generic [ref=e58]: 0%
+        - generic [ref=e60]: No cards tested yet
+      - generic [ref=e61]:
+        - generic [ref=e62]:
+          - generic [ref=e63]: "0"
+          - generic [ref=e64]: Joe Working
+        - generic [ref=e65]:
+          - generic [ref=e66]: "0"
+          - generic [ref=e67]: Ign Working
+        - generic [ref=e68]:
+          - generic [ref=e69]: "0"
+          - generic [ref=e70]: Joe Total
+        - generic [ref=e71]:
+          - generic [ref=e72]: "0"
+          - generic [ref=e73]: Ign Total
+      - generic [ref=e74]:
+        - generic [ref=e77]: Idle
+        - button "▶ Run PPSR" [ref=e79] [cursor=pointer]
+      - generic [ref=e80]: Recent Activity
+      - generic [ref=e82]: No activity yet

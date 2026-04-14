@@ -933,13 +933,13 @@ function renderSettings() {
   if ($('requeueOnTimeout')) $('requeueOnTimeout').checked = settings.requeueOnTimeout;
   if ($('requeueOnFailure')) $('requeueOnFailure').checked = settings.requeueOnFailure;
   if ($('maxRequeueCount')) $('maxRequeueCount').value = settings.maxRequeueCount;
-  if ($('batchDelayMs'))    $('batchDelayMs').value    = settings.batchDelayBetweenStartsMs;
+  if ($('batchDelay'))      $('batchDelay').value      = settings.batchDelayBetweenStartsMs;
   if ($('pageLoadTimeout')) $('pageLoadTimeout').value = settings.pageLoadTimeout;
 
   // Network/VPN settings
   if ($('vpnRotation'))         $('vpnRotation').checked         = settings.vpnRotation;
   if ($('dnsRotation'))         $('dnsRotation').checked         = settings.dnsRotation;
-  if ($('proxyRotateOnFailure'))$('proxyRotateOnFailure').checked = settings.proxyRotateOnFailure;
+  if ($('proxyRotateOnFail'))   $('proxyRotateOnFail').checked   = settings.proxyRotateOnFailure;
 
   applyTheme(settings.theme);
   renderWgConfigs();
@@ -2410,15 +2410,13 @@ function closeWgPasteModal() { $('wgPasteModal').classList.add('hidden'); }
 function confirmWgPaste() {
   const text = $('wgPasteText').value.trim();
   if (!text) { $('wgPasteFeedback').textContent = 'Please paste a WireGuard .conf'; return; }
-  const cfg = parseWireGuardConf(text);
-  if (!cfg) { $('wgPasteFeedback').textContent = 'Invalid WireGuard config — missing [Interface] or PrivateKey'; return; }
-  if (!cfg.peer?.publicKey) { $('wgPasteFeedback').textContent = 'Missing [Peer] PublicKey in config'; return; }
-  if (!cfg.peer?.endpoint)  { $('wgPasteFeedback').textContent = 'Missing [Peer] Endpoint in config'; return; }
+  const cfg = parseWireGuardConf('Pasted Config', text);
+  if (!cfg) { $('wgPasteFeedback').textContent = 'Invalid WireGuard config — must have [Interface] PrivateKey, [Peer] PublicKey and Endpoint'; return; }
   state.wireGuardConfigs.push(cfg);
   saveWgConfigs();
   closeWgPasteModal();
   renderWgConfigs();
-  toast(`WireGuard config added: ${cfg.name}`, 'success');
+  toast(`WireGuard config added: ${cfg.fileName}`, 'success');
 }
 
 /**
@@ -2432,14 +2430,15 @@ function handleWgFileImport(e) {
   const reader = new FileReader();
   reader.onload = ev => {
     const text = ev.target.result;
-    const cfg = parseWireGuardConf(text);
-    if (!cfg || !cfg.peer?.publicKey || !cfg.peer?.endpoint) {
-      toast('Invalid WireGuard .conf file', 'error'); return;
+    const label = file.name.replace(/\.conf$/i, '') || 'Imported Config';
+    const cfg = parseWireGuardConf(label, text);
+    if (!cfg) {
+      toast('Invalid WireGuard .conf file — must have PrivateKey, PublicKey and Endpoint', 'error'); return;
     }
-    state.wireGuardConfigs.push({ ...cfg, name: cfg.name || file.name.replace(/\.conf$/i, '') });
+    state.wireGuardConfigs.push(cfg);
     saveWgConfigs();
     renderWgConfigs();
-    toast(`WireGuard config imported: ${cfg.name}`, 'success');
+    toast(`WireGuard config imported: ${cfg.fileName}`, 'success');
   };
   reader.readAsText(file);
   e.target.value = '';
