@@ -162,6 +162,27 @@ The rebuilt app must preserve all existing functionality:
 - **Performance**: UI must remain responsive during concurrent check runs; render calls must not block the event loop
 - **Data safety**: localStorage writes must be fault-tolerant; quota errors must be handled gracefully
 - **Code quality**: No global namespace pollution (all state in a single `state` object), no `var` declarations, consistent naming conventions
+- **Function documentation**: Every function — without exception — must have a JSDoc block immediately above it. The JSDoc must include:
+  - A one-sentence `@description` (or lead sentence) explaining the function's single responsibility and purpose
+  - `@param` tags for every parameter with type and description
+  - `@returns` tag describing the return value and type (use `@returns {void}` where applicable)
+  - `@throws` tag if the function can throw (even if caught internally)
+  - For async functions, the return type must be `@returns {Promise<T>}`
+  - For event handlers and callbacks, note what event or trigger invokes them
+  - Example of required style:
+    ```js
+    /**
+     * Parses a single line of text into a card object.
+     * Accepts pipe-, space-, or slash-separated formats (NUM|MM|YY|CVV).
+     * Returns null if the line is blank, malformed, or the card number is out of range.
+     *
+     * @param {string} line - Raw input line from the import textarea.
+     * @returns {CardObject|null} Parsed card object, or null if the line is invalid.
+     */
+    function parseCardLine(line) { … }
+    ```
+  - Section divider comments (`// ── Section Name ──`) must also be kept to group logical blocks
+  - Inline comments are required inside any function body that contains non-obvious logic (e.g. hash computation, retry loops, race condition guards)
 
 ---
 
