@@ -757,8 +757,8 @@ function renderCredSite(site) {
 
   const total    = creds.length;
   const working  = creds.filter(c => c.status === CredStatus.WORKING).length;
-  const noAcc    = creds.filter(c => c.status === CredStatus.NO_ACC).length;
-  const disabled = creds.filter(c => c.status === CredStatus.PERM_DISABLED || c.status === CredStatus.TEMP_DISABLED).length;
+  const noAcc    = creds.filter(c => c.status === CredStatus.NO_ACC || c.status === CredStatus.PERM_DISABLED).length;
+  const disabled = creds.filter(c => c.status === CredStatus.TEMP_DISABLED).length;
   const untested = creds.filter(c => c.status === CredStatus.UNTESTED).length;
 
   $(`${prefix}StatTotal`).textContent    = total;
@@ -776,8 +776,8 @@ function renderCredSite(site) {
   let visible = creds;
   if (filter === 'untested')  visible = creds.filter(c => c.status === CredStatus.UNTESTED);
   else if (filter === 'working')  visible = creds.filter(c => c.status === CredStatus.WORKING);
-  else if (filter === 'noAcc')    visible = creds.filter(c => c.status === CredStatus.NO_ACC);
-  else if (filter === 'disabled') visible = creds.filter(c => c.status === CredStatus.PERM_DISABLED || c.status === CredStatus.TEMP_DISABLED);
+  else if (filter === 'noAcc')    visible = creds.filter(c => c.status === CredStatus.NO_ACC || c.status === CredStatus.PERM_DISABLED);
+  else if (filter === 'disabled') visible = creds.filter(c => c.status === CredStatus.TEMP_DISABLED);
 
   const listEl  = $(`${prefix}CredList`);
   const emptyEl = $(`${prefix}Empty`);
