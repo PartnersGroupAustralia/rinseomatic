@@ -33,7 +33,7 @@
 
 // ── Imports ────────────────────────────────────────────────
 import { createRecordingArtifact, formatBytes, getRecordingsButtonLabel, sanitizeFilenamePart } from './recording-utils.js';
-import { getLoginUrl } from './run-config.js';
+import { getLoginUrl, JOE_LOGIN_URL, IGNITION_LOGIN_URL } from './run-config.js';
 
 // ── Storage keys ───────────────────────────────────────────
 /** @constant {string} localStorage key for PPSR cards array. */
@@ -352,6 +352,9 @@ let state = {
     stealthMode: false,
     debugScreenshots: true,
     ppsrUrl: 'https://transact.ppsr.gov.au/CarCheck/',
+    // Target login URLs (editable in Settings → Target URLs)
+    joeLoginUrl: 'https://joefortunepokies.win/login',
+    ignitionLoginUrl: 'https://ignitioncasino.ooo/login',
     // Login checker
     loginConcurrency: 3,
     loginTimeout: 60,
@@ -912,6 +915,10 @@ function renderSettings() {
   const nordConfigured = nordAccessKey.length > 0;
   if ($('nordKeyStatus')) $('nordKeyStatus').textContent = nordConfigured ? '✅ NordLynx key saved' : 'No key saved';
   if ($('deleteNordKeyBtn')) $('deleteNordKeyBtn').style.display = nordConfigured ? '' : 'none';
+
+  // Target URLs
+  if ($('joeLoginUrl'))      $('joeLoginUrl').value      = settings.joeLoginUrl;
+  if ($('ignitionLoginUrl')) $('ignitionLoginUrl').value = settings.ignitionLoginUrl;
 
   // PPSR settings
   $('maxConcurrency').value = settings.maxConcurrency;
@@ -1973,7 +1980,9 @@ async function runLoginChecks(site, credIds = null) {
   else                { state.ignRunning = true; state.ignAbortController = abortCtrl; }
   const signal = abortCtrl.signal;
   const siteName = site === 'joe' ? 'Joe Fortune' : 'Ignition';
-  const loginUrl = getLoginUrl(site);
+  const loginUrl = site === 'joe'
+    ? (state.settings.joeLoginUrl || JOE_LOGIN_URL)
+    : (state.settings.ignitionLoginUrl || IGNITION_LOGIN_URL);
 
   showProgress(`Running ${siteName} Login Checks (Virtual Headless)…`, site);
   renderAll();
@@ -2708,6 +2717,8 @@ function wireEvents() {
     if (!el) return;
     el.addEventListener('change', () => { state.settings[key] = parser(el.value); saveSettings(); });
   };
+  autoBind('joeLoginUrl',      'joeLoginUrl');
+  autoBind('ignitionLoginUrl', 'ignitionLoginUrl');
   autoBind('maxConcurrency', 'maxConcurrency', v => Math.max(1, Math.min(20, parseInt(v) || 7)));
   autoBind('checkTimeout',   'checkTimeout',   v => Math.max(30, Math.min(300, parseInt(v) || 180)));
   autoBind('testEmail',      'testEmail');
