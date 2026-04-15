@@ -1682,7 +1682,7 @@ function enqueueShot(buildOverlayFn, tag, note) {
  * @param {string} tag - Short identifier tag for filename and display.
  * @param {string} note - Human-readable description shown in screenshot modal.
  */
-function saveDebugShot(dataUrl, tag, note) {
+function saveDebugShot(dataUrl, tag, note, groupId = '') {
   if (!state.settings.debugScreenshots) return;
   if (!dataUrl || !dataUrl.startsWith('data:image')) return;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1690,6 +1690,7 @@ function saveDebugShot(dataUrl, tag, note) {
     id: crypto.randomUUID(),
     ts: Date.now(),
     tag: sanitizeFilenamePart(tag),
+    groupId: groupId || tag,
     note: note || '',
     filename: `sitchomatic_live_${sanitizeFilenamePart(tag)}_${stamp}.png`,
     dataUrl,
@@ -1889,7 +1890,7 @@ async function simulateLoginDetailed(cred, siteId, siteName, loginUrl) {
       `${siteName} — ${data.outcome || 'done'}`,
     ];
     shots.forEach((dataUrl, i) => {
-      if (dataUrl) saveDebugShot(dataUrl, shotTag + `_${i + 1}_${labels[i].split(' ').pop().toLowerCase()}`, notes[i]);
+      if (dataUrl) saveDebugShot(dataUrl, shotTag + `_${i + 1}_${labels[i].split(' ').pop().toLowerCase()}`, notes[i], shotTag);
     });
 
     const statusMap = {
@@ -1943,7 +1944,7 @@ async function simulateCheckDetailed(card, ppsrUrl) {
       `PPSR — ${data.outcome || 'done'}`,
     ];
     shots.forEach((dataUrl, i) => {
-      if (dataUrl) saveDebugShot(dataUrl, `${shotTag}_${i + 1}`, notes[i]);
+      if (dataUrl) saveDebugShot(dataUrl, `${shotTag}_${i + 1}`, notes[i], shotTag);
     });
 
     const result = data.outcome === 'working' ? Status.WORKING : Status.DEAD;
@@ -2274,17 +2275,47 @@ function renderDebugShots() {
     empty.classList.remove('hidden'); list.innerHTML = ''; return;
   }
   empty.classList.add('hidden');
-  list.innerHTML = state.debugShots.map(s => `
-    <div class="shot-card">
-      <img class="shot-thumb" src="${s.dataUrl}" alt="Debug screenshot" loading="lazy" />
-      <div class="shot-meta">
-        <div class="shot-sub">${timeAgo(s.ts)}${s.note ? ` · ${s.note}` : ''}</div>
+
+  // Group shots by groupId, preserving newest-group-first order.
+  // Shots are stored newest-first (unshift), so within each group the last
+  // screenshot saved (SCR 4/4) appears first — we reverse within each group
+  // to restore the natural SCR 1/4 → SCR 4/4 display order.
+  const groups = [];
+  const groupMap = new Map();
+  for (const s of state.debugShots) {
+    const gid = s.groupId || s.id;
+    if (!groupMap.has(gid)) {
+      const g = { groupId: gid, shots: [], ts: s.ts };
+      groups.push(g);
+      groupMap.set(gid, g);
+    }
+    groupMap.get(gid).shots.push(s);
+  }
+
+  list.innerHTML = groups.map(g => {
+    const ordered = [...g.shots].reverse();
+    const label = ordered[0]?.note?.split(' — ').slice(0, 2).join(' — ') || g.groupId;
+    return `
+    <div class="shot-group">
+      <div class="shot-group-header">
+        <span class="shot-group-label">${label}</span>
+        <span class="shot-group-time">${timeAgo(g.ts)}</span>
       </div>
-      <div class="shot-actions">
-        <button class="icon-text-btn" data-shot-action="open" data-shot-id="${s.id}">🔍 Open</button>
-        <button class="icon-text-btn" data-shot-action="download" data-shot-id="${s.id}">💾 Save</button>
+      <div class="shot-group-row">
+        ${ordered.map(s => `
+          <div class="shot-card">
+            <img class="shot-thumb" src="${s.dataUrl}" alt="${s.note}" loading="lazy" />
+            <div class="shot-meta">
+              <div class="shot-sub">${s.note || ''}</div>
+            </div>
+            <div class="shot-actions">
+              <button class="icon-text-btn" data-shot-action="open" data-shot-id="${s.id}">🔍</button>
+              <button class="icon-text-btn" data-shot-action="download" data-shot-id="${s.id}">💾</button>
+            </div>
+          </div>`).join('')}
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 /** @description Opens the debug screenshots modal and re-renders its contents. */
