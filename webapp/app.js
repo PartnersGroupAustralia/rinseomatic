@@ -2304,7 +2304,7 @@ function renderDebugShots() {
       <div class="shot-group-row">
         ${ordered.map(s => `
           <div class="shot-card">
-            <img class="shot-thumb" src="${s.dataUrl}" alt="${s.note}" loading="lazy" />
+            <img class="shot-thumb" src="${s.dataUrl}" alt="${s.note}" loading="lazy" data-shot-action="open" data-shot-id="${s.id}" />
             <div class="shot-meta">
               <div class="shot-sub">${s.note || ''}</div>
             </div>
