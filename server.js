@@ -288,6 +288,16 @@ async function determineLoginOutcome(page, loginUrl) {
   if (/temporarily.*blocked|too many.*attempt|locked.*out|try again later|rate.?limit/i.test(bodyText)) {
     return { outcome: 'tempDisabled', note: 'Account temporarily locked — too many attempts. Retry eligible after ~1 hour.' };
   }
+  // Joe Fortune exact — attempt 1 wrong password:
+  // "Oops! Your email and/or password are incorrect. Please check that your CAPS lock is not on and try again."
+  if (/oops!\s*your email and\/or password are incorrect\.\s*please check that your caps lock/i.test(bodyText)) {
+    return { outcome: 'noAcc', note: 'Joe Fortune — incorrect email/password (attempt 1)' };
+  }
+  // Joe Fortune exact — attempt 2+ wrong password (warning about blocking):
+  // "Your email and/or password remain incorrect. Further failed attempts may result in your account being blocked."
+  if (/your email and\/or password remain incorrect\.\s*further failed attempts may result/i.test(bodyText)) {
+    return { outcome: 'noAcc', note: 'Joe Fortune — email/password remain incorrect (account does not exist or wrong credentials)' };
+  }
   if (/email.*not.*found|account.*not.*found|user.*not.*found|no account.*found/i.test(bodyText)) {
     return { outcome: 'noAcc', note: 'No account found for this email' };
   }
