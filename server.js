@@ -275,8 +275,13 @@ async function determineLoginOutcome(page, loginUrl) {
   if (/account.*disabled|disabled.*account|account.*suspended|permanently.*suspended/i.test(bodyText)) {
     return { outcome: 'permDisabled', note: 'Account is permanently disabled or suspended' };
   }
+  // Joe Fortune exact: "Sorry, your account has been temporarily disabled due to
+  // too many failed login attempts. Contact us immediately to re-enable."
+  if (/temporarily disabled due to too many failed login attempt/i.test(bodyText)) {
+    return { outcome: 'tempDisabled', note: 'Joe Fortune — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.' };
+  }
   if (/temporarily.*blocked|too many.*attempt|locked.*out|try again later|rate.?limit/i.test(bodyText)) {
-    return { outcome: 'tempDisabled', note: 'Account temporarily locked — too many attempts' };
+    return { outcome: 'tempDisabled', note: 'Account temporarily locked — too many attempts. Retry eligible after ~1 hour.' };
   }
   if (/email.*not.*found|account.*not.*found|user.*not.*found|no account.*found/i.test(bodyText)) {
     return { outcome: 'noAcc', note: 'No account found for this email' };
