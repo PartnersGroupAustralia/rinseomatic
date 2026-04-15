@@ -2267,9 +2267,8 @@ function renderDebugShots() {
   empty.classList.add('hidden');
   list.innerHTML = state.debugShots.map(s => `
     <div class="shot-card">
-      <img class="shot-thumb" src="${s.dataUrl}" alt="Debug screenshot ${s.tag}" loading="lazy" />
+      <img class="shot-thumb" src="${s.dataUrl}" alt="Debug screenshot" loading="lazy" />
       <div class="shot-meta">
-        <div class="shot-title">${s.tag}</div>
         <div class="shot-sub">${timeAgo(s.ts)}${s.note ? ` · ${s.note}` : ''}</div>
       </div>
       <div class="shot-actions">

