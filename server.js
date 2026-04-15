@@ -127,7 +127,9 @@ async function fillLoginForm(page, username, password) {
   for (const sel of emailSelectors) {
     try {
       const el = page.locator(sel).first();
-      if (await el.count() > 0 && await el.isVisible()) {
+      if (await el.count() > 0 && await el.isVisible({ timeout: 3000 })) {
+        await el.click();
+        await el.fill('');
         await el.fill(username);
         emailFilled = true;
         break;
@@ -135,17 +137,26 @@ async function fillLoginForm(page, username, password) {
     } catch {}
   }
 
+  // Pause after email entry — some sites enable the password field via JS
+  // handlers that fire on email input/blur events
+  if (emailFilled) await page.waitForTimeout(600);
+
   let passFilled = false;
   for (const sel of passSelectors) {
     try {
       const el = page.locator(sel).first();
-      if (await el.count() > 0 && await el.isVisible()) {
+      if (await el.count() > 0 && await el.isVisible({ timeout: 3000 })) {
+        await el.click();
+        await el.fill('');
         await el.fill(password);
         passFilled = true;
         break;
       }
     } catch {}
   }
+
+  // Short settle time after password entry before caller proceeds
+  if (passFilled) await page.waitForTimeout(300);
 
   return emailFilled && passFilled;
 }
@@ -518,19 +529,26 @@ async function waitForLoginResponse(page, maxWaitMs = RESPONSE_POLL_MS) {
   const deadline = Date.now() + maxWaitMs;
   while (Date.now() < deadline) {
     const body = (await page.textContent('body').catch(() => '')).toLowerCase();
+    const url  = page.url().toLowerCase();
 
-    // ── Success ──────────────────────────────────────────────────────────
-    if (/welcome\s*!/.test(body)) return RESP.SUCCESS;
-    if (/hot pokies|new & exclusive|specialty games/.test(body)) return RESP.SUCCESS;
-
-    // ── Disabled ─────────────────────────────────────────────────────────
+    // ── Disabled (check before success — these appear on the login page) ──
     if (/your account has been disabled.*contact customer service/i.test(body)) return RESP.PERM_DISABLED;
     if (/temporarily disabled due to too many failed login attempt/i.test(body)) return RESP.TEMP_DISABLED;
     if (/account.*banned|banned.*account/i.test(body)) return RESP.PERM_DISABLED;
 
-    // ── Wrong password signals ────────────────────────────────────────────
+    // ── Wrong password signals (also appear on the login page) ────────────
     if (/your email and\/or password remain incorrect.*further failed attempt/i.test(body)) return RESP.WRONG_PASS_2;
     if (/oops.*your email and\/or password are incorrect.*caps lock/i.test(body)) return RESP.WRONG_PASS_1;
+
+    // ── Success: URL must have left the login page ─────────────────────────
+    // "WELCOME BACK!" and casino promo content (hot pokies etc.) also appear
+    // on the unauthenticated login page, so success is only valid once the
+    // browser has navigated away from /login.
+    const isOffLoginPage = !url.includes('/login') && !url.includes('/sign-in') && !url.includes('/signin');
+    if (isOffLoginPage) {
+      if (/hot pokies|new & exclusive|specialty games/i.test(body)) return RESP.SUCCESS;
+      if (/account balance|your balance|make a deposit|my account/i.test(body)) return RESP.SUCCESS;
+    }
 
     await page.waitForTimeout(POLL_INTERVAL_MS);
   }
@@ -585,7 +603,10 @@ app.post('/api/login-check', async (req, res) => {
     const filled = await fillLoginForm(page, username, password);
     if (!filled) note = 'Could not locate login form fields on page';
 
-    // SCR 1/4 — form filled, ready to submit
+    // Extra settle time so both fields are fully visible in the screenshot
+    await page.waitForTimeout(500);
+
+    // SCR 1/4 — both fields filled, ready to submit
     shots[0] = await captureShot(page, 'SCR 1/4');
 
     // ── Step 2–3: Submit with retry loop (up to MAX_LOGIN_ATTEMPTS) ───────
