@@ -180,7 +180,7 @@ async function dismissCookiePopup(page) {
     'button:has-text("I agree")',
     'button:has-text("I Agree")',
     'button:has-text("Agree")',
-    'button:has-text("Got it")",',
+    'button:has-text("Got it")',
     'button:has-text("Got It")',
     'button:has-text("OK")',
     'button:has-text("Ok")',
@@ -590,6 +590,7 @@ app.post('/api/login-check', async (req, res) => {
 
     // ── Step 2–3: Submit with retry loop (up to MAX_LOGIN_ATTEMPTS) ───────
     let respType = RESP.UNKNOWN;
+    const siteName = site === 'ign' ? 'Ignition' : 'Joe Fortune';
 
     for (let attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
       // Re-fill credentials on retries (form may have cleared)
@@ -609,26 +610,25 @@ app.post('/api/login-check', async (req, res) => {
       // Capture SCR 2/4 after first submit, SCR 3/4 after last retry
       if (attempt === 1)                   shots[1] = await captureShot(page, 'SCR 2/4');
       if (attempt === MAX_LOGIN_ATTEMPTS)  shots[2] = await captureShot(page, 'SCR 3/4');
-
       if (respType === RESP.SUCCESS) {
         outcome = 'working';
-        note = 'Joe Fortune — login successful';
+        note = `${siteName} — login successful`;
         break;
       }
       if (respType === RESP.PERM_DISABLED) {
         outcome = 'permDisabled';
-        note = 'Joe Fortune — account permanently disabled (contact Customer Service)';
+        note = `${siteName} — account permanently disabled (contact Customer Service)`;
         break;
       }
       if (respType === RESP.TEMP_DISABLED) {
         outcome = 'tempDisabled';
-        note = 'Joe Fortune — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.';
+        note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
         break;
       }
       if (respType === RESP.WRONG_PASS_1 || respType === RESP.WRONG_PASS_2) {
         if (attempt === MAX_LOGIN_ATTEMPTS) {
           outcome = 'noAcc';
-          note = `Joe Fortune — incorrect credentials after ${MAX_LOGIN_ATTEMPTS} attempts (account does not exist or wrong password)`;
+          note = `${siteName} — incorrect credentials after ${MAX_LOGIN_ATTEMPTS} attempts (account does not exist or wrong password)`;
         }
         // else: loop again for next attempt
         continue;

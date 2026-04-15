@@ -2793,8 +2793,10 @@ function wireEvents() {
       state.settings = {
         maxConcurrency: 7, checkTimeout: 180, autoRetry: true, stealthMode: false,
         automationMode: 'virtualHeadless', debugScreenshots: true, testEmail: '',
-        ppsrUrl: 'https://transact.ppsr.gov.au/CarCheck/', loginConcurrency: 3,
-        loginTimeout: 60, useEmailRotation: false, theme: 'dark',
+        ppsrUrl: 'https://transact.ppsr.gov.au/CarCheck/',
+        joeLoginUrl: 'https://joefortunepokies.win/login',
+        ignitionLoginUrl: 'https://ignitioncasino.ooo/login',
+        loginConcurrency: 3, loginTimeout: 60, useEmailRotation: false, theme: 'dark',
         typingSpeedMinMs: 80, typingSpeedMaxMs: 180, requeueOnTimeout: true,
         requeueOnFailure: false, maxRequeueCount: 2, batchDelayBetweenStartsMs: 500,
         pageLoadTimeout: 30, vpnRotation: false, dnsRotation: false, proxyRotateOnFailure: false,
