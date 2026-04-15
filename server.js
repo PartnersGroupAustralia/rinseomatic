@@ -272,6 +272,11 @@ async function determineLoginOutcome(page, loginUrl) {
   const bodyText = (await page.textContent('body').catch(() => '')).toLowerCase();
 
   // ── Hard failure signals (check first) ──────────────────────────────────
+  // Joe Fortune exact: "Your account has been disabled. Please, contact Customer Service."
+  // Shown inside the "WELCOME BACK!" login form — page stays on /login
+  if (/your account has been disabled\.\s*please,?\s*contact customer service/i.test(bodyText)) {
+    return { outcome: 'permDisabled', note: 'Joe Fortune — account permanently disabled (contact Customer Service)' };
+  }
   if (/account.*disabled|disabled.*account|account.*suspended|permanently.*suspended/i.test(bodyText)) {
     return { outcome: 'permDisabled', note: 'Account is permanently disabled or suspended' };
   }
