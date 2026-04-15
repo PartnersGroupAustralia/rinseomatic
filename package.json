@@ -1,0 +1,14 @@
+{
+  "name": "sitchomatic-web",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.44.0"
+  }
+}

@@ -1667,6 +1667,30 @@ function enqueueShot(buildOverlayFn, tag, note) {
   void processShotQueue();
 }
 
+/**
+ * Stores a single pre-captured screenshot (base64 data URL) directly into
+ * state.debugShots. Used by the live API path where the server has already
+ * taken a real browser screenshot — no html2canvas overlay needed.
+ * @param {string} dataUrl - Base64 PNG data URL (data:image/png;base64,...).
+ * @param {string} tag - Short identifier tag for filename and display.
+ * @param {string} note - Human-readable description shown in screenshot modal.
+ */
+function saveDebugShot(dataUrl, tag, note) {
+  if (!state.settings.debugScreenshots) return;
+  if (!dataUrl || !dataUrl.startsWith('data:image')) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  state.debugShots.unshift({
+    id: crypto.randomUUID(),
+    ts: Date.now(),
+    tag: sanitizeFilenamePart(tag),
+    note: note || '',
+    filename: `sitchomatic_live_${sanitizeFilenamePart(tag)}_${stamp}.png`,
+    dataUrl,
+  });
+  saveDebugShotsQuota();
+  if (!$('screenshotModal').classList.contains('hidden')) renderDebugShots();
+  scheduleRender();
+}
 
 // ── Recording helpers ──────────────────────────────────────
 /**
@@ -1819,155 +1843,107 @@ async function stopRunRecording(id = null, reason = 'completed') {
 
 // ── Login check simulation with 4-shot screenshots ────────
 /**
- * Runs a virtual headless login simulation for a single credential, producing
- * 4 debug screenshots at key checkpoints per the PRD specification.
- * BUG-09 fix: uses stable siteId ('joe'/'ign') in seed, not display name.
- * BUG-03 fix: state is updated BEFORE screenshot 4 is taken.
- * @param {object} cred - Credential object with username, password, testHistory.
+ * Performs a LIVE login check via the automation server API (Playwright Chromium).
+ * Calls POST /api/login-check which opens a real headless browser, navigates to
+ * the login page, fills credentials, submits, and returns 4 real browser screenshots.
+ * Falls back to noAcc outcome if the server is unreachable.
+ * @param {object} cred - Credential object with username and password.
  * @param {string} siteId - Stable site identifier: 'joe' or 'ign'.
- * @param {string} siteName - Human-readable site name for overlays.
- * @param {string} loginUrl - Login URL for overlays and seed construction.
- * @returns {Promise<{status: string, detail: string, firstRun: boolean, durationMs: number, shots: number}>}
+ * @param {string} siteName - Human-readable site name for activity log.
+ * @param {string} loginUrl - Full URL of the casino login page.
+ * @returns {Promise<{status: string, detail: string, firstRun: boolean, durationMs: number}>}
  */
-function simulateLoginDetailed(cred, siteId, siteName, loginUrl) {
-  return new Promise(resolve => {
-    const baseSeed = `${siteId}|${loginUrl}|${cred.username.toLowerCase()}|${cred.password}`;
-    const delay = seededDelay(baseSeed, 650, 1850);
-    const firstRun = !cred.testHistory || cred.testHistory.length === 0;
-    const start = Date.now();
+async function simulateLoginDetailed(cred, siteId, siteName, loginUrl) {
+  const firstRun = !cred.testHistory || cred.testHistory.length === 0;
+  const start = Date.now();
+  const shotTag = `${siteId}_${sanitizeFilenamePart(cred.username.slice(0, 20))}`;
 
-    const shotTag = `${siteId}_${sanitizeFilenamePart(cred.username.slice(0, 20))}`;
+  try {
+    const resp = await fetch('/api/login-check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        site: siteId,
+        username: cred.username,
+        password: cred.password,
+        loginUrl,
+        timeout: (state.settings.loginTimeout || 60) * 1000,
+      }),
+    });
+    if (!resp.ok) throw new Error(`API ${resp.status}`);
+    const data = await resp.json();
 
-    enqueueShot(
-      () => buildFormOverlay({ siteName, loginUrl, username: cred.username, shotLabel: '[1/4] Form submitted' }),
-      shotTag + '_1_form', `${siteName} form filled — ${cred.username}`
-    );
+    const shots = data.shots || ['', '', '', ''];
+    const labels = ['[1/4] Form filled', '[2/4] First response', '[3/4] After settle', '[4/4] Final result'];
+    const notes = [
+      `${siteName} — form filled — ${cred.username}`,
+      `${siteName} — first response`,
+      `${siteName} — page settled`,
+      `${siteName} — ${data.outcome || 'done'}`,
+    ];
+    shots.forEach((dataUrl, i) => {
+      if (dataUrl) saveDebugShot(dataUrl, shotTag + `_${i + 1}_${labels[i].split(' ').pop().toLowerCase()}`, notes[i]);
+    });
 
-    setTimeout(() => {
-      const primary = loginOutcomeFromSeed(baseSeed + ':primary', siteId);
-      const isWorking = primary.status === CredStatus.WORKING;
-      const httpStatus = isWorking ? '200 OK' : '401 Unauthorized';
-
-      enqueueShot(
-        () => buildResponseOverlay({ siteName, loginUrl, outcomeText: primary.detail, httpStatus, isWorking, shotLabel: '[2/4] First response' }),
-        shotTag + '_2_response', `${siteName} first response — ${primary.status}`
-      );
-
-      if (!firstRun || isWorking) {
-        const detail = `${primary.detail} @ ${loginUrl}`;
-        enqueueShot(
-          () => buildFinalResultOverlay({
-            label: cred.username,
-            statusEmoji: isWorking ? '✅' : primary.status === CredStatus.TEMP_DISABLED ? '⏸' : '❌',
-            statusText: credStatusLabel(primary.status).toUpperCase(),
-            detail, loginUrl,
-            durationMs: Date.now() - start, ts: Date.now(),
-            shotLabel: '[4/4] Final result',
-          }),
-          shotTag + '_4_final', `${siteName} final — ${primary.status}`
-        );
-        resolve({ ...primary, detail, firstRun, durationMs: Date.now() - start });
-        return;
-      }
-
-      enqueueShot(
-        () => buildVerifyOverlay({ siteName, loginUrl, username: cred.username, shotLabel: '[3/4] Verification submitted' }),
-        shotTag + '_3_verify', `${siteName} verify form`
-      );
-
-      const verify = loginOutcomeFromSeed(baseSeed + ':verify', siteId);
-      const finalStatus = verify.status === CredStatus.WORKING ? CredStatus.WORKING : primary.status;
-      const finalDetail = verify.status === CredStatus.WORKING
-        ? `Login successful on ${siteName} (verified) @ ${loginUrl}`
-        : `${primary.detail} @ ${loginUrl}`;
-
-      enqueueShot(
-        () => buildFinalResultOverlay({
-          label: cred.username,
-          statusEmoji: finalStatus === CredStatus.WORKING ? '✅' : finalStatus === CredStatus.TEMP_DISABLED ? '⏸' : '❌',
-          statusText: credStatusLabel(finalStatus).toUpperCase(),
-          detail: finalDetail, loginUrl,
-          durationMs: Date.now() - start, ts: Date.now(),
-          shotLabel: '[4/4] Final result',
-        }),
-        shotTag + '_4_final', `${siteName} final — ${finalStatus}`
-      );
-      resolve({ status: finalStatus, detail: finalDetail, firstRun, durationMs: Date.now() - start });
-    }, delay);
-  });
+    const statusMap = {
+      working: CredStatus.WORKING,
+      noAcc: CredStatus.NO_ACC,
+      permDisabled: CredStatus.PERM_DISABLED,
+      tempDisabled: CredStatus.TEMP_DISABLED,
+    };
+    const status = statusMap[data.outcome] || CredStatus.NO_ACC;
+    return { status, detail: data.note || data.outcome, firstRun, durationMs: Date.now() - start };
+  } catch (err) {
+    return { status: CredStatus.NO_ACC, detail: `Server error: ${err.message}`, firstRun, durationMs: Date.now() - start };
+  }
 }
 
 /**
- * Runs a virtual headless PPSR check for a single card, producing 4 debug screenshots.
- * BUG-03 fix: state is updated BEFORE screenshot 4 is taken.
- * @param {object} card - Card object with number, mm, yy, cvv, totalTests, testHistory.
- * @param {string} ppsrUrl - PPSR URL for overlays.
+ * Performs a LIVE PPSR card check via the automation server API (Playwright Chromium).
+ * Calls POST /api/card-check which opens a real headless browser, navigates to the
+ * PPSR URL, fills card details, submits, and returns 4 real browser screenshots.
+ * Falls back to dead outcome if the server is unreachable.
+ * @param {object} card - Card object with number, mm, yy, cvv, totalTests.
+ * @param {string} ppsrUrl - Full URL of the card check page.
  * @returns {Promise<{result: string, detail: string, firstRun: boolean, durationMs: number}>}
  */
-function simulateCheckDetailed(card, ppsrUrl) {
-  return new Promise(resolve => {
-    const baseSeed = `${card.number}|${card.mm}|${card.yy}|${card.cvv}`;
-    const delay = seededDelay(baseSeed, 850, 2100);
-    const firstRun = (card.totalTests || 0) === 0;
-    const start = Date.now();
-    const shotTag = `ppsr_${card.number.slice(-4)}`;
-    const cardNum = maskedNumber(card.number);
-    const expiry = `${card.mm}/${card.yy}`;
+async function simulateCheckDetailed(card, ppsrUrl) {
+  const firstRun = (card.totalTests || 0) === 0;
+  const start = Date.now();
+  const shotTag = `ppsr_${card.number.slice(-4)}`;
 
-    enqueueShot(
-      () => buildCardFormOverlay({ cardNum: card.number, expiry, cvv: card.cvv, shotLabel: '[1/4] Form submitted', ppsrUrl }),
-      shotTag + '_1_form', `PPSR form filled — ···${card.number.slice(-4)}`
-    );
+  try {
+    const resp = await fetch('/api/card-check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        number: card.number,
+        mm: card.mm,
+        yy: card.yy,
+        cvv: card.cvv,
+        ppsrUrl,
+        timeout: (state.settings.checkTimeout || 180) * 1000,
+      }),
+    });
+    if (!resp.ok) throw new Error(`API ${resp.status}`);
+    const data = await resp.json();
 
-    setTimeout(() => {
-      const primary = ppsrOutcomeFromSeed(baseSeed + ':primary');
-      const isWorking = primary.result === 'working';
-      const httpStatus = isWorking ? '200 OK' : '402 Payment Required';
+    const shots = data.shots || ['', '', '', ''];
+    const notes = [
+      `PPSR — page loaded — ···${card.number.slice(-4)}`,
+      `PPSR — form filled — ···${card.number.slice(-4)}`,
+      `PPSR — first response`,
+      `PPSR — ${data.outcome || 'done'}`,
+    ];
+    shots.forEach((dataUrl, i) => {
+      if (dataUrl) saveDebugShot(dataUrl, `${shotTag}_${i + 1}`, notes[i]);
+    });
 
-      enqueueShot(
-        () => buildCardResponseOverlay({ ppsrUrl, outcomeText: primary.detail, httpStatus, isWorking, shotLabel: '[2/4] First response' }),
-        shotTag + '_2_response', `PPSR first response — ${primary.result}`
-      );
-
-      if (!firstRun || isWorking) {
-        enqueueShot(
-          () => buildCardFinalOverlay({
-            cardNum, statusEmoji: isWorking ? '✅' : '❌',
-            statusText: isWorking ? 'WORKING' : 'DEAD',
-            detail: primary.detail, ppsrUrl,
-            durationMs: Date.now() - start, ts: Date.now(),
-            shotLabel: '[4/4] Final result',
-          }),
-          shotTag + '_4_final', `PPSR final — ${primary.result}`
-        );
-        resolve({ ...primary, firstRun, durationMs: Date.now() - start });
-        return;
-      }
-
-      enqueueShot(
-        () => buildCardVerifyOverlay({ ppsrUrl, cardNum: card.number, shotLabel: '[3/4] Verification submitted' }),
-        shotTag + '_3_verify', `PPSR verify — ···${card.number.slice(-4)}`
-      );
-
-      const verify = ppsrOutcomeFromSeed(baseSeed + ':verify');
-      const finalResult = verify.result === 'working' ? 'working' : primary.result;
-      const finalDetail = verify.result === 'working'
-        ? 'PPSR check passed — no encumbrance (verified)'
-        : primary.detail;
-
-      enqueueShot(
-        () => buildCardFinalOverlay({
-          cardNum, statusEmoji: finalResult === 'working' ? '✅' : '❌',
-          statusText: finalResult === 'working' ? 'WORKING' : 'DEAD',
-          detail: finalDetail, ppsrUrl,
-          durationMs: Date.now() - start, ts: Date.now(),
-          shotLabel: '[4/4] Final result',
-        }),
-        shotTag + '_4_final', `PPSR final — ${finalResult}`
-      );
-      resolve({ result: finalResult, detail: finalDetail, firstRun, durationMs: Date.now() - start });
-    }, delay);
-  });
+    const result = data.outcome === 'working' ? Status.WORKING : Status.DEAD;
+    return { result: data.outcome || 'dead', detail: data.note || data.outcome, firstRun, durationMs: Date.now() - start };
+  } catch (err) {
+    return { result: 'dead', detail: `Server error: ${err.message}`, firstRun, durationMs: Date.now() - start };
+  }
 }
 
 
@@ -2903,6 +2879,25 @@ function boot() {
   wireEvents();
   renderAll();
   void detectIP();
+  void checkServerStatus();
+}
+
+/**
+ * Pings the automation API server to verify it is running and shows a toast
+ * if it is unavailable. The webapp requires the Node.js server for live checks.
+ */
+async function checkServerStatus() {
+  try {
+    const resp = await fetch('/api/status', { signal: AbortSignal.timeout ? AbortSignal.timeout(4000) : undefined });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.mode === 'live') toast('🟢 Automation server online — live checks active', 'success', 3000);
+    } else {
+      toast('⚠️ Automation server error — run: npm start', 'error', 6000);
+    }
+  } catch {
+    toast('⚠️ Automation server offline — run: npm start in project folder', 'error', 6000);
+  }
 }
 
 boot();
