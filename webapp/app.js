@@ -2331,8 +2331,18 @@ function closeScreenshots() { $('screenshotModal').classList.add('hidden'); }
 function openDebugShot(id) {
   const shot = state.debugShots.find(s => s.id === id);
   if (!shot) return;
-  const a = document.createElement('a');
-  a.href = shot.dataUrl; a.target = '_blank'; a.rel = 'noopener noreferrer'; a.click();
+  fetch(shot.dataUrl)
+    .then(r => r.blob())
+    .then(blob => {
+      const blobUrl = URL.createObjectURL(blob);
+      const win = window.open(blobUrl, '_blank');
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+      if (!win) {
+        const a = document.createElement('a');
+        a.href = blobUrl; a.target = '_blank'; a.click();
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+      }
+    });
 }
 
 /**
