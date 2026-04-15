@@ -291,26 +291,34 @@ async function determineLoginOutcome(page, loginUrl) {
     return { outcome: 'permDisabled', note: 'Account banned' };
   }
 
-  // ── Strong success signals ───────────────────────────────────────────────
-  // High-confidence: URL moved to an account/game area (not just /login or / )
-  const loginHostname = new URL(loginUrl).hostname.toLowerCase();
+  // ── Joe Fortune: specific success signals ───────────────────────────────
+  // Signal 1: green "Welcome!" banner with checkmark shown immediately after login
+  if (/^\s*welcome\s*!?\s*$/im.test(bodyText) || /✓.*welcome|welcome.*✓/i.test(bodyText)) {
+    return { outcome: 'working', note: 'Joe Fortune — Welcome! banner detected (login successful)' };
+  }
+  // Signal 2: redirected to lobby — nav shows "JOE FORTUNE" + DEPOSIT button + account icon
+  // Detected by URL leaving /login and body containing "deposit" without login-page content
   const urlPath = (() => { try { return new URL(page.url()).pathname.toLowerCase(); } catch { return ''; } })();
-  const successUrlPaths = ['/account', '/dashboard', '/cashier', '/lobby', '/deposit', '/withdraw', '/profile', '/my-account', '/game'];
-  const urlIndicatesSuccess = successUrlPaths.some(p => urlPath.startsWith(p));
+  const isOffLoginPage = !url.includes('/login') && !url.includes('/sign-in') && !url.includes('/signin');
+  if (isOffLoginPage && /hot pokies|new & exclusive|live casino|specialty games/i.test(bodyText)) {
+    return { outcome: 'working', note: 'Joe Fortune — casino lobby detected (login successful)' };
+  }
+  if (isOffLoginPage && /deposit/i.test(bodyText) && /joe fortune/i.test(bodyText) && /welcome back/i.test(bodyText)) {
+    return { outcome: 'working', note: 'Joe Fortune — Welcome Back screen detected (login successful)' };
+  }
 
-  // High-confidence body text (specific casino post-login page content)
+  // ── General strong success signals ──────────────────────────────────────
+  const urlIndicatesSuccess = ['/account', '/dashboard', '/cashier', '/lobby', '/deposit', '/withdraw', '/profile', '/my-account', '/game', '/casino'].some(p => urlPath.startsWith(p));
   const strongSuccessPatterns = [
-    /my account/i, /account balance/i, /your balance/i, /\$[\d,]+\.\d{2}/,
-    /make a deposit/i, /cashier/i, /account overview/i, /welcome back/i,
-    /logout/i, /log out/i, /sign out/i, /deposit now/i, /withdrawal/i,
+    /welcome back/i, /account balance/i, /your balance/i, /\$[\d,]+\.\d{2}/,
+    /make a deposit/i, /account overview/i,
+    /logout/i, /log out/i, /sign out/i, /withdrawal/i,
   ];
   const hasStrongSuccessText = strongSuccessPatterns.some(p => p.test(bodyText));
-
-  // Soft success: moderate indicators — only count if URL also changed to account area
-  const softSuccessPatterns = [/dashboard/i, /lobby/i, /balance/i, /profile/i];
+  const softSuccessPatterns = [/hot pokies/i, /live casino/i, /lobby/i, /balance/i];
   const hasSoftSuccessText = softSuccessPatterns.some(p => p.test(bodyText));
 
-  if (hasStrongSuccessText && !url.includes('/login') && !url.includes('/sign-in')) {
+  if (hasStrongSuccessText && isOffLoginPage) {
     return { outcome: 'working', note: 'Login successful — account area detected' };
   }
   if (urlIndicatesSuccess && hasSoftSuccessText) {
