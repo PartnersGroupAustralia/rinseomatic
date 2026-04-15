@@ -284,20 +284,14 @@ async function determineLoginOutcome(page, loginUrl) {
 
   // ── Hard failure signals (check first) ──────────────────────────────────
   // Joe Fortune exact: "Your account has been disabled. Please, contact Customer Service."
-  // Shown inside the "WELCOME BACK!" login form — page stays on /login
-  if (/your account has been disabled\.\s*please,?\s*contact customer service/i.test(bodyText)) {
+  // This is the ONLY signal that indicates permanent disable — red textbox below login form.
+  if (/your account has been disabled\.\s*please,?\s*contact\s+customer\s+service/i.test(bodyText)) {
     return { outcome: 'permDisabled', note: 'Joe Fortune — account permanently disabled (contact Customer Service)' };
-  }
-  if (/account.*disabled|disabled.*account|account.*suspended|permanently.*suspended/i.test(bodyText)) {
-    return { outcome: 'permDisabled', note: 'Account is permanently disabled or suspended' };
   }
   // Joe Fortune exact: "Sorry, your account has been temporarily disabled due to
   // too many failed login attempts. Contact us immediately to re-enable."
   if (/temporarily disabled due to too many failed login attempt/i.test(bodyText)) {
     return { outcome: 'tempDisabled', note: 'Joe Fortune — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.' };
-  }
-  if (/temporarily.*blocked|too many.*attempt|locked.*out|try again later|rate.?limit/i.test(bodyText)) {
-    return { outcome: 'tempDisabled', note: 'Account temporarily locked — too many attempts. Retry eligible after ~1 hour.' };
   }
   // Joe Fortune exact — attempt 1 wrong password:
   // "Oops! Your email and/or password are incorrect. Please check that your CAPS lock is not on and try again."
@@ -532,9 +526,10 @@ async function waitForLoginResponse(page, maxWaitMs = RESPONSE_POLL_MS) {
     const url  = page.url().toLowerCase();
 
     // ── Disabled (check before success — these appear on the login page) ──
-    if (/your account has been disabled.*contact customer service/i.test(body)) return RESP.PERM_DISABLED;
+    // Permanently disabled: ONLY the exact Joe Fortune red textbox message
+    if (/your account has been disabled\.\s*please,?\s*contact\s+customer\s+service/i.test(body)) return RESP.PERM_DISABLED;
+    // Temporarily disabled: too many failed attempts
     if (/temporarily disabled due to too many failed login attempt/i.test(body)) return RESP.TEMP_DISABLED;
-    if (/account.*banned|banned.*account/i.test(body)) return RESP.PERM_DISABLED;
 
     // ── Wrong password signals (also appear on the login page) ────────────
     if (/your email and\/or password remain incorrect.*further failed attempt/i.test(body)) return RESP.WRONG_PASS_2;
