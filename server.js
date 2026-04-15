@@ -151,6 +151,76 @@ async function fillLoginForm(page, username, password) {
 }
 
 /**
+ * Attempts to dismiss any visible cookie consent / GDPR popup by clicking
+ * common accept/dismiss buttons. Runs silently — never throws.
+ *
+ * Tries text-based button matches first (most reliable across sites), then
+ * falls back to common class/id/attribute selectors used by popular consent
+ * management platforms (OneTrust, Cookiebot, TrustArc, etc.).
+ *
+ * Should be called after every page.goto() and after form submissions that
+ * may trigger a new page load with a fresh consent overlay.
+ *
+ * @param {import('playwright').Page} page - The Playwright page.
+ * @returns {Promise<void>}
+ */
+async function dismissCookiePopup(page) {
+  const textSelectors = [
+    'button:has-text("Accept all")',
+    'button:has-text("Accept All")',
+    'button:has-text("Accept All Cookies")',
+    'button:has-text("Accept all cookies")',
+    'button:has-text("Accept & Continue")',
+    'button:has-text("Accept")',
+    'button:has-text("Accept cookies")',
+    'button:has-text("Allow all")',
+    'button:has-text("Allow All")',
+    'button:has-text("Allow All Cookies")',
+    'button:has-text("I Accept")',
+    'button:has-text("I agree")',
+    'button:has-text("I Agree")',
+    'button:has-text("Agree")',
+    'button:has-text("Got it")",',
+    'button:has-text("Got It")',
+    'button:has-text("OK")',
+    'button:has-text("Ok")',
+    'button:has-text("Close")',
+    'button:has-text("Dismiss")',
+    'button:has-text("Continue")',
+  ];
+  const attrSelectors = [
+    // OneTrust
+    '#onetrust-accept-btn-handler',
+    '.onetrust-close-btn-handler',
+    // Cookiebot
+    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+    // TrustArc
+    '.trustarc-agree-btn',
+    '.truste_popframe .pdynamicbutton',
+    // Generic consent platforms
+    '[id*="cookie"][id*="accept" i]',
+    '[id*="cookie"][id*="allow" i]',
+    '[class*="cookie"][class*="accept" i]',
+    '[class*="cookie-consent"] button',
+    '[class*="cookie-banner"] button',
+    '[class*="cookie-notice"] button',
+    '[aria-label*="accept" i][role="button"]',
+    '[data-testid*="cookie-accept" i]',
+    '[data-testid*="consent-accept" i]',
+  ];
+
+  for (const sel of [...textSelectors, ...attrSelectors]) {
+    try {
+      const el = page.locator(sel.endsWith(',') ? sel.slice(0, -1) : sel).first();
+      if (await el.count() > 0 && await el.isVisible({ timeout: 400 })) {
+        await el.click({ timeout: 1000 });
+        return;
+      }
+    } catch {}
+  }
+}
+
+/**
  * Clicks the login/submit button on a login form by trying common selectors.
  * @param {import('playwright').Page} page - The Playwright page.
  * @returns {Promise<boolean>} True if a submit button was found and clicked.
@@ -425,6 +495,7 @@ app.post('/api/login-check', async (req, res) => {
     // Navigate to login page
     await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout });
     await page.waitForTimeout(2000);
+    await dismissCookiePopup(page);
 
     // Fill the login form
     const filled = await fillLoginForm(page, username, password);
@@ -443,6 +514,7 @@ app.post('/api/login-check', async (req, res) => {
 
     // Shot 2: immediately after submit (first response)
     await page.waitForTimeout(1500);
+    await dismissCookiePopup(page);
     shots[1] = await captureShot(page, 'SCR 2/4');
 
     // Wait for page to settle
@@ -452,6 +524,7 @@ app.post('/api/login-check', async (req, res) => {
       // Network may never be idle on SPAs — continue anyway
     }
     await page.waitForTimeout(1500);
+    await dismissCookiePopup(page);
 
     // Shot 3: after page settled
     shots[2] = await captureShot(page, 'SCR 3/4');
@@ -521,6 +594,7 @@ app.post('/api/card-check', async (req, res) => {
     // Navigate to check page
     await page.goto(ppsrUrl, { waitUntil: 'domcontentloaded', timeout });
     await page.waitForTimeout(2000);
+    await dismissCookiePopup(page);
 
     // Shot 1: page loaded, form visible
     shots[0] = await captureShot(page, 'SCR 1/4');
@@ -546,6 +620,7 @@ app.post('/api/card-check', async (req, res) => {
       await page.waitForLoadState('networkidle', { timeout: POST_SUBMIT_WAIT });
     } catch {}
     await page.waitForTimeout(1000);
+    await dismissCookiePopup(page);
 
     // Shot 3: first response after submit
     shots[2] = await captureShot(page, 'SCR 3/4');
