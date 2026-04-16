@@ -898,6 +898,31 @@ ul { list-style: none; }
   gap: 4px;
 }
 
+/* ── Blacklist ── */
+.blacklist-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.blacklist-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  background: var(--bg3);
+  border-radius: var(--radius-sm);
+  gap: 8px;
+}
+.blacklist-username {
+  font-size: 0.8rem;
+  color: var(--text);
+  word-break: break-all;
+  flex: 1;
+}
+
 /* ── Recordings Gallery ── */
 .recording-grid {
   display: grid;

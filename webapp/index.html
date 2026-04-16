@@ -677,6 +677,24 @@
           </div>
         </div>
 
+        <!-- Blacklist -->
+        <div class="settings-section">
+          <div class="settings-section-header">Blacklist</div>
+          <div class="settings-card">
+            <div class="settings-row">
+              <span>Known disabled / no-account usernames</span>
+              <span id="blacklistCount" class="settings-note">0 entries</span>
+            </div>
+            <div class="settings-note">Paste usernames or user:pass pairs. When credentials are imported, any matching username is automatically marked as Perm Disabled — skipping the check entirely.</div>
+            <textarea id="blacklistImportText" class="import-textarea" placeholder="email@example.com&#10;user:pass&#10;anotheruser@email.com" style="min-height:110px;margin-top:8px"></textarea>
+            <div class="settings-row" style="margin-top:8px;gap:8px">
+              <button class="btn-primary" id="blacklistImportBtn">➕ Add to Blacklist</button>
+              <button class="btn-danger" id="blacklistClearBtn">🗑 Clear All</button>
+            </div>
+            <div id="blacklistList" class="blacklist-list"></div>
+          </div>
+        </div>
+
         <!-- Appearance -->
         <div class="settings-section">
           <div class="settings-section-header">Appearance</div>

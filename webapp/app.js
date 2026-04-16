@@ -56,6 +56,8 @@ const KEY_ACTIVITY   = 'sitcho_activity';
 const KEY_WG_CONFIGS = 'sitcho_wg_configs';
 /** @constant {string} localStorage key for NordLynx access key string. */
 const KEY_NORD_KEY   = 'sitcho_nord_key';
+/** @constant {string} localStorage key for the blacklist of known-disabled/no-acc usernames. */
+const KEY_BLACKLIST  = 'sitcho_blacklist';
 
 // ── Card status enum ───────────────────────────────────────
 /**
@@ -341,6 +343,8 @@ let state = {
   ignCreds: [],
   /** @type {Array} WireGuard config objects parsed from imported .conf files. */
   wireGuardConfigs: [],
+  /** @type {Array<{id:string, username:string, ts:number, note:string}>} Blacklisted usernames — auto-marked as Perm Disabled on import. */
+  blacklist: [],
   /** @type {string} NordLynx access key (persisted). */
   nordAccessKey: '',
   /** @type {object} User-configurable settings. */
@@ -449,6 +453,25 @@ function saveNordKey() {
 }
 
 /**
+ * Saves the blacklist to localStorage.
+ * The blacklist is an array of {id, username, ts, note} objects representing
+ * known-bad usernames that should be auto-marked as Perm Disabled on import.
+ */
+function saveBlacklist() {
+  try { localStorage.setItem(KEY_BLACKLIST, JSON.stringify(state.blacklist)); } catch {}
+}
+
+/**
+ * Returns true if the given username exists in the blacklist (case-insensitive).
+ * @param {string} username - The username/email to look up.
+ * @returns {boolean}
+ */
+function isBlacklisted(username) {
+  const u = (username || '').toLowerCase().trim();
+  return state.blacklist.some(b => (b.username || '').toLowerCase().trim() === u);
+}
+
+/**
  * Saves debug screenshots to localStorage with recursive quota-safe trimming.
  * BUG-13 fix: if the first setItem throws a quota error, trims the array by 25%
  * and retries recursively until it fits, rather than silently failing.
@@ -482,6 +505,7 @@ function loadAll() {
   try { state.ignCreds      = JSON.parse(localStorage.getItem(KEY_IGN_CREDS))  || []; } catch { state.ignCreds = []; }
   try { state.activity      = JSON.parse(localStorage.getItem(KEY_ACTIVITY))   || []; } catch { state.activity = []; }
   try { state.wireGuardConfigs = JSON.parse(localStorage.getItem(KEY_WG_CONFIGS)) || []; } catch { state.wireGuardConfigs = []; }
+  try { state.blacklist        = JSON.parse(localStorage.getItem(KEY_BLACKLIST))   || []; } catch { state.blacklist = []; }
   state.nordAccessKey = localStorage.getItem(KEY_NORD_KEY) || '';
   try {
     const s = JSON.parse(localStorage.getItem(KEY_SETTINGS));
@@ -966,6 +990,7 @@ function renderAll() {
   renderCredSite('ign');
   renderSessions();
   renderSettings();
+  renderBlacklist();
 }
 
 // ── Badge helper ────────────────────────────────────────────
@@ -1181,11 +1206,78 @@ function confirmImportCred() {
   if (importCredParsed.length === 0) return;
   const site = state.importCredSite;
   if (!site) { toast('Import session lost — please reopen the import dialog', 'error'); return; }
-  if (site === 'joe') { state.joeCreds.push(...importCredParsed); saveJoeCreds(); }
-  else                { state.ignCreds.push(...importCredParsed); saveIgnCreds(); }
-  toast(`Added ${importCredParsed.length} credential(s)`, 'success');
+  let blacklistedCount = 0;
+  const toImport = importCredParsed.map(c => {
+    if (isBlacklisted(c.username)) {
+      blacklistedCount++;
+      return { ...c, status: CredStatus.PERM_DISABLED };
+    }
+    return c;
+  });
+  if (site === 'joe') { state.joeCreds.push(...toImport); saveJoeCreds(); }
+  else                { state.ignCreds.push(...toImport); saveIgnCreds(); }
+  let msg = `Added ${toImport.length} credential(s)`;
+  if (blacklistedCount > 0) msg += ` — ${blacklistedCount} auto-marked Perm Disabled (blacklist)`;
+  toast(msg, 'success');
   closeImportCred();
   renderAll();
+}
+
+// ── Blacklist ──────────────────────────────────────────────
+/**
+ * Adds usernames parsed from the blacklist textarea to the blacklist.
+ * Accepts the same formats as credential import (user:pass, user|pass, plain email, etc.)
+ * — only the username portion is stored. Deduplicates against existing entries.
+ * Saves and re-renders the blacklist section.
+ */
+function importBlacklist() {
+  const raw = ($('blacklistImportText').value || '').trim();
+  if (!raw) return;
+  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  let added = 0;
+  for (const line of lines) {
+    const username = line.split(/[:;|, \t]/)[0].trim();
+    if (!username) continue;
+    if (!isBlacklisted(username)) {
+      state.blacklist.push({ id: crypto.randomUUID(), username, ts: Date.now(), note: '' });
+      added++;
+    }
+  }
+  saveBlacklist();
+  $('blacklistImportText').value = '';
+  renderBlacklist();
+  toast(added > 0 ? `${added} username(s) added to blacklist` : 'All entries already in blacklist', added > 0 ? 'success' : 'info');
+}
+
+/**
+ * Removes a single entry from the blacklist by ID.
+ * @param {string} id - The blacklist entry UUID to remove.
+ */
+function removeBlacklistEntry(id) {
+  state.blacklist = state.blacklist.filter(b => b.id !== id);
+  saveBlacklist();
+  renderBlacklist();
+}
+
+/**
+ * Re-renders the blacklist list and count in the Settings panel.
+ * Shows each blacklisted username with a remove button.
+ */
+function renderBlacklist() {
+  const countEl = $('blacklistCount');
+  const listEl  = $('blacklistList');
+  if (!countEl || !listEl) return;
+  const n = state.blacklist.length;
+  countEl.textContent = `${n} entr${n === 1 ? 'y' : 'ies'}`;
+  if (n === 0) {
+    listEl.innerHTML = '<div class="settings-note" style="padding:6px 0">No entries yet.</div>';
+    return;
+  }
+  listEl.innerHTML = state.blacklist.map(b => `
+    <div class="blacklist-row">
+      <span class="blacklist-username">${b.username}</span>
+      <button class="icon-text-btn danger" data-bl-remove="${b.id}">✕</button>
+    </div>`).join('');
 }
 
 // ── Credential Detail Modal ────────────────────────────────
@@ -2829,6 +2921,7 @@ function wireEvents() {
       state.cards = []; state.sessions = []; state.activity = [];
       clearAllRecordings(); state.debugShots = [];
       state.joeCreds = []; state.ignCreds = [];
+      state.blacklist = [];
       state.wireGuardConfigs = []; state.nordAccessKey = '';
       state.grokKey = '';
       state.settings = {
@@ -2877,6 +2970,18 @@ function wireEvents() {
     openConfirm('Remove NordLynx Key', 'Remove the saved NordLynx access key?', () => {
       state.nordAccessKey = ''; saveNordKey(); toast('NordLynx key removed', 'info'); renderSettings();
     });
+  });
+
+  $('blacklistImportBtn')?.addEventListener('click', importBlacklist);
+  $('blacklistClearBtn')?.addEventListener('click', () => {
+    if (state.blacklist.length === 0) { toast('Blacklist is already empty', 'info'); return; }
+    openConfirm('Clear Blacklist', `Remove all ${state.blacklist.length} blacklist entr${state.blacklist.length === 1 ? 'y' : 'ies'}?`, () => {
+      state.blacklist = []; saveBlacklist(); renderBlacklist(); toast('Blacklist cleared', 'info');
+    });
+  });
+  $('blacklistList')?.addEventListener('click', e => {
+    const id = e.target.closest('[data-bl-remove]')?.dataset.blRemove;
+    if (id) removeBlacklistEntry(id);
   });
 
   document.addEventListener('keydown', e => {
