@@ -76,15 +76,15 @@
 
 /* ── Reset ── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { font-size: 16px; }
+html { font-size: 16px; height: 100%; overflow: hidden; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
   background: var(--bg);
   color: var(--text);
-  min-height: 100dvh;
+  height: 100dvh;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
-  overflow-x: hidden;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -210,14 +210,19 @@ ul { list-style: none; }
 /* ── Main Content ── */
 .main-content {
   flex: 1;
+  min-height: 0;
   max-width: 960px;
   margin: 0 auto;
   width: 100%;
   position: relative;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 .tab-panel {
   display: none;
-  height: calc(100dvh - 111px - var(--ip-banner-h, 0px));
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
 .tab-panel.active { display: flex; flex-direction: column; }
@@ -1024,9 +1029,7 @@ ul { list-style: none; }
   .tab-btn { font-size: 0.7rem; padding: 9px 8px 7px; }
   .tab-label { font-size: 0.66rem; }
 }
-@media (min-width: 960px) {
-  .tab-panel { height: calc(100dvh - 109px - var(--ip-banner-h, 0px)); }
-}
+
 
 /* ── WireGuard Config List ── */
 .wg-list { display: flex; flex-direction: column; gap: 1px; border-radius: var(--radius-sm); overflow: hidden; margin-top: 6px; }
