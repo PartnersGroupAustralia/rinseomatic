@@ -602,20 +602,19 @@ app.post('/api/login-check', async (req, res) => {
     await page.waitForTimeout(700);
     shots[0] = await captureShot(page, 'SCR 1/4');
 
-    // ── Step 2: First submit → 0.9s → SCR 2/4 ────────────────────────────
+    // ── Step 2: First submit → wait for real response → SCR 2/4 ─────────
     let respType = RESP.UNKNOWN;
     const siteName = site === 'ign' ? 'Ignition' : 'Joe Fortune';
 
     const clicked1 = await clickSubmit(page);
     if (!clicked1) await page.keyboard.press('Enter');
 
-    // Wait 0.9s after the submit click then capture SCR 2/4
-    await page.waitForTimeout(900);
-    shots[1] = await captureShot(page, 'SCR 2/4');
-
-    // Now poll remaining time (~4.1s) to detect the response
-    respType = await waitForLoginResponse(page, 4100);
+    // Poll up to 5s for a known response BEFORE taking SCR 2/4 so the
+    // screenshot actually shows the login result, not a blank loading state.
+    respType = await waitForLoginResponse(page, 5000);
     await dismissCookiePopup(page);
+    await page.waitForTimeout(600); // brief settle so the DOM finishes painting
+    shots[1] = await captureShot(page, 'SCR 2/4');
 
     // Evaluate result after first attempt
     if (respType === RESP.SUCCESS) {
@@ -629,20 +628,18 @@ app.post('/api/login-check', async (req, res) => {
       note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
     }
 
-    // ── Step 3: Retry submit (if needed) → 0.9s → SCR 3/4 ───────────────
+    // ── Step 3: Retry submit → wait for real response → SCR 3/4 ─────────
     if (respType === RESP.WRONG_PASS_1 || respType === RESP.WRONG_PASS_2 || respType === RESP.UNKNOWN) {
       // Re-fill and submit again
       await fillLoginForm(page, username, password);
       const clicked2 = await clickSubmit(page);
       if (!clicked2) await page.keyboard.press('Enter');
 
-      // Wait 0.9s after the retry click then capture SCR 3/4
-      await page.waitForTimeout(900);
-      shots[2] = await captureShot(page, 'SCR 3/4');
-
-      // Poll for response after retry
-      respType = await waitForLoginResponse(page, 4100);
+      // Poll for response BEFORE taking SCR 3/4 so we capture the real result.
+      respType = await waitForLoginResponse(page, 5000);
       await dismissCookiePopup(page);
+      await page.waitForTimeout(600);
+      shots[2] = await captureShot(page, 'SCR 3/4');
 
       if (respType === RESP.SUCCESS) {
         outcome = 'working';
@@ -658,20 +655,23 @@ app.post('/api/login-check', async (req, res) => {
         note = `${siteName} — incorrect credentials on retry (account does not exist or wrong password)`;
       }
     } else {
-      // Outcome already determined after attempt 1 — still take SCR 3/4
-      await page.waitForTimeout(900);
+      // Outcome determined after attempt 1 — SCR 3/4 shows the same resolved state
+      await page.waitForTimeout(600);
       shots[2] = await captureShot(page, 'SCR 3/4');
     }
 
-    // ── Step 4: Fallback account-page check → 0.9s → SCR 4/4 ────────────
+    // ── Step 4: Fallback account-page check → SCR 4/4 ────────────────────
     // Navigates to the account page directly. If it loads without redirecting
-    // back to /login the session is active (logged in). This is the 4th click.
+    // back to /login the session is active (logged in).
+    // Uses 'load' waitUntil + 2.5s extra settle to ensure the page renders
+    // visually before the screenshot is taken (avoids blank/white frames).
     const needsFallback = outcome !== 'working' && outcome !== 'permDisabled' && outcome !== 'tempDisabled';
     try {
       const accountUrl = site === 'ign'
         ? loginUrl.replace(/\/login.*$/, '/account')
         : 'https://joefortunepokies.win/account';
-      await page.goto(accountUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await page.goto(accountUrl, { waitUntil: 'load', timeout: 20000 });
+      await page.waitForTimeout(2500); // wait for JS-rendered content to paint
       await dismissCookiePopup(page);
 
       if (needsFallback) {
@@ -689,10 +689,9 @@ app.post('/api/login-check', async (req, res) => {
         outcome = 'noAcc';
         note = `Fallback check failed: ${fallbackErr.message}`;
       }
+      // Still take SCR 4/4 of whatever state the page is in
     }
 
-    // SCR 4/4 — 0.9s after the account page goto (4th click)
-    await page.waitForTimeout(900);
     shots[3] = await captureShot(page, 'SCR 4/4');
 
   } catch (err) {
