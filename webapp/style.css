@@ -904,6 +904,37 @@ ul { list-style: none; }
   gap: 4px;
 }
 
+/* ── Flow Recorder ── */
+.flow-site-row { display: flex; flex-direction: column; gap: 8px; padding: 4px 0; }
+.flow-site-header {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.flow-actions { margin-left: auto; display: flex; gap: 6px; }
+.flow-status {
+  font-size: 0.75rem; color: var(--text3); white-space: nowrap;
+}
+.flow-status.recorded { color: var(--green); }
+.flow-status.recording { color: var(--red); }
+.flow-detail {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 6px 0 2px;
+}
+.flow-step-row {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 0.78rem;
+}
+.flow-step-label {
+  color: var(--text2); white-space: nowrap; min-width: 110px; flex-shrink: 0;
+}
+.flow-step-sel {
+  background: var(--bg4); border-radius: 4px; padding: 2px 6px;
+  font-family: 'SF Mono', 'Menlo', monospace; font-size: 0.72rem;
+  color: var(--accent); word-break: break-all;
+}
+.flow-divider {
+  border: none; border-top: 0.5px solid var(--border); margin: 8px 0;
+}
+
 /* ── Blacklist ── */
 .blacklist-list {
   display: flex;

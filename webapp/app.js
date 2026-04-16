@@ -58,6 +58,10 @@ const KEY_WG_CONFIGS = 'sitcho_wg_configs';
 const KEY_NORD_KEY   = 'sitcho_nord_key';
 /** @constant {string} localStorage key for the blacklist of known-disabled/no-acc usernames. */
 const KEY_BLACKLIST  = 'sitcho_blacklist';
+/** @constant {string} localStorage key for Joe Fortune recorded flow selectors. */
+const KEY_JOE_FLOW   = 'sitcho_joe_flow';
+/** @constant {string} localStorage key for Ignition recorded flow selectors. */
+const KEY_IGN_FLOW   = 'sitcho_ign_flow';
 
 // ── Card status enum ───────────────────────────────────────
 /**
@@ -345,6 +349,16 @@ let state = {
   wireGuardConfigs: [],
   /** @type {Array<{id:string, username:string, ts:number, note:string}>} Blacklisted usernames — auto-marked as Perm Disabled on import. */
   blacklist: [],
+  /**
+   * @type {string[]|null} Recorded CSS selectors for Joe Fortune login flow.
+   * Index 0 = cookie dismiss, 1 = email field, 2 = password field, 3 = submit button.
+   */
+  joeFlow: null,
+  /**
+   * @type {string[]|null} Recorded CSS selectors for Ignition login flow.
+   * Index 0 = cookie dismiss, 1 = email field, 2 = password field, 3 = submit button.
+   */
+  ignFlow: null,
   /** @type {string} NordLynx access key (persisted). */
   nordAccessKey: '',
   /** @type {object} User-configurable settings. */
@@ -506,6 +520,8 @@ function loadAll() {
   try { state.activity      = JSON.parse(localStorage.getItem(KEY_ACTIVITY))   || []; } catch { state.activity = []; }
   try { state.wireGuardConfigs = JSON.parse(localStorage.getItem(KEY_WG_CONFIGS)) || []; } catch { state.wireGuardConfigs = []; }
   try { state.blacklist        = JSON.parse(localStorage.getItem(KEY_BLACKLIST))   || []; } catch { state.blacklist = []; }
+  try { state.joeFlow          = JSON.parse(localStorage.getItem(KEY_JOE_FLOW))    || null; } catch { state.joeFlow = null; }
+  try { state.ignFlow          = JSON.parse(localStorage.getItem(KEY_IGN_FLOW))    || null; } catch { state.ignFlow = null; }
   state.nordAccessKey = localStorage.getItem(KEY_NORD_KEY) || '';
   try {
     const s = JSON.parse(localStorage.getItem(KEY_SETTINGS));
@@ -991,6 +1007,7 @@ function renderAll() {
   renderSessions();
   renderSettings();
   renderBlacklist();
+  renderFlowRecorder();
 }
 
 // ── Badge helper ────────────────────────────────────────────
@@ -1278,6 +1295,116 @@ function renderBlacklist() {
       <span class="blacklist-username">${b.username}</span>
       <button class="icon-text-btn danger" data-bl-remove="${b.id}">✕</button>
     </div>`).join('');
+}
+
+// ── Flow Recorder ──────────────────────────────────────────
+
+/** @description Labels for the 4 recorded flow selectors displayed in Settings. */
+const FLOW_STEP_LABELS = ['Cookie Dismiss', 'Email Field', 'Password Field', 'Submit Button'];
+
+/**
+ * Saves the recorded flow selectors for the given site to localStorage.
+ * @param {'joe'|'ign'} site
+ * @param {string[]|null} selectors
+ */
+function saveFlow(site, selectors) {
+  const key = site === 'joe' ? KEY_JOE_FLOW : KEY_IGN_FLOW;
+  try {
+    if (selectors) localStorage.setItem(key, JSON.stringify(selectors));
+    else localStorage.removeItem(key);
+  } catch {}
+}
+
+/**
+ * Re-renders the Flow Recorder UI in Settings for both sites.
+ * Shows recorded selectors (if any) and the Record / Clear buttons.
+ */
+function renderFlowRecorder() {
+  ['joe', 'ign'].forEach(site => {
+    const flow = site === 'joe' ? state.joeFlow : state.ignFlow;
+    const statusEl  = $(`${site}FlowStatus`);
+    const detailEl  = $(`${site}FlowDetail`);
+    const recordBtn = $(`${site}FlowRecordBtn`);
+    const clearBtn  = $(`${site}FlowClearBtn`);
+    if (!statusEl) return;
+
+    if (flow && Array.isArray(flow) && flow.length === 4) {
+      statusEl.textContent = '✅ Recorded';
+      statusEl.className = 'flow-status recorded';
+      detailEl.innerHTML = flow.map((sel, i) =>
+        `<div class="flow-step-row"><span class="flow-step-label">${FLOW_STEP_LABELS[i]}</span><code class="flow-step-sel">${sel}</code></div>`
+      ).join('');
+      if (clearBtn) clearBtn.classList.remove('hidden');
+    } else {
+      statusEl.textContent = 'Not recorded';
+      statusEl.className = 'flow-status';
+      detailEl.innerHTML = '<div class="settings-note" style="padding:4px 0">No flow recorded yet. Click Record to open a browser and manually click each element.</div>';
+      if (clearBtn) clearBtn.classList.add('hidden');
+    }
+    if (recordBtn) recordBtn.disabled = false;
+  });
+}
+
+/**
+ * Starts a flow recording session for the given site.
+ * Opens a headed browser on the login page via the server API, then polls
+ * /api/record-flow/status every 800ms to update the step indicator in the UI.
+ * When the POST resolves, saves the selectors and re-renders.
+ * @param {'joe'|'ign'} site
+ */
+async function startFlowRecording(site) {
+  const loginUrl = site === 'joe'
+    ? (state.settings.joeLoginUrl || 'https://joefortunepokies.win/login')
+    : (state.settings.ignitionLoginUrl || 'https://ignitioncasino.ooo/?overlay=login');
+
+  const statusEl  = $(`${site}FlowStatus`);
+  const detailEl  = $(`${site}FlowDetail`);
+  const recordBtn = $(`${site}FlowRecordBtn`);
+  if (recordBtn) recordBtn.disabled = true;
+  if (statusEl) { statusEl.textContent = '🔴 Recording…'; statusEl.className = 'flow-status recording'; }
+  if (detailEl) detailEl.innerHTML = '<div class="flow-step-row"><span class="flow-step-label">Step 1/4</span><span class="settings-note">A browser window will open — follow the on-screen instructions</span></div>';
+
+  // Poll status while POST is in-flight
+  let pollInterval = setInterval(async () => {
+    try {
+      const r = await fetch('/api/record-flow/status');
+      const d = await r.json();
+      if (!d.active) return;
+      if (statusEl) statusEl.textContent = `🔴 Step ${d.step + 1}/4`;
+      if (detailEl && d.step < 4) {
+        detailEl.innerHTML = `<div class="flow-step-row"><span class="flow-step-label">Step ${d.step + 1}/4</span><span class="settings-note">${d.label}</span></div>`;
+      }
+    } catch {}
+  }, 800);
+
+  try {
+    const res = await fetch('/api/record-flow', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ loginUrl }),
+    });
+    const data = await res.json();
+    clearInterval(pollInterval);
+
+    if (data.error) {
+      toast(`Recording failed: ${data.error}`, 'error');
+      if (statusEl) { statusEl.textContent = '❌ Failed'; statusEl.className = 'flow-status'; }
+      if (recordBtn) recordBtn.disabled = false;
+      return;
+    }
+
+    if (site === 'joe') state.joeFlow = data.selectors;
+    else                state.ignFlow = data.selectors;
+    saveFlow(site, data.selectors);
+    toast(`${site === 'joe' ? 'Joe Fortune' : 'Ignition'} flow recorded!`, 'success');
+    renderFlowRecorder();
+
+  } catch (err) {
+    clearInterval(pollInterval);
+    toast(`Recording error: ${err.message}`, 'error');
+    if (statusEl) { statusEl.textContent = '❌ Failed'; statusEl.className = 'flow-status'; }
+    if (recordBtn) recordBtn.disabled = false;
+  }
 }
 
 // ── Credential Detail Modal ────────────────────────────────
@@ -2982,6 +3109,19 @@ function wireEvents() {
   $('blacklistList')?.addEventListener('click', e => {
     const id = e.target.closest('[data-bl-remove]')?.dataset.blRemove;
     if (id) removeBlacklistEntry(id);
+  });
+
+  $('joeFlowRecordBtn')?.addEventListener('click', () => startFlowRecording('joe'));
+  $('ignFlowRecordBtn')?.addEventListener('click', () => startFlowRecording('ign'));
+  $('joeFlowClearBtn')?.addEventListener('click', () => {
+    openConfirm('Clear Joe Fortune Flow', 'Remove the recorded flow for Joe Fortune?', () => {
+      state.joeFlow = null; saveFlow('joe', null); renderFlowRecorder(); toast('Joe Fortune flow cleared', 'info');
+    });
+  });
+  $('ignFlowClearBtn')?.addEventListener('click', () => {
+    openConfirm('Clear Ignition Flow', 'Remove the recorded flow for Ignition?', () => {
+      state.ignFlow = null; saveFlow('ign', null); renderFlowRecorder(); toast('Ignition flow cleared', 'info');
+    });
   });
 
   document.addEventListener('keydown', e => {

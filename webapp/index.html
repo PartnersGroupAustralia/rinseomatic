@@ -677,6 +677,46 @@
           </div>
         </div>
 
+        <!-- Flow Recorder -->
+        <div class="settings-section">
+          <div class="settings-section-header">Flow Recorder</div>
+          <div class="settings-card">
+            <div class="settings-note" style="margin-bottom:10px">Record exactly which elements to click for each site. A real browser opens — you click: <strong>1) Cookie dismiss → 2) Email field → 3) Password field → 4) Submit button</strong>. The selectors are saved and used by the automation instead of generic guesses.</div>
+
+            <!-- Joe Fortune row -->
+            <div class="flow-site-row">
+              <div class="flow-site-header">
+                <span class="site-tag joe" style="font-size:0.72rem;padding:2px 8px">🎰 Joe Fortune</span>
+                <span id="joeFlowStatus" class="flow-status">Not recorded</span>
+                <div class="flow-actions">
+                  <button class="btn-primary btn-sm" id="joeFlowRecordBtn">🎬 Record</button>
+                  <button class="btn-danger btn-sm hidden" id="joeFlowClearBtn">🗑</button>
+                </div>
+              </div>
+              <div id="joeFlowDetail" class="flow-detail">
+                <div class="settings-note" style="padding:4px 0">No flow recorded yet.</div>
+              </div>
+            </div>
+
+            <div class="flow-divider"></div>
+
+            <!-- Ignition row -->
+            <div class="flow-site-row">
+              <div class="flow-site-header">
+                <span class="site-tag ignition" style="font-size:0.72rem;padding:2px 8px">🔥 Ignition</span>
+                <span id="ignFlowStatus" class="flow-status">Not recorded</span>
+                <div class="flow-actions">
+                  <button class="btn-primary btn-sm" id="ignFlowRecordBtn">🎬 Record</button>
+                  <button class="btn-danger btn-sm hidden" id="ignFlowClearBtn">🗑</button>
+                </div>
+              </div>
+              <div id="ignFlowDetail" class="flow-detail">
+                <div class="settings-note" style="padding:4px 0">No flow recorded yet.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- Blacklist -->
         <div class="settings-section">
           <div class="settings-section-header">Blacklist</div>

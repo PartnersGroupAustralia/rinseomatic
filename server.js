@@ -810,6 +810,172 @@ app.post('/api/card-check', async (req, res) => {
   res.json({ outcome, note, shots });
 });
 
+// ── API: Flow Recorder ────────────────────────────────────────────────────────
+
+/**
+ * In-memory state for the active flow recording session.
+ * Only one session may be active at a time.
+ * @type {{ step: number, labels: string[], selectors: string[], status: string, error: string } | null}
+ */
+let flowSession = null;
+
+/**
+ * Waits for the user's next click in the recording browser and returns a CSS
+ * selector string for the clicked element. Runs inside the page context via
+ * page.evaluate. Clicks on the recording overlay bar are ignored.
+ * Selector priority: id → input type → name → placeholder → data-testid →
+ *   aria-label → button text → first class → tag name.
+ * @param {import('playwright').Page} page
+ * @returns {Promise<string>} CSS selector for the clicked element.
+ */
+async function waitForRecordedClick(page) {
+  return page.evaluate(() => new Promise(resolve => {
+    function sel(el) {
+      if (!el || el.tagName === 'BODY') return 'body';
+      const tag = el.tagName.toLowerCase();
+      if (el.id && /^[a-zA-Z_]/.test(el.id)) return '#' + el.id;
+      const type = el.getAttribute('type');
+      if (type === 'email')    return 'input[type="email"]';
+      if (type === 'password') return 'input[type="password"]';
+      if (type === 'submit')   return tag + '[type="submit"]';
+      const name = el.getAttribute('name');
+      if (name) return tag + '[name="' + name + '"]';
+      const ph = el.getAttribute('placeholder');
+      if (ph) return tag + '[placeholder="' + ph.replace(/"/g, '\\"') + '"]';
+      const tid = el.getAttribute('data-testid');
+      if (tid) return '[data-testid="' + tid + '"]';
+      const al = el.getAttribute('aria-label');
+      if (al) return '[aria-label="' + al.replace(/"/g, '\\"') + '"]';
+      if (tag === 'button') {
+        const txt = (el.textContent || '').trim().slice(0, 40);
+        if (txt) return 'button:has-text("' + txt.replace(/"/g, '\\"') + '")';
+      }
+      if (el.className && typeof el.className === 'string') {
+        const c = el.className.trim().split(/\s+/)[0];
+        if (c) return tag + '.' + c;
+      }
+      return tag;
+    }
+    function handler(e) {
+      const bar = document.getElementById('_sitcho_rec_bar');
+      if (bar && bar.contains(e.target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      document.removeEventListener('click', handler, true);
+      resolve(sel(e.target));
+    }
+    document.addEventListener('click', handler, true);
+  }));
+}
+
+/** Step labels shown in the recording overlay inside the headed browser. */
+const FLOW_STEPS = [
+  'Click the COOKIE DISMISS / Accept button (or anywhere to skip if none)',
+  'Click the EMAIL / Username text field',
+  'Click the PASSWORD text field',
+  'Click the SUBMIT / Login button',
+];
+
+/**
+ * GET /api/record-flow/status
+ * Returns the current flow recording session state.
+ * Response: { active: bool, step: 0-4, label: string, selectors: string[], status: string, error: string }
+ */
+app.get('/api/record-flow/status', (req, res) => {
+  if (!flowSession) return res.json({ active: false });
+  res.json({
+    active: true,
+    step:      flowSession.step,
+    label:     FLOW_STEPS[flowSession.step] || 'Done',
+    selectors: flowSession.selectors,
+    status:    flowSession.status,
+    error:     flowSession.error || '',
+  });
+});
+
+/**
+ * POST /api/record-flow
+ * Opens a headed (visible) Chromium browser on the login page and records 4
+ * user clicks:  1) cookie dismiss  2) email field  3) password field  4) submit.
+ * A coloured overlay bar guides the user through each step.
+ * Long-polls: responds when all 4 selectors are captured or on timeout/error.
+ *
+ * Request body: { loginUrl: string }
+ * Response:     { selectors: string[4] }  or  { error: string }
+ */
+app.post('/api/record-flow', async (req, res) => {
+  const { loginUrl } = req.body;
+  if (!loginUrl) return res.status(400).json({ error: 'Missing loginUrl' });
+  if (flowSession && flowSession.status === 'recording') {
+    return res.status(409).json({ error: 'A recording session is already active. Close the browser window first.' });
+  }
+
+  flowSession = { step: 0, selectors: [], status: 'recording', error: '' };
+
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: false, args: ['--window-size=1280,800'] });
+    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    const page = await context.newPage();
+
+    await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(1500);
+
+    for (let i = 0; i < FLOW_STEPS.length; i++) {
+      flowSession.step = i;
+
+      // Inject / update the guidance overlay bar at the top of the page
+      await page.evaluate(({ step, label, total }) => {
+        let bar = document.getElementById('_sitcho_rec_bar');
+        if (!bar) {
+          bar = document.createElement('div');
+          bar.id = '_sitcho_rec_bar';
+          bar.style.cssText = [
+            'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:2147483647',
+            'background:rgba(0,0,0,0.88)', 'color:#fff',
+            'padding:10px 16px', 'font:14px/1.4 system-ui,sans-serif',
+            'display:flex', 'align-items:center', 'gap:12px',
+            'border-bottom:2px solid #30d5c8',
+          ].join(';');
+          document.body.prepend(bar);
+        }
+        bar.innerHTML =
+          '<span style="background:#30d5c8;color:#000;padding:2px 8px;border-radius:4px;font-weight:700;white-space:nowrap">' +
+          'STEP ' + (step + 1) + '/' + total + '</span> ' + label;
+      }, { step: i, label: FLOW_STEPS[i], total: FLOW_STEPS.length });
+
+      // Wait for the user's next click (up to 90 s per step)
+      page.setDefaultTimeout(90000);
+      const selector = await waitForRecordedClick(page).catch(() => null);
+
+      if (selector === null) throw new Error(`Timed out waiting for step ${i + 1} click`);
+      flowSession.selectors.push(selector);
+    }
+
+    // Done — show confirmation in the browser
+    await page.evaluate(() => {
+      const bar = document.getElementById('_sitcho_rec_bar');
+      if (bar) {
+        bar.style.background = 'rgba(52,199,89,0.95)';
+        bar.style.color = '#000';
+        bar.style.borderColor = '#28a046';
+        bar.innerHTML = '<strong>✓ Flow recorded!</strong> You can close this window.';
+      }
+    });
+    await page.waitForTimeout(2000);
+
+    flowSession.status = 'done';
+    res.json({ selectors: flowSession.selectors });
+
+  } catch (err) {
+    flowSession.status = 'error';
+    flowSession.error  = err.message;
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
