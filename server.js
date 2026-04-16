@@ -487,11 +487,11 @@ app.get('/api/status', (req, res) => {
 /** Maximum number of login attempts before declaring noAcc. */
 const MAX_LOGIN_ATTEMPTS = 4;
 
-/** How long to poll for a known response after each submit (ms). */
-const RESPONSE_POLL_MS = 5000;
+/** Maximum time to poll for a login response before giving up (ms). */
+const RESPONSE_POLL_MS = 15000;
 
 /** Poll interval while waiting for a response (ms). */
-const POLL_INTERVAL_MS = 500;
+const POLL_INTERVAL_MS = 300;
 
 /**
  * Response type codes returned by waitForLoginResponse.
@@ -609,9 +609,9 @@ app.post('/api/login-check', async (req, res) => {
     const clicked1 = await clickSubmit(page);
     if (!clicked1) await page.keyboard.press('Enter');
 
-    // Poll up to 5s for a known response BEFORE taking SCR 2/4 so the
-    // screenshot actually shows the login result, not a blank loading state.
-    respType = await waitForLoginResponse(page, 5000);
+    // Poll up to RESPONSE_POLL_MS for a known response BEFORE taking SCR 2/4
+    // so the screenshot actually shows the login result, not a loading state.
+    respType = await waitForLoginResponse(page, RESPONSE_POLL_MS);
     await dismissCookiePopup(page);
     await page.waitForTimeout(600); // brief settle so the DOM finishes painting
     shots[1] = await captureShot(page, 'SCR 2/4');
@@ -636,7 +636,7 @@ app.post('/api/login-check', async (req, res) => {
       if (!clicked2) await page.keyboard.press('Enter');
 
       // Poll for response BEFORE taking SCR 3/4 so we capture the real result.
-      respType = await waitForLoginResponse(page, 5000);
+      respType = await waitForLoginResponse(page, RESPONSE_POLL_MS);
       await dismissCookiePopup(page);
       await page.waitForTimeout(600);
       shots[2] = await captureShot(page, 'SCR 3/4');
