@@ -324,7 +324,12 @@ async function determineLoginOutcome(page, loginUrl) {
   // Signal 2: redirected to lobby — nav shows "JOE FORTUNE" + DEPOSIT button + account icon
   // Detected by URL leaving /login and body containing "deposit" without login-page content
   const urlPath = (() => { try { return new URL(page.url()).pathname.toLowerCase(); } catch { return ''; } })();
-  const isOffLoginPage = !url.includes('/login') && !url.includes('/sign-in') && !url.includes('/signin');
+  const isOffLoginPage = !url.includes('/login')
+    && !url.includes('/sign-in')
+    && !url.includes('/signin')
+    && !url.includes('overlay=login')
+    && !url.includes('modal=login')
+    && !url.includes('action=login');
   if (isOffLoginPage && /hot pokies|new & exclusive|live casino|specialty games/i.test(bodyText)) {
     return { outcome: 'working', note: 'Joe Fortune — casino lobby detected (login successful)' };
   }
@@ -536,10 +541,15 @@ async function waitForLoginResponse(page, maxWaitMs = RESPONSE_POLL_MS) {
     if (/oops.*your email and\/or password are incorrect.*caps lock/i.test(body)) return RESP.WRONG_PASS_1;
 
     // ── Success: URL must have left the login page ─────────────────────────
-    // "WELCOME BACK!" and casino promo content (hot pokies etc.) also appear
-    // on the unauthenticated login page, so success is only valid once the
-    // browser has navigated away from /login.
-    const isOffLoginPage = !url.includes('/login') && !url.includes('/sign-in') && !url.includes('/signin');
+    // Ignition uses ?overlay=login (query param) rather than a /login path,
+    // so we must check for that pattern too. "WELCOME BACK!" appears on the
+    // Ignition login modal title and is NOT a success signal.
+    const isOffLoginPage = !url.includes('/login')
+      && !url.includes('/sign-in')
+      && !url.includes('/signin')
+      && !url.includes('overlay=login')
+      && !url.includes('modal=login')
+      && !url.includes('action=login');
     if (isOffLoginPage) {
       if (/hot pokies|new & exclusive|specialty games/i.test(body)) return RESP.SUCCESS;
       if (/account balance|your balance|make a deposit|my account/i.test(body)) return RESP.SUCCESS;
