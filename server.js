@@ -820,15 +820,17 @@ app.post('/api/card-check', async (req, res) => {
 let flowSession = null;
 
 /**
- * Waits for the user's next click in the recording browser and returns a CSS
- * selector string for the clicked element. Runs inside the page context via
- * page.evaluate. Clicks on the recording overlay bar are ignored.
+ * Waits for the user's next interaction inside the recording browser.
+ * Returns { selector, ts } when the user clicks a page element, or
+ * { done: true } when the user presses the "✓ Done" button in the overlay bar.
+ *
  * Selector priority: id → input type → name → placeholder → data-testid →
  *   aria-label → button text → first class → tag name.
+ *
  * @param {import('playwright').Page} page
- * @returns {Promise<string>} CSS selector for the clicked element.
+ * @returns {Promise<{selector: string, ts: number}|{done: true}>}
  */
-async function waitForRecordedClick(page) {
+async function waitForRecordedEvent(page) {
   return page.evaluate(() => new Promise(resolve => {
     function sel(el) {
       if (!el || el.tagName === 'BODY') return 'body';
@@ -857,36 +859,69 @@ async function waitForRecordedClick(page) {
       return tag;
     }
     function handler(e) {
+      // "Done" button inside the overlay bar → signal end of recording
+      const doneBtn = document.getElementById('_sitcho_done_btn');
+      if (doneBtn && (e.target === doneBtn || doneBtn.contains(e.target))) {
+        e.preventDefault();
+        e.stopPropagation();
+        document.removeEventListener('click', handler, true);
+        resolve({ done: true });
+        return;
+      }
+      // Other clicks inside the overlay bar are ignored (don't record them)
       const bar = document.getElementById('_sitcho_rec_bar');
       if (bar && bar.contains(e.target)) return;
+
       e.preventDefault();
       e.stopPropagation();
       document.removeEventListener('click', handler, true);
-      resolve(sel(e.target));
+      resolve({ selector: sel(e.target), ts: Date.now() });
     }
     document.addEventListener('click', handler, true);
   }));
 }
 
-/** Step labels shown in the recording overlay inside the headed browser. */
-const FLOW_STEPS = [
-  'Click the COOKIE DISMISS / Accept button (or anywhere to skip if none)',
-  'Click the EMAIL / Username text field',
-  'Click the PASSWORD text field',
-  'Click the SUBMIT / Login button',
-];
+/**
+ * Injects or updates the recording overlay bar inside the headed browser.
+ * Shows how many clicks have been captured so far and a "✓ Done" button.
+ * @param {import('playwright').Page} page
+ * @param {number} count - Number of clicks captured so far.
+ */
+async function updateRecordingOverlay(page, count) {
+  await page.evaluate((count) => {
+    let bar = document.getElementById('_sitcho_rec_bar');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = '_sitcho_rec_bar';
+      bar.style.cssText = [
+        'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:2147483647',
+        'background:rgba(0,0,0,0.88)', 'color:#fff',
+        'padding:8px 16px', 'font:14px/1.4 system-ui,sans-serif',
+        'display:flex', 'align-items:center', 'gap:12px',
+        'border-bottom:2px solid #30d5c8',
+      ].join(';');
+      document.body.prepend(bar);
+    }
+    const badge = count === 0
+      ? '<span style="background:#30d5c8;color:#000;padding:2px 8px;border-radius:4px;font-weight:700;white-space:nowrap">READY</span>'
+      : '<span style="background:#30d5c8;color:#000;padding:2px 8px;border-radius:4px;font-weight:700;white-space:nowrap">CLICK ' + count + '</span>';
+    bar.innerHTML =
+      badge +
+      '<span style="flex:1">Click elements in order (cookie dismiss → email → password → submit + any extras). Press <strong>✓ Done</strong> when finished.</span>' +
+      '<button id="_sitcho_done_btn" style="background:#34c759;color:#000;border:none;padding:5px 14px;border-radius:4px;font-weight:700;cursor:pointer;font-size:13px;white-space:nowrap">✓ Done</button>';
+  }, count);
+}
 
 /**
  * GET /api/record-flow/status
  * Returns the current flow recording session state.
- * Response: { active: bool, step: 0-4, label: string, selectors: string[], status: string, error: string }
+ * Response: { active: bool, count: number, selectors: string[], status: string, error: string }
  */
 app.get('/api/record-flow/status', (req, res) => {
   if (!flowSession) return res.json({ active: false });
   res.json({
-    active: true,
-    step:      flowSession.step,
-    label:     FLOW_STEPS[flowSession.step] || 'Done',
+    active:    true,
+    count:     flowSession.count || 0,
     selectors: flowSession.selectors,
     status:    flowSession.status,
     error:     flowSession.error || '',
@@ -895,13 +930,16 @@ app.get('/api/record-flow/status', (req, res) => {
 
 /**
  * POST /api/record-flow
- * Opens a headed (visible) Chromium browser on the login page and records 4
- * user clicks:  1) cookie dismiss  2) email field  3) password field  4) submit.
- * A coloured overlay bar guides the user through each step.
- * Long-polls: responds when all 4 selectors are captured or on timeout/error.
+ * Opens a headed (visible) Chromium browser on the login page and records an
+ * unlimited number of user clicks until the user presses the "✓ Done" button
+ * in the overlay bar. Each click's selector and timestamp are captured.
+ *
+ * After recording, delays between consecutive clicks are computed so the UI
+ * can show timing analysis. The automation can use these delays to tune waits.
  *
  * Request body: { loginUrl: string }
- * Response:     { selectors: string[4] }  or  { error: string }
+ * Response:     { selectors: string[], delays: number[], count: number }
+ *               or { error: string }
  */
 app.post('/api/record-flow', async (req, res) => {
   const { loginUrl } = req.body;
@@ -910,7 +948,7 @@ app.post('/api/record-flow', async (req, res) => {
     return res.status(409).json({ error: 'A recording session is already active. Close the browser window first.' });
   }
 
-  flowSession = { step: 0, selectors: [], status: 'recording', error: '' };
+  flowSession = { count: 0, selectors: [], delays: [], status: 'recording', error: '' };
 
   let browser;
   try {
@@ -921,51 +959,59 @@ app.post('/api/record-flow', async (req, res) => {
     await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(1500);
 
-    for (let i = 0; i < FLOW_STEPS.length; i++) {
-      flowSession.step = i;
+    // Inject initial overlay with Done button; no step limit
+    await updateRecordingOverlay(page, 0);
 
-      // Inject / update the guidance overlay bar at the top of the page
-      await page.evaluate(({ step, label, total }) => {
-        let bar = document.getElementById('_sitcho_rec_bar');
-        if (!bar) {
-          bar = document.createElement('div');
-          bar.id = '_sitcho_rec_bar';
-          bar.style.cssText = [
-            'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:2147483647',
-            'background:rgba(0,0,0,0.88)', 'color:#fff',
-            'padding:10px 16px', 'font:14px/1.4 system-ui,sans-serif',
-            'display:flex', 'align-items:center', 'gap:12px',
-            'border-bottom:2px solid #30d5c8',
-          ].join(';');
-          document.body.prepend(bar);
-        }
-        bar.innerHTML =
-          '<span style="background:#30d5c8;color:#000;padding:2px 8px;border-radius:4px;font-weight:700;white-space:nowrap">' +
-          'STEP ' + (step + 1) + '/' + total + '</span> ' + label;
-      }, { step: i, label: FLOW_STEPS[i], total: FLOW_STEPS.length });
+    // Allow up to 10 minutes total for the user to complete their recording
+    page.setDefaultTimeout(600000);
 
-      // Wait for the user's next click (up to 90 s per step)
-      page.setDefaultTimeout(90000);
-      const selector = await waitForRecordedClick(page).catch(() => null);
+    const clicks = []; // { selector: string, ts: number }
 
-      if (selector === null) throw new Error(`Timed out waiting for step ${i + 1} click`);
-      flowSession.selectors.push(selector);
+    while (true) {
+      const event = await waitForRecordedEvent(page).catch(() => null);
+
+      // null (timeout/error) or explicit done → stop recording
+      if (!event || event.done) break;
+
+      clicks.push(event);
+      flowSession.count     = clicks.length;
+      flowSession.selectors = clicks.map(c => c.selector);
+
+      // Update overlay badge to reflect the running click count
+      await updateRecordingOverlay(page, clicks.length);
     }
 
-    // Done — show confirmation in the browser
-    await page.evaluate(() => {
+    // Compute ms delay between each pair of consecutive clicks.
+    // These can be used to tune automation timing for this specific site.
+    const delays = [];
+    for (let i = 1; i < clicks.length; i++) {
+      delays.push(clicks[i].ts - clicks[i - 1].ts);
+    }
+    flowSession.delays = delays;
+
+    // Show completion summary in the headed browser before it auto-closes
+    const avgDelay = delays.length
+      ? Math.round(delays.reduce((a, b) => a + b, 0) / delays.length)
+      : 0;
+    await page.evaluate(({ count, avgDelay }) => {
       const bar = document.getElementById('_sitcho_rec_bar');
       if (bar) {
+        bar.style.cssText = bar.style.cssText.replace('#30d5c8', '#28a046')
+          .replace('rgba(0,0,0,0.88)', 'rgba(52,199,89,0.95)');
         bar.style.background = 'rgba(52,199,89,0.95)';
         bar.style.color = '#000';
         bar.style.borderColor = '#28a046';
-        bar.innerHTML = '<strong>✓ Flow recorded!</strong> You can close this window.';
+        bar.innerHTML =
+          '<strong>✓ ' + count + ' click' + (count !== 1 ? 's' : '') + ' recorded!</strong>' +
+          (avgDelay ? '  Avg delay between clicks: <strong>' + avgDelay + ' ms</strong>' : '') +
+          '  You can close this window.';
       }
-    });
-    await page.waitForTimeout(2000);
+    }, { count: clicks.length, avgDelay });
+
+    await page.waitForTimeout(2500);
 
     flowSession.status = 'done';
-    res.json({ selectors: flowSession.selectors });
+    res.json({ selectors: flowSession.selectors, delays, count: clicks.length });
 
   } catch (err) {
     flowSession.status = 'error';

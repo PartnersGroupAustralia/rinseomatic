@@ -1299,46 +1299,69 @@ function renderBlacklist() {
 
 // ── Flow Recorder ──────────────────────────────────────────
 
-/** @description Labels for the 4 recorded flow selectors displayed in Settings. */
-const FLOW_STEP_LABELS = ['Cookie Dismiss', 'Email Field', 'Password Field', 'Submit Button'];
-
 /**
- * Saves the recorded flow selectors for the given site to localStorage.
+ * Saves the recorded flow data for the given site to localStorage.
+ * flow can be { selectors, delays, count } or null to clear.
  * @param {'joe'|'ign'} site
- * @param {string[]|null} selectors
+ * @param {{selectors: string[], delays: number[], count: number}|null} flow
  */
-function saveFlow(site, selectors) {
+function saveFlow(site, flow) {
   const key = site === 'joe' ? KEY_JOE_FLOW : KEY_IGN_FLOW;
   try {
-    if (selectors) localStorage.setItem(key, JSON.stringify(selectors));
+    if (flow) localStorage.setItem(key, JSON.stringify(flow));
     else localStorage.removeItem(key);
   } catch {}
 }
 
 /**
+ * Returns the selectors array from a flow object, handling both the new
+ * { selectors, delays, count } format and the legacy plain-array format.
+ * @param {any} flow
+ * @returns {string[]|null}
+ */
+function flowSelectors(flow) {
+  if (!flow) return null;
+  if (Array.isArray(flow)) return flow.length ? flow : null;
+  if (Array.isArray(flow.selectors) && flow.selectors.length) return flow.selectors;
+  return null;
+}
+
+/**
  * Re-renders the Flow Recorder UI in Settings for both sites.
- * Shows recorded selectors (if any) and the Record / Clear buttons.
+ * Shows all recorded selectors (unlimited), timing analysis, and action buttons.
  */
 function renderFlowRecorder() {
   ['joe', 'ign'].forEach(site => {
-    const flow = site === 'joe' ? state.joeFlow : state.ignFlow;
+    const flow      = site === 'joe' ? state.joeFlow : state.ignFlow;
+    const sels      = flowSelectors(flow);
     const statusEl  = $(`${site}FlowStatus`);
     const detailEl  = $(`${site}FlowDetail`);
     const recordBtn = $(`${site}FlowRecordBtn`);
     const clearBtn  = $(`${site}FlowClearBtn`);
     if (!statusEl) return;
 
-    if (flow && Array.isArray(flow) && flow.length === 4) {
-      statusEl.textContent = '✅ Recorded';
+    if (sels) {
+      const delays  = (flow && !Array.isArray(flow) && Array.isArray(flow.delays)) ? flow.delays : [];
+      const avgMs   = delays.length ? Math.round(delays.reduce((a, b) => a + b, 0) / delays.length) : 0;
+      const timingNote = avgMs
+        ? `<div class="settings-note" style="padding:2px 0;font-size:0.72rem">Avg delay between clicks: <strong>${avgMs} ms</strong> (${delays.length} intervals)</div>`
+        : '';
+
+      statusEl.textContent = `✅ ${sels.length} click${sels.length !== 1 ? 's' : ''} recorded`;
       statusEl.className = 'flow-status recorded';
-      detailEl.innerHTML = flow.map((sel, i) =>
-        `<div class="flow-step-row"><span class="flow-step-label">${FLOW_STEP_LABELS[i]}</span><code class="flow-step-sel">${sel}</code></div>`
-      ).join('');
+      detailEl.innerHTML =
+        timingNote +
+        sels.map((sel, i) =>
+          `<div class="flow-step-row">` +
+          `<span class="flow-step-label">Click ${i + 1}${delays[i - 1] !== undefined ? ` <span style="color:var(--text3);font-size:0.68rem">(+${delays[i - 1]}ms)</span>` : ''}</span>` +
+          `<code class="flow-step-sel">${sel}</code>` +
+          `</div>`
+        ).join('');
       if (clearBtn) clearBtn.classList.remove('hidden');
     } else {
       statusEl.textContent = 'Not recorded';
       statusEl.className = 'flow-status';
-      detailEl.innerHTML = '<div class="settings-note" style="padding:4px 0">No flow recorded yet. Click Record to open a browser and manually click each element.</div>';
+      detailEl.innerHTML = '<div class="settings-note" style="padding:4px 0">No flow recorded yet. Click Record to open a browser, click each element in order, then press ✓ Done.</div>';
       if (clearBtn) clearBtn.classList.add('hidden');
     }
     if (recordBtn) recordBtn.disabled = false;
@@ -1346,10 +1369,11 @@ function renderFlowRecorder() {
 }
 
 /**
- * Starts a flow recording session for the given site.
- * Opens a headed browser on the login page via the server API, then polls
- * /api/record-flow/status every 800ms to update the step indicator in the UI.
- * When the POST resolves, saves the selectors and re-renders.
+ * Starts a free-form flow recording session for the given site.
+ * Opens a headed browser on the login page via the server API.
+ * The user clicks elements in order (no fixed limit) then presses "✓ Done".
+ * Polls /api/record-flow/status every 800ms to update the live click count in UI.
+ * When the POST resolves, saves selectors + timing data and re-renders.
  * @param {'joe'|'ign'} site
  */
 async function startFlowRecording(site) {
@@ -1362,18 +1386,15 @@ async function startFlowRecording(site) {
   const recordBtn = $(`${site}FlowRecordBtn`);
   if (recordBtn) recordBtn.disabled = true;
   if (statusEl) { statusEl.textContent = '🔴 Recording…'; statusEl.className = 'flow-status recording'; }
-  if (detailEl) detailEl.innerHTML = '<div class="flow-step-row"><span class="flow-step-label">Step 1/4</span><span class="settings-note">A browser window will open — follow the on-screen instructions</span></div>';
+  if (detailEl) detailEl.innerHTML = '<div class="settings-note" style="padding:4px 0">🔴 Browser opening — click elements in order, press ✓ Done when finished.</div>';
 
-  // Poll status while POST is in-flight
+  // Poll live click count while the POST is long-polling
   let pollInterval = setInterval(async () => {
     try {
       const r = await fetch('/api/record-flow/status');
       const d = await r.json();
       if (!d.active) return;
-      if (statusEl) statusEl.textContent = `🔴 Step ${d.step + 1}/4`;
-      if (detailEl && d.step < 4) {
-        detailEl.innerHTML = `<div class="flow-step-row"><span class="flow-step-label">Step ${d.step + 1}/4</span><span class="settings-note">${d.label}</span></div>`;
-      }
+      if (statusEl) statusEl.textContent = `🔴 ${d.count} click${d.count !== 1 ? 's' : ''} captured…`;
     } catch {}
   }, 800);
 
@@ -1393,10 +1414,11 @@ async function startFlowRecording(site) {
       return;
     }
 
-    if (site === 'joe') state.joeFlow = data.selectors;
-    else                state.ignFlow = data.selectors;
-    saveFlow(site, data.selectors);
-    toast(`${site === 'joe' ? 'Joe Fortune' : 'Ignition'} flow recorded!`, 'success');
+    const flowData = { selectors: data.selectors, delays: data.delays || [], count: data.count || data.selectors.length };
+    if (site === 'joe') state.joeFlow = flowData;
+    else                state.ignFlow = flowData;
+    saveFlow(site, flowData);
+    toast(`${site === 'joe' ? 'Joe Fortune' : 'Ignition'} — ${flowData.count} clicks recorded!`, 'success');
     renderFlowRecorder();
 
   } catch (err) {
