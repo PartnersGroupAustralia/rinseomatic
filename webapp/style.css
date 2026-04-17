@@ -411,6 +411,7 @@ ul { list-style: none; }
 .activity-detail { font-size: 0.7rem; color: var(--text3); margin-top: 1px; }
 .activity-time { font-size: 0.68rem; color: var(--text3); font-variant-numeric: tabular-nums; flex-shrink: 0; }
 .empty-row { color: var(--text3); font-size: 0.82rem; padding: 20px 0; text-align: center; }
+.cred-empty-filter { color: var(--text3); font-size: 0.82rem; padding: 24px 0; text-align: center; list-style: none; }
 
 /* ── Empty State ── */
 .empty-state {

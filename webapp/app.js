@@ -831,6 +831,15 @@ function renderCredSite(site) {
   }
   emptyEl.classList.add('hidden');
 
+  if (visible.length === 0) {
+    listEl.innerHTML = `<li class="cred-empty-filter">No credentials match the "${filter}" filter.</li>`;
+    const nSelEmpty = selIds.size;
+    batchEl.classList.toggle('hidden', nSelEmpty === 0);
+    $(`${prefix}SelectedCount`).textContent = nSelEmpty > 0 ? `${nSelEmpty} selected` : '';
+    $(`${prefix}CheckSelectedBtn`).textContent = `▶ Check Selected (${nSelEmpty})`;
+    return;
+  }
+
   listEl.innerHTML = visible.map(c => {
     const sel = selIds.has(c.id);
     const sc  = credStatusClass(c.status);
@@ -2475,10 +2484,14 @@ function exportCards(cards) {
  * Columns: identifier, brand_or_site, result, detail, timestamp, duration
  */
 function exportSessions() {
+  const csvEscape = v => {
+    const s = String(v == null ? '' : v);
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
   const lines = state.sessions.map(s => {
     const identifier = s.username || s.cardNum || '';
     const extra = s.brand || (s.type || '');
-    return [identifier, extra, s.result, s.detail || '', new Date(s.ts).toISOString(), (s.durationMs || 0) + 'ms'].join(',');
+    return [identifier, extra, s.result, s.detail || '', new Date(s.ts).toISOString(), (s.durationMs || 0) + 'ms'].map(csvEscape).join(',');
   });
   const csv = 'identifier,brand_or_site,result,detail,timestamp,duration\n' + lines.join('\n');
   const blob = new Blob([csv], { type: 'text/csv' });
@@ -2711,10 +2724,12 @@ function handleWgFileImport(e) {
 }
 
 /**
- * Removes a WireGuard config from state by index.
- * @param {number} idx - Array index of the config to remove.
+ * Removes a WireGuard config from state by UUID.
+ * @param {string} id - UUID of the config to remove.
  */
-function deleteWgConfig(idx) {
+function deleteWgConfig(id) {
+  const idx = state.wireGuardConfigs.findIndex(c => c.id === id);
+  if (idx === -1) return;
   state.wireGuardConfigs.splice(idx, 1);
   saveWgConfigs();
   renderWgConfigs();
@@ -2722,16 +2737,19 @@ function deleteWgConfig(idx) {
 }
 
 /**
- * Toggles the active/enabled state of a WireGuard config.
- * Only one config can be active at a time — enabling one disables all others.
- * @param {number} idx - Array index of the config to toggle.
+ * Toggles the enabled state of a WireGuard config by UUID.
+ * Only one config can be enabled at a time — enabling one disables all others.
+ * @param {string} id - UUID of the config to toggle.
  */
-function toggleWgConfig(idx) {
-  const isNowActive = !state.wireGuardConfigs[idx].active;
-  state.wireGuardConfigs.forEach((c, i) => { c.active = i === idx && isNowActive; });
+function toggleWgConfig(id) {
+  const idx = state.wireGuardConfigs.findIndex(c => c.id === id);
+  if (idx === -1) return;
+  const isNowEnabled = !state.wireGuardConfigs[idx].isEnabled;
+  state.wireGuardConfigs.forEach((c, i) => { c.isEnabled = i === idx && isNowEnabled; });
   saveWgConfigs();
   renderWgConfigs();
-  toast(isNowActive ? `WireGuard ${state.wireGuardConfigs[idx].name} enabled` : 'WireGuard disabled', 'info');
+  const name = state.wireGuardConfigs[idx].fileName || 'config';
+  toast(isNowEnabled ? `WireGuard ${name} enabled` : 'WireGuard disabled', 'info');
 }
 
 // ── Event wiring ───────────────────────────────────────────
@@ -3075,14 +3093,14 @@ function wireEvents() {
       state.grokKey = '';
       state.settings = {
         maxConcurrency: 7, checkTimeout: 180, autoRetry: true, stealthMode: false,
-        automationMode: 'virtualHeadless', debugScreenshots: true, testEmail: '',
+        debugScreenshots: true, testEmail: '',
         ppsrUrl: 'https://transact.ppsr.gov.au/CarCheck/',
         joeLoginUrl: 'https://joefortunepokies.win/login',
         ignitionLoginUrl: 'https://ignitioncasino.ooo/login',
         loginConcurrency: 3, loginTimeout: 60, useEmailRotation: false, theme: 'dark',
-        typingSpeedMinMs: 80, typingSpeedMaxMs: 180, requeueOnTimeout: true,
-        requeueOnFailure: false, maxRequeueCount: 2, batchDelayBetweenStartsMs: 500,
-        pageLoadTimeout: 30, vpnRotation: false, dnsRotation: false, proxyRotateOnFailure: false,
+        typingSpeedMinMs: 50, typingSpeedMaxMs: 150, requeueOnTimeout: true,
+        requeueOnFailure: true, maxRequeueCount: 3, batchDelayBetweenStartsMs: 50,
+        pageLoadTimeout: 180, vpnRotation: false, dnsRotation: false, proxyRotateOnFailure: true,
       };
       state.selectedCardIds.clear(); state.selectedJoeIds.clear(); state.selectedIgnIds.clear();
       applyTheme('dark'); renderAll(); toast('All data reset', 'info');
@@ -3100,10 +3118,10 @@ function wireEvents() {
   $('wgConfigList')?.addEventListener('click', e => {
     const btn = e.target.closest('[data-wg-action]');
     if (!btn) return;
-    const idx = parseInt(btn.dataset.wgIdx, 10);
-    if (isNaN(idx)) return;
-    if (btn.dataset.wgAction === 'delete') deleteWgConfig(idx);
-    else if (btn.dataset.wgAction === 'toggle') toggleWgConfig(idx);
+    const id = btn.dataset.wgId;
+    if (!id) return;
+    if (btn.dataset.wgAction === 'delete') deleteWgConfig(id);
+    else if (btn.dataset.wgAction === 'toggle') toggleWgConfig(id);
   });
 
   $('saveNordKeyBtn')?.addEventListener('click', () => {

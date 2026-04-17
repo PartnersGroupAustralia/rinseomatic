@@ -469,7 +469,7 @@ async function determineCardOutcome(page) {
   if (/expired/i.test(bodyText)) {
     return { outcome: 'dead', note: 'Card expired' };
   }
-  if (/error/i.test(bodyText)) {
+  if (/(payment|card|transaction|processor).{0,30}error|error.{0,30}(payment|card|transaction|processing)/i.test(bodyText)) {
     return { outcome: 'dead', note: 'Error during card check' };
   }
 
