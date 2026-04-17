@@ -612,19 +612,22 @@ app.post('/api/login-check', async (req, res) => {
     await page.waitForTimeout(700);
     shots[0] = await captureShot(page, 'SCR 1/4');
 
-    // ── Step 2: First submit → wait for real response → SCR 2/4 ─────────
+    // ── Step 2: First submit → SCR 2/4 (2000ms fixed) → poll outcome ─────
+    // Screenshot timing is hardcoded: 2000ms after first submit click so the
+    // page has time to render the immediate response before we capture it.
+    // After the screenshot we poll to confirm the outcome (fast if already visible).
     let respType = RESP.UNKNOWN;
     const siteName = site === 'ign' ? 'Ignition' : 'Joe Fortune';
 
     const clicked1 = await clickSubmit(page);
     if (!clicked1) await page.keyboard.press('Enter');
 
-    // Poll up to RESPONSE_POLL_MS for a known response BEFORE taking SCR 2/4
-    // so the screenshot actually shows the login result, not a loading state.
-    respType = await waitForLoginResponse(page, RESPONSE_POLL_MS);
+    await page.waitForTimeout(2000); // hardcoded: 2000ms after 1st submit
     await dismissCookiePopup(page);
-    await page.waitForTimeout(600); // brief settle so the DOM finishes painting
     shots[1] = await captureShot(page, 'SCR 2/4');
+
+    // Poll for outcome — returns immediately if the response is already visible
+    respType = await waitForLoginResponse(page, RESPONSE_POLL_MS);
 
     // Evaluate result after first attempt
     if (respType === RESP.SUCCESS) {
@@ -638,18 +641,18 @@ app.post('/api/login-check', async (req, res) => {
       note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
     }
 
-    // ── Step 3: Retry submit → wait for real response → SCR 3/4 ─────────
+    // ── Step 3: Retry submit → SCR 3/4 (2500ms fixed) → poll outcome ─────
+    // Screenshot taken 2500ms after the second submit click.
     if (respType === RESP.WRONG_PASS_1 || respType === RESP.WRONG_PASS_2 || respType === RESP.UNKNOWN) {
-      // Re-fill and submit again
       await fillLoginForm(page, username, password);
       const clicked2 = await clickSubmit(page);
       if (!clicked2) await page.keyboard.press('Enter');
 
-      // Poll for response BEFORE taking SCR 3/4 so we capture the real result.
-      respType = await waitForLoginResponse(page, RESPONSE_POLL_MS);
+      await page.waitForTimeout(2500); // hardcoded: 2500ms after 2nd submit
       await dismissCookiePopup(page);
-      await page.waitForTimeout(600);
       shots[2] = await captureShot(page, 'SCR 3/4');
+
+      respType = await waitForLoginResponse(page, RESPONSE_POLL_MS);
 
       if (respType === RESP.SUCCESS) {
         outcome = 'working';
@@ -665,23 +668,21 @@ app.post('/api/login-check', async (req, res) => {
         note = `${siteName} — incorrect credentials on retry (account does not exist or wrong password)`;
       }
     } else {
-      // Outcome determined after attempt 1 — SCR 3/4 shows the same resolved state
-      await page.waitForTimeout(600);
+      // Outcome already determined after attempt 1 — capture current state for SCR 3/4
       shots[2] = await captureShot(page, 'SCR 3/4');
     }
 
-    // ── Step 4: Fallback account-page check → SCR 4/4 ────────────────────
-    // Navigates to the account page directly. If it loads without redirecting
-    // back to /login the session is active (logged in).
-    // Uses 'load' waitUntil + 2.5s extra settle to ensure the page renders
-    // visually before the screenshot is taken (avoids blank/white frames).
+    // ── Step 4: Fallback account-page check → SCR 4/4 (2000ms fixed) ─────
+    // Navigates to the account page. If it loads without redirecting back to
+    // /login the session is active (logged in). Screenshot taken 2000ms after
+    // navigation to allow JS-rendered content to paint.
     const needsFallback = outcome !== 'working' && outcome !== 'permDisabled' && outcome !== 'tempDisabled';
     try {
       const accountUrl = site === 'ign'
         ? loginUrl.replace(/\/login.*$/, '/account')
         : 'https://joefortunepokies.win/account';
       await page.goto(accountUrl, { waitUntil: 'load', timeout: 20000 });
-      await page.waitForTimeout(2500); // wait for JS-rendered content to paint
+      await page.waitForTimeout(2000); // hardcoded: 2000ms after account-page navigation
       await dismissCookiePopup(page);
 
       if (needsFallback) {
