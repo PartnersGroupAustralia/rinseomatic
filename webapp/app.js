@@ -832,7 +832,10 @@ function renderCredSite(site) {
   emptyEl.classList.add('hidden');
 
   if (visible.length === 0) {
-    listEl.innerHTML = `<li class="cred-empty-filter">No credentials match the "${filter}" filter.</li>`;
+    const li = document.createElement('li');
+    li.className = 'cred-empty-filter';
+    li.textContent = `No credentials match the "${filter}" filter.`;
+    listEl.replaceChildren(li);
     const nSelEmpty = selIds.size;
     batchEl.classList.toggle('hidden', nSelEmpty === 0);
     $(`${prefix}SelectedCount`).textContent = nSelEmpty > 0 ? `${nSelEmpty} selected` : '';
@@ -3025,10 +3028,10 @@ function wireEvents() {
   autoBind('ppsrUrl',        'ppsrUrl');
   autoBind('loginConcurrency', 'loginConcurrency', v => Math.max(1, Math.min(10, parseInt(v) || 3)));
   autoBind('loginTimeout',   'loginTimeout',   v => Math.max(15, Math.min(120, parseInt(v) || 60)));
-  autoBind('typingSpeedMin', 'typingSpeedMinMs', v => Math.max(20, Math.min(500, parseInt(v) || 80)));
-  autoBind('typingSpeedMax', 'typingSpeedMaxMs', v => Math.max(50, Math.min(1000, parseInt(v) || 180)));
-  autoBind('batchDelay',     'batchDelayBetweenStartsMs', v => Math.max(0, Math.min(5000, parseInt(v) || 500)));
-  autoBind('pageLoadTimeout', 'pageLoadTimeout', v => Math.max(10, Math.min(120, parseInt(v) || 30)));
+  autoBind('typingSpeedMin', 'typingSpeedMinMs', v => Math.max(20, Math.min(500, parseInt(v) || 50)));
+  autoBind('typingSpeedMax', 'typingSpeedMaxMs', v => Math.max(50, Math.min(1000, parseInt(v) || 150)));
+  autoBind('batchDelay',     'batchDelayBetweenStartsMs', v => Math.max(0, Math.min(5000, parseInt(v) || 50)));
+  autoBind('pageLoadTimeout', 'pageLoadTimeout', v => Math.max(10, Math.min(300, parseInt(v) || 180)));
 
   const checkBind = (id, key) => {
     const el = $(id);
@@ -3045,7 +3048,7 @@ function wireEvents() {
   checkBind('dnsRotation',       'dnsRotation');
   checkBind('proxyRotateOnFail', 'proxyRotateOnFailure');
 
-  autoBind('maxRequeueCount', 'maxRequeueCount', v => Math.max(0, Math.min(10, parseInt(v) || 2)));
+  autoBind('maxRequeueCount', 'maxRequeueCount', v => Math.max(0, Math.min(10, parseInt(v) || 3)));
 
   $all('.seg-btn[data-theme]').forEach(btn => {
     btn.addEventListener('click', () => { state.settings.theme = btn.dataset.theme; applyTheme(btn.dataset.theme); saveSettings(); });
