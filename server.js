@@ -564,12 +564,16 @@ async function waitForLoginResponse(page, maxWaitMs = RESPONSE_POLL_MS) {
  * POST /api/login-check
  * Performs a real Playwright login attempt against the target casino site.
  *
- * Flow:
- *  1. Navigate to login page, dismiss cookies, fill credentials → SCR 1/4
- *  2. Submit and poll up to 5 s for a known response → SCR 2/4
- *  3. If wrong-password: re-fill and retry up to 4 total attempts → SCR 3/4
- *  4. If still unclear after 4 attempts: navigate to /account as fallback
- *  5. SCR 4/4 — final state
+ * Flow (single page — NO navigation between submits):
+ *  1. Navigate to login page ONCE, dismiss cookies, fill credentials → SCR 1/4
+ *  2. Submit #1, poll for known response → SCR 2/4 (same page)
+ *  3. If wrong-password: re-fill same fields + submit #2 → SCR 3/4 (same page)
+ *  4. 2000ms settle, read final DOM/URL in place → SCR 4/4 (same page)
+ *  5. Session end: clear cookies + localStorage + sessionStorage, close browser
+ *
+ * Cookies / localStorage / JS state are preserved across all submits so the
+ * screenshots form a clean visual timeline of the same page reacting to each
+ * request. Only at session end is state wiped.
  *
  * Request body:
  *   site       {string} 'joe' | 'ign'
@@ -692,38 +696,53 @@ app.post('/api/login-check', async (req, res) => {
       shots[2] = await captureShot(page, 'SCR 3/4');
     }
 
-    // ── Step 4: Fallback account-page check → SCR 4/4 (2000ms fixed) ─────
-    // Navigates to the account page. If it loads without redirecting back to
-    // /login the session is active (logged in). Screenshot taken 2000ms after
-    // navigation to allow JS-rendered content to paint.
+    // ── Step 4: In-place final state → SCR 4/4 (2000ms settle) ─────────────
+    // DO NOT navigate — we want the exact page state resulting from the user's
+    // submits, with cookies/localStorage/JS state intact. This gives a clean
+    // visual timeline across SCR 1–4 on a single URL. We only read signals
+    // from the current page.
     const needsFallback = outcome !== 'working' && outcome !== 'permDisabled' && outcome !== 'tempDisabled';
-    try {
-      const accountUrl = site === 'ign'
-        ? loginUrl.replace(/\/login.*$/, '/account')
-        : 'https://joefortunepokies.win/account';
-      await page.goto(accountUrl, { waitUntil: 'load', timeout: 20000 });
-      await page.waitForTimeout(2000); // hardcoded: 2000ms after account-page navigation
-      await dismissCookiePopup(page);
+    await page.waitForTimeout(2000).catch(() => {}); // 2000ms settle before SCR 4/4
+    await dismissCookiePopup(page);
 
-      if (needsFallback) {
-        const finalUrl = page.url().toLowerCase();
-        if (!finalUrl.includes('/login') && !finalUrl.includes('/sign-in') && !finalUrl.includes('/signin')) {
-          outcome = 'working';
-          note = `${siteName} — account page loaded without redirect (fallback — logged in)`;
-        } else {
-          outcome = 'noAcc';
-          note = `${siteName} — redirected back to login (not logged in)`;
-        }
-      }
-    } catch (fallbackErr) {
-      if (needsFallback) {
+    if (needsFallback) {
+      const finalUrl  = (page.url() || '').toLowerCase();
+      const finalBody = ((await page.textContent('body').catch(() => '')) || '').toLowerCase();
+
+      // URL-based success: moved off the login page via normal site nav
+      const offLoginPage = !finalUrl.includes('/login')
+        && !finalUrl.includes('/sign-in')
+        && !finalUrl.includes('/signin')
+        && !finalUrl.includes('overlay=login')
+        && !finalUrl.includes('modal=login')
+        && !finalUrl.includes('action=login');
+
+      // Content-based success signals (same list used by waitForLoginResponse)
+      const hasLoggedInContent = /hot pokies|new & exclusive|specialty games|account balance|your balance|make a deposit|my account/i.test(finalBody);
+
+      if (offLoginPage && hasLoggedInContent) {
+        outcome = 'working';
+        note = `${siteName} — logged-in content detected on current page (no navigation)`;
+      } else if (/your account has been disabled\.\s*please,?\s*contact\s+customer\s+service/i.test(finalBody)) {
+        outcome = 'permDisabled';
+        note = `${siteName} — account permanently disabled (detected on final state)`;
+      } else if (/temporarily disabled due to too many failed login attempt/i.test(finalBody)) {
+        outcome = 'tempDisabled';
+        note = `${siteName} — temporarily disabled (detected on final state)`;
+      } else {
         outcome = 'noAcc';
-        note = `Fallback check failed: ${fallbackErr.message}`;
+        note = `${siteName} — no success signal detected after retries`;
       }
-      // Still take SCR 4/4 of whatever state the page is in
     }
 
     shots[3] = await captureShot(page, 'SCR 4/4');
+
+    // ── Session end: clear cookies + storage for hygiene, THEN close ──────
+    // Only at the very end of the session — never between submits.
+    await context.clearCookies().catch(() => {});
+    await page.evaluate(() => {
+      try { localStorage.clear(); sessionStorage.clear(); } catch { /* ignore */ }
+    }).catch(() => {});
 
   } catch (err) {
     note = `Automation error: ${err.message}`;
