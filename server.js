@@ -605,12 +605,23 @@ app.post('/api/login-check', async (req, res) => {
     const context = await browser.newContext({
       viewport: liveView ? { width: 540, height: 420 } : { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      ignoreHTTPSErrors: true,
     });
     const page = await context.newPage();
     page.setDefaultTimeout(timeout);
 
     // ── Step 1: Load login page ───────────────────────────────────────────
-    await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout });
+    // Bulletproofing: if navigation fails (cert, DNS, timeout) we still want
+    // to return a screenshot of the error state so the user has visual proof
+    // rather than 4 blank slots.
+    try {
+      await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout });
+    } catch (navErr) {
+      note = `Navigation failed: ${navErr.message.split('\n')[0]}`;
+      shots[0] = await captureShot(page, 'SCR 1/4').catch(() => '');
+      shots[1] = shots[0]; shots[2] = shots[0]; shots[3] = shots[0];
+      return res.json({ outcome: 'noAcc', note, shots });
+    }
     await page.waitForTimeout(2000);
     await dismissCookiePopup(page);
 
@@ -721,7 +732,7 @@ app.post('/api/login-check', async (req, res) => {
     if (browser) await browser.close().catch(() => {});
   }
 
-  res.json({ outcome, note, shots });
+  if (!res.headersSent) res.json({ outcome, note, shots });
 });
 
 // ── API: Card Check ───────────────────────────────────────────────────────────
@@ -764,12 +775,21 @@ app.post('/api/card-check', async (req, res) => {
     const context = await browser.newContext({
       viewport: { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      ignoreHTTPSErrors: true,
     });
     const page = await context.newPage();
     page.setDefaultTimeout(timeout);
 
-    // Navigate to check page
-    await page.goto(ppsrUrl, { waitUntil: 'domcontentloaded', timeout });
+    // Navigate to check page — if it fails, capture whatever the page shows
+    // so the user has visual evidence of the failure mode.
+    try {
+      await page.goto(ppsrUrl, { waitUntil: 'domcontentloaded', timeout });
+    } catch (navErr) {
+      note = `Navigation failed: ${navErr.message.split('\n')[0]}`;
+      const frame = await captureShot(page, 'SCR 1/4').catch(() => '');
+      shots[0] = frame; shots[1] = frame; shots[2] = frame; shots[3] = frame;
+      return res.json({ outcome: 'dead', note, shots });
+    }
     await page.waitForTimeout(2000);
     await dismissCookiePopup(page);
 
@@ -817,7 +837,7 @@ app.post('/api/card-check', async (req, res) => {
     if (browser) await browser.close().catch(() => {});
   }
 
-  res.json({ outcome, note, shots });
+  if (!res.headersSent) res.json({ outcome, note, shots });
 });
 
 // ── API: Flow Recorder ────────────────────────────────────────────────────────
@@ -963,8 +983,17 @@ app.post('/api/record-flow', async (req, res) => {
   let browser;
   try {
     browser = await chromium.launch({ headless: false, args: ['--window-size=1280,800'] });
-    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    const context = await browser.newContext({
+      viewport: { width: 1280, height: 800 },
+      ignoreHTTPSErrors: true,
+    });
     const page = await context.newPage();
+
+    // If the user manually closes the browser window, stop the recording loop
+    // gracefully instead of throwing from the next waitForRecordedEvent call.
+    let userClosedBrowser = false;
+    page.on('close', () => { userClosedBrowser = true; });
+    browser.on('disconnected', () => { userClosedBrowser = true; });
 
     await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(1500);
@@ -978,17 +1007,18 @@ app.post('/api/record-flow', async (req, res) => {
     const clicks = []; // { selector: string, ts: number }
 
     while (true) {
+      if (userClosedBrowser) break;
       const event = await waitForRecordedEvent(page).catch(() => null);
 
-      // null (timeout/error) or explicit done → stop recording
-      if (!event || event.done) break;
+      // null (timeout/error/window closed) or explicit done → stop recording
+      if (userClosedBrowser || !event || event.done) break;
 
       clicks.push(event);
       flowSession.count     = clicks.length;
       flowSession.selectors = clicks.map(c => c.selector);
 
       // Update overlay badge to reflect the running click count
-      await updateRecordingOverlay(page, clicks.length);
+      await updateRecordingOverlay(page, clicks.length).catch(() => {});
     }
 
     // Compute ms delay between each pair of consecutive clicks.
@@ -1003,6 +1033,11 @@ app.post('/api/record-flow', async (req, res) => {
     const avgDelay = delays.length
       ? Math.round(delays.reduce((a, b) => a + b, 0) / delays.length)
       : 0;
+    if (userClosedBrowser) {
+      flowSession.status = 'done';
+      return res.json({ selectors: flowSession.selectors, delays, count: clicks.length, closed: true });
+    }
+
     await page.evaluate(({ count, avgDelay }) => {
       const bar = document.getElementById('_sitcho_rec_bar');
       if (bar) {
@@ -1016,17 +1051,19 @@ app.post('/api/record-flow', async (req, res) => {
           (avgDelay ? '  Avg delay between clicks: <strong>' + avgDelay + ' ms</strong>' : '') +
           '  You can close this window.';
       }
-    }, { count: clicks.length, avgDelay });
+    }, { count: clicks.length, avgDelay }).catch(() => {});
 
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(2500).catch(() => {});
 
     flowSession.status = 'done';
-    res.json({ selectors: flowSession.selectors, delays, count: clicks.length });
+    if (!res.headersSent) {
+      res.json({ selectors: flowSession.selectors, delays, count: clicks.length });
+    }
 
   } catch (err) {
     flowSession.status = 'error';
     flowSession.error  = err.message;
-    res.status(500).json({ error: err.message });
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
