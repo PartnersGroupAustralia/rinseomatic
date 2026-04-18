@@ -102,27 +102,28 @@ async function captureShot(page, label) {
  * @returns {Promise<boolean>} True if both fields were found and filled.
  */
 async function fillLoginForm(page, username, password) {
+  // Strict visible-only selectors — no loose text-input fallback which caused
+  // Ignition to target the same <input> for both email and password.
   const emailSelectors = [
-    'input[type="email"]',
-    'input[name="email"]',
-    'input[name="username"]',
-    'input[name="login"]',
-    'input[placeholder*="email" i]',
-    'input[placeholder*="username" i]',
-    'input[id*="email" i]',
-    'input[id*="user" i]',
-    'input[id*="login" i]',
-    'input[type="text"]:first-of-type',
+    'input[type="email"]:visible',
+    'input[name="email"]:visible',
+    'input[name="username"]:visible',
+    'input[name="login"]:visible',
+    'input[placeholder*="email" i]:visible',
+    'input[placeholder*="username" i]:visible',
+    'input[id*="email" i]:visible',
+    'input[id*="user" i]:visible',
+    'input[id*="login" i]:visible',
   ];
   const passSelectors = [
-    'input[type="password"]',
-    'input[name="password"]',
-    'input[name="pass"]',
-    'input[placeholder*="password" i]',
-    'input[id*="password" i]',
-    'input[id*="pass" i]',
+    'input[type="password"]:visible',
+    'input[name="password"]:visible',
+    'input[name="pass"]:visible',
+    'input[placeholder*="password" i]:visible',
+    'input[id*="password" i]:visible',
   ];
 
+  let emailHandle = null;
   let emailFilled = false;
   for (const sel of emailSelectors) {
     try {
@@ -131,27 +132,44 @@ async function fillLoginForm(page, username, password) {
         await el.click();
         await el.fill('');
         await el.fill(username);
+        emailHandle = await el.elementHandle();
         emailFilled = true;
         break;
       }
     } catch {}
   }
 
-  // Pause after email entry — some sites enable the password field via JS
-  // handlers that fire on email input/blur events
-  if (emailFilled) await page.waitForTimeout(600);
+  // Pause — some sites enable the password field via JS handlers that fire
+  // on email input/blur. Then explicitly wait for a password-typed field to
+  // materialise before proceeding; avoids Ignition's type="text"→"password"
+  // hydration race where the password selector collided with the email.
+  if (emailFilled) {
+    await page.waitForTimeout(600);
+    await page.waitForSelector('input[type="password"]:visible', { timeout: 5000 }).catch(() => {});
+  }
 
   let passFilled = false;
   for (const sel of passSelectors) {
     try {
       const el = page.locator(sel).first();
-      if (await el.count() > 0 && await el.isVisible({ timeout: 3000 })) {
-        await el.click();
-        await el.fill('');
-        await el.fill(password);
-        passFilled = true;
-        break;
+      if (await el.count() === 0) continue;
+      if (!(await el.isVisible({ timeout: 3000 }).catch(() => false))) continue;
+
+      // Guard against the password locator resolving to the SAME element as
+      // the email — which would overwrite the email value with the password.
+      if (emailHandle) {
+        const passHandle = await el.elementHandle();
+        if (passHandle && emailHandle) {
+          const sameNode = await page.evaluate(([a, b]) => a === b, [emailHandle, passHandle]).catch(() => false);
+          if (sameNode) continue;
+        }
       }
+
+      await el.click();
+      await el.fill('');
+      await el.fill(password);
+      passFilled = true;
+      break;
     } catch {}
   }
 
@@ -176,59 +194,92 @@ async function fillLoginForm(page, username, password) {
  * @returns {Promise<void>}
  */
 async function dismissCookiePopup(page) {
-  const textSelectors = [
-    'button:has-text("Accept all")',
-    'button:has-text("Accept All")',
-    'button:has-text("Accept All Cookies")',
-    'button:has-text("Accept all cookies")',
-    'button:has-text("Accept & Continue")',
-    'button:has-text("Accept")',
-    'button:has-text("Accept cookies")',
-    'button:has-text("Allow all")',
-    'button:has-text("Allow All")',
-    'button:has-text("Allow All Cookies")',
-    'button:has-text("I Accept")',
-    'button:has-text("I agree")',
-    'button:has-text("I Agree")',
-    'button:has-text("Agree")',
-    'button:has-text("Got it")',
-    'button:has-text("Got It")',
-    'button:has-text("OK")',
-    'button:has-text("Ok")',
-    'button:has-text("Close")',
-    'button:has-text("Dismiss")',
-    'button:has-text("Continue")',
+  // Text targets — include <button>, <a>, [role=button], generic clickables.
+  // Covers Joe Fortune ("Got It" / "I agree") and Ignition ("Accept" / "I Understand")
+  // which render as anchor tags or divs, not real <button>s.
+  const textTargets = [
+    'Accept All Cookies', 'Accept all cookies',
+    'Accept All', 'Accept all',
+    'Accept & Continue', 'Accept and continue',
+    'Accept Cookies', 'Accept cookies',
+    'Accept',
+    'Allow All Cookies', 'Allow all cookies',
+    'Allow All', 'Allow all',
+    'I Accept', 'I accept',
+    'I Agree', 'I agree',
+    'I Understand', 'I understand',
+    'Agree & Close', 'Agree and close',
+    'Agree',
+    'Got it', 'Got It', 'GOT IT',
+    'Yes, I Agree', 'Yes, I agree',
+    'That\'s OK', 'That\'s fine',
+    'OK', 'Ok',
+    'Close', 'Dismiss',
+    'Continue',
   ];
+
+  const roleSelectors = textTargets.flatMap(t => [
+    `button:has-text("${t}")`,
+    `a:has-text("${t}")`,
+    `[role="button"]:has-text("${t}")`,
+    `div[role="button"]:has-text("${t}")`,
+    `span[role="button"]:has-text("${t}")`,
+  ]);
+
   const attrSelectors = [
     // OneTrust
     '#onetrust-accept-btn-handler',
     '.onetrust-close-btn-handler',
     // Cookiebot
     '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+    '#CybotCookiebotDialogBodyButtonAccept',
     // TrustArc
     '.trustarc-agree-btn',
     '.truste_popframe .pdynamicbutton',
-    // Generic consent platforms
+    // Didomi
+    '#didomi-notice-agree-button',
+    // Generic consent platforms — buttons, anchors and role=button inside banners
     '[id*="cookie"][id*="accept" i]',
     '[id*="cookie"][id*="allow" i]',
     '[class*="cookie"][class*="accept" i]',
     '[class*="cookie-consent"] button',
+    '[class*="cookie-consent"] a',
     '[class*="cookie-banner"] button',
+    '[class*="cookie-banner"] a',
     '[class*="cookie-notice"] button',
+    '[class*="cookie-notice"] a',
+    '[class*="gdpr"] button',
+    '[class*="consent"] button',
     '[aria-label*="accept" i][role="button"]',
+    '[aria-label*="accept cookies" i]',
     '[data-testid*="cookie-accept" i]',
     '[data-testid*="consent-accept" i]',
   ];
 
-  for (const sel of [...textSelectors, ...attrSelectors]) {
-    try {
-      const el = page.locator(sel.endsWith(',') ? sel.slice(0, -1) : sel).first();
-      if (await el.count() > 0 && await el.isVisible({ timeout: 400 })) {
-        await el.click({ timeout: 1000 });
-        return;
-      }
-    } catch {}
+  const tryOnce = async () => {
+    for (const sel of [...roleSelectors, ...attrSelectors]) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.count() > 0 && await el.isVisible({ timeout: 250 }).catch(() => false)) {
+          await el.click({ timeout: 1200, force: false }).catch(async () => {
+            // Fallback: JS click in case the element is covered
+            await el.evaluate(n => n.click()).catch(() => {});
+          });
+          return true;
+        }
+      } catch {}
+    }
+    return false;
+  };
+
+  // First pass
+  if (await tryOnce()) {
+    await page.waitForTimeout(400).catch(() => {});
+    return;
   }
+  // Some banners mount after a short delay — retry after 1.2s
+  await page.waitForTimeout(1200).catch(() => {});
+  await tryOnce();
 }
 
 /**
