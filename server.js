@@ -575,40 +575,93 @@ const RESP = {
  * @param {number} [maxWaitMs=5000]
  * @returns {Promise<string>} One of the RESP constants.
  */
-async function waitForLoginResponse(page, maxWaitMs = RESPONSE_POLL_MS) {
+async function waitForLoginResponse(page, maxWaitMs = RESPONSE_POLL_MS, site = 'joe') {
   const deadline = Date.now() + maxWaitMs;
   while (Date.now() < deadline) {
     const body = (await page.textContent('body').catch(() => '')).toLowerCase();
-    const url  = page.url().toLowerCase();
+    const url  = (page.url() || '').toLowerCase();
 
     // ── Disabled (check before success — these appear on the login page) ──
-    // Permanently disabled: ONLY the exact Joe Fortune red textbox message
     if (/your account has been disabled\.\s*please,?\s*contact\s+customer\s+service/i.test(body)) return RESP.PERM_DISABLED;
-    // Temporarily disabled: too many failed attempts
     if (/temporarily disabled due to too many failed login attempt/i.test(body)) return RESP.TEMP_DISABLED;
 
     // ── Wrong password signals (also appear on the login page) ────────────
     if (/your email and\/or password remain incorrect.*further failed attempt/i.test(body)) return RESP.WRONG_PASS_2;
     if (/oops.*your email and\/or password are incorrect.*caps lock/i.test(body)) return RESP.WRONG_PASS_1;
 
-    // ── Success: URL must have left the login page ─────────────────────────
-    // Ignition uses ?overlay=login (query param) rather than a /login path,
-    // so we must check for that pattern too. "WELCOME BACK!" appears on the
-    // Ignition login modal title and is NOT a success signal.
+    // Ignition-specific wrong-password text
+    if (site === 'ign') {
+      if (/incorrect (email|username|password)|invalid (email|username|password|credentials)/i.test(body)) return RESP.WRONG_PASS_1;
+    }
+
+    // ── Success: URL must have left the login page AND auth-only signals ──
     const isOffLoginPage = !url.includes('/login')
       && !url.includes('/sign-in')
       && !url.includes('/signin')
       && !url.includes('overlay=login')
       && !url.includes('modal=login')
       && !url.includes('action=login');
-    if (isOffLoginPage) {
-      if (/hot pokies|new & exclusive|specialty games/i.test(body)) return RESP.SUCCESS;
-      if (/account balance|your balance|make a deposit|my account/i.test(body)) return RESP.SUCCESS;
-    }
+
+    if (isOffLoginPage && (await isLoggedIn(page, site))) return RESP.SUCCESS;
 
     await page.waitForTimeout(POLL_INTERVAL_MS);
   }
   return RESP.UNKNOWN;
+}
+
+/**
+ * Site-aware logged-in check. Uses DOM/cookie signals that only exist for
+ * authenticated users — NOT promotional marketing text which appears on the
+ * logged-out homepage too.
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} site - 'joe' | 'ign'
+ * @returns {Promise<boolean>}
+ */
+async function isLoggedIn(page, site) {
+  try {
+    // 1. Auth-only DOM elements — logout button / profile menu / balance chip.
+    //    These are absent when logged out.
+    const authOnlyLocators = site === 'ign'
+      ? [
+          'a:has-text("Log Out")', 'a:has-text("Log out")', 'a:has-text("Logout")',
+          'button:has-text("Log Out")', 'button:has-text("Logout")',
+          '[data-testid*="logout" i]',
+          '[class*="user-menu"]', '[class*="account-menu"]',
+          '[class*="balance"]', '[data-testid*="balance" i]',
+          'a[href*="/cashier"]', 'a[href*="/account"]:has-text("Account")',
+          'button:has-text("Deposit")',
+        ]
+      : [
+          // Joe Fortune: logout link, balance, user avatar, deposit button
+          'a:has-text("Logout")', 'a:has-text("Log Out")', 'a:has-text("Sign Out")',
+          'button:has-text("Logout")', 'button:has-text("Deposit")',
+          '[class*="user-avatar"]', '[class*="profile-avatar"]',
+          '[class*="balance"]', '[data-testid*="balance" i]',
+          'a[href*="/account"]', 'a[href*="/cashier"]',
+        ];
+
+    for (const sel of authOnlyLocators) {
+      const el = page.locator(sel).first();
+      if ((await el.count().catch(() => 0)) > 0 && (await el.isVisible({ timeout: 150 }).catch(() => false))) {
+        return true;
+      }
+    }
+
+    // 2. Auth cookies — casino sites typically set a session/auth cookie on
+    //    successful login. Presence of a cookie whose name matches typical
+    //    auth patterns is a strong secondary signal.
+    const cookies = await page.context().cookies().catch(() => []);
+    const authCookie = cookies.find(c => /token|auth|session|jwt|sid|bearer/i.test(c.name) && c.value && c.value.length > 10);
+    if (authCookie) {
+      // Cookie alone isn't enough (some sites set session cookies pre-login).
+      // Combine with "no visible password input" — if the login form is gone
+      // AND we have an auth-shaped cookie, treat as logged in.
+      const passVisible = await page.locator('input[type="password"]:visible').first().isVisible({ timeout: 150 }).catch(() => false);
+      if (!passVisible) return true;
+    }
+  } catch { /* ignore */ }
+  return false;
 }
 
 /**
@@ -705,7 +758,7 @@ app.post('/api/login-check', async (req, res) => {
     shots[1] = await captureShot(page, 'SCR 2/4');
 
     // Poll for outcome — returns immediately if the response is already visible
-    respType = await waitForLoginResponse(page, RESPONSE_POLL_MS);
+    respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
 
     // Evaluate result after first attempt
     if (respType === RESP.SUCCESS) {
@@ -730,7 +783,7 @@ app.post('/api/login-check', async (req, res) => {
       await dismissCookiePopup(page);
       shots[2] = await captureShot(page, 'SCR 3/4');
 
-      respType = await waitForLoginResponse(page, RESPONSE_POLL_MS);
+      respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
 
       if (respType === RESP.SUCCESS) {
         outcome = 'working';
@@ -771,12 +824,14 @@ app.post('/api/login-check', async (req, res) => {
         && !finalUrl.includes('modal=login')
         && !finalUrl.includes('action=login');
 
-      // Content-based success signals (same list used by waitForLoginResponse)
-      const hasLoggedInContent = /hot pokies|new & exclusive|specialty games|account balance|your balance|make a deposit|my account/i.test(finalBody);
+      // Site-aware auth-only check (DOM locators + auth cookie + no password input).
+      // Avoids false positives from generic marketing text on logged-out homepages
+      // (e.g. Ignition's `?overlay=login` landing page).
+      const loggedIn = await isLoggedIn(page, site);
 
-      if (offLoginPage && hasLoggedInContent) {
+      if (offLoginPage && loggedIn) {
         outcome = 'working';
-        note = `${siteName} — logged-in content detected on current page (no navigation)`;
+        note = `${siteName} — auth-only signals detected on current page (no navigation)`;
       } else if (/your account has been disabled\.\s*please,?\s*contact\s+customer\s+service/i.test(finalBody)) {
         outcome = 'permDisabled';
         note = `${siteName} — account permanently disabled (detected on final state)`;
