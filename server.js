@@ -581,7 +581,7 @@ async function waitForLoginResponse(page, maxWaitMs = RESPONSE_POLL_MS) {
  * Response: { outcome, note, shots: [4 base64 PNGs] }
  */
 app.post('/api/login-check', async (req, res) => {
-  const { site, username, password, loginUrl, timeout = NAV_TIMEOUT } = req.body;
+  const { site, username, password, loginUrl, timeout = NAV_TIMEOUT, liveView = false } = req.body;
   if (!username || !password || !loginUrl) {
     return res.status(400).json({ error: 'Missing username, password, or loginUrl' });
   }
@@ -592,9 +592,18 @@ app.post('/api/login-check', async (req, res) => {
   let note = 'Check did not complete';
 
   try {
-    browser = await chromium.launch({ headless: true, args: BROWSER_ARGS });
+    // liveView: small visible Chromium window so the user can watch each step.
+    // Uses a reduced viewport and slowMo so the flow mirrors recorder timing.
+    const launchArgs = liveView
+      ? [...BROWSER_ARGS, '--window-size=540,420', '--window-position=40,40']
+      : BROWSER_ARGS;
+    browser = await chromium.launch({
+      headless: !liveView,
+      args: launchArgs,
+      slowMo: liveView ? 120 : 0,
+    });
     const context = await browser.newContext({
-      viewport: { width: 1280, height: 800 },
+      viewport: liveView ? { width: 540, height: 420 } : { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     });
     const page = await context.newPage();

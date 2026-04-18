@@ -386,6 +386,7 @@ let state = {
     maxRequeueCount: 3,
     batchDelayBetweenStartsMs: 50,
     pageLoadTimeout: 180,
+    liveView: false,
     // Network / VPN
     vpnRotation: false,
     dnsRotation: false,
@@ -985,6 +986,7 @@ function renderSettings() {
   $('testEmail').value           = settings.testEmail;
   $('useEmailRotation').checked  = settings.useEmailRotation;
   $('debugScreenshots').checked  = settings.debugScreenshots !== false;
+  if ($('liveView')) $('liveView').checked = settings.liveView === true;
 
   // Automation settings
   if ($('typingSpeedMin')) $('typingSpeedMin').value = settings.typingSpeedMinMs;
@@ -2129,6 +2131,7 @@ async function simulateLoginDetailed(cred, siteId, siteName, loginUrl) {
         password: cred.password,
         loginUrl,
         timeout: (state.settings.loginTimeout || 60) * 1000,
+        liveView: state.settings.liveView === true,
       }),
     });
     if (!resp.ok) throw new Error(`API ${resp.status}`);
@@ -3042,6 +3045,7 @@ function wireEvents() {
   checkBind('stealthMode',       'stealthMode');
   checkBind('useEmailRotation',  'useEmailRotation');
   checkBind('debugScreenshots',  'debugScreenshots');
+  checkBind('liveView',          'liveView');
   checkBind('requeueOnTimeout',  'requeueOnTimeout');
   checkBind('requeueOnFailure',  'requeueOnFailure');
   checkBind('vpnRotation',       'vpnRotation');
@@ -3103,7 +3107,8 @@ function wireEvents() {
         loginConcurrency: 3, loginTimeout: 60, useEmailRotation: false, theme: 'dark',
         typingSpeedMinMs: 50, typingSpeedMaxMs: 150, requeueOnTimeout: true,
         requeueOnFailure: true, maxRequeueCount: 3, batchDelayBetweenStartsMs: 50,
-        pageLoadTimeout: 180, vpnRotation: false, dnsRotation: false, proxyRotateOnFailure: true,
+        pageLoadTimeout: 180, liveView: false,
+        vpnRotation: false, dnsRotation: false, proxyRotateOnFailure: true,
       };
       state.selectedCardIds.clear(); state.selectedJoeIds.clear(); state.selectedIgnIds.clear();
       applyTheme('dark'); renderAll(); toast('All data reset', 'info');
