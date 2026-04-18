@@ -626,7 +626,10 @@ app.post('/api/login-check', async (req, res) => {
       shots[1] = shots[0]; shots[2] = shots[0]; shots[3] = shots[0];
       return res.json({ outcome: 'noAcc', note, shots });
     }
-    await page.waitForTimeout(2000);
+    // Ignition takes longer to paint the login overlay + cookie banner.
+    // Wait 6000ms for Ignition, 2000ms for all other sites.
+    const initialLoadWait = site === 'ign' ? 6000 : 2000;
+    await page.waitForTimeout(initialLoadWait);
     await dismissCookiePopup(page);
 
     const filled = await fillLoginForm(page, username, password);
