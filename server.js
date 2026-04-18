@@ -718,6 +718,24 @@ app.post('/api/login-check', async (req, res) => {
     const page = await context.newPage();
     page.setDefaultTimeout(timeout);
 
+    // Navigation freeze: when `frozen` flips true, any further top-level
+    // document navigation (e.g. Ignition's post-login redirect to the lobby)
+    // is aborted so SCR 4/4 captures the response on the original page.
+    // XHR/fetch and sub-resources are unaffected.
+    let frozen = false;
+    await page.route('**/*', (route) => {
+      try {
+        const req = route.request();
+        if (frozen
+            && req.resourceType() === 'document'
+            && req.isNavigationRequest()
+            && req.frame() === page.mainFrame()) {
+          return route.abort();
+        }
+      } catch { /* fall through */ }
+      return route.continue();
+    });
+
     // ── Step 1: Load login page ───────────────────────────────────────────
     // Bulletproofing: if navigation fails (cert, DNS, timeout) we still want
     // to return a screenshot of the error state so the user has visual proof
@@ -809,6 +827,21 @@ app.post('/api/login-check', async (req, res) => {
     // visual timeline across SCR 1–4 on a single URL. We only read signals
     // from the current page.
     const needsFallback = outcome !== 'working' && outcome !== 'permDisabled' && outcome !== 'tempDisabled';
+
+    // Freeze page navigation so any post-submit redirect (Ignition jumps to
+    // the lobby after the 4th click) doesn't pull us off the response page
+    // before we capture SCR 4/4. Also block client-side reloads via JS.
+    frozen = true;
+    await page.evaluate(() => {
+      try {
+        window.addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = ''; }, true);
+        const noop = () => {};
+        try { window.location.assign  = noop; } catch {}
+        try { window.location.replace = noop; } catch {}
+        try { window.location.reload  = noop; } catch {}
+      } catch { /* ignore */ }
+    }).catch(() => {});
+
     await page.waitForTimeout(2000).catch(() => {}); // 2000ms settle before SCR 4/4
     await dismissCookiePopup(page);
 
