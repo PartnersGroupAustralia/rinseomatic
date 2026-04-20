@@ -248,9 +248,14 @@ const POOL_MAX_HEADED   = 1;
  * @type {{ headless: import('playwright').Browser | null, headed: import('playwright').Browser | null }}
  */
 const browserPool = { headless: null, headed: null };
+// Pending-launch coalescing: multiple concurrent callers share a single
+// chromium.launch() promise per mode so we never orphan Chromium processes
+// when the pool is cold and the context lease pool asks for N workers at once.
+const browserLaunching = { headless: null, headed: null };
 
 /**
  * Get (or lazy-launch) the persistent browser for the given mode.
+ * Concurrent-safe: coalesces simultaneous cold-start requests into one launch.
  * @param {boolean} live - true = visible window (liveView), false = headless
  * @returns {Promise<import('playwright').Browser>}
  */
@@ -259,20 +264,29 @@ async function getBrowser(live) {
   const existing = browserPool[key];
   if (existing && existing.isConnected()) return existing;
 
+  // Another caller is already launching for this mode — join them.
+  if (browserLaunching[key]) return browserLaunching[key];
+
   const launchArgs = live
     ? [...BROWSER_ARGS, '--window-size=540,420', '--window-position=40,40']
     : BROWSER_ARGS;
-  const b = await chromium.launch({
+  const launchPromise = chromium.launch({
     headless: !live,
     args:     launchArgs,
     slowMo:   live ? 120 : 0,
+  }).then((b) => {
+    // When the browser disconnects (crash, user close), clear the slot so the
+    // next request triggers a fresh launch instead of using a dead handle.
+    b.on('disconnected', () => { if (browserPool[key] === b) browserPool[key] = null; });
+    browserPool[key] = b;
+    logEvent('info', 'browser.launched', { mode: key });
+    return b;
+  }).finally(() => {
+    if (browserLaunching[key] === launchPromise) browserLaunching[key] = null;
   });
-  // When the browser disconnects (crash, user close), clear the slot so the
-  // next request triggers a fresh launch instead of using a dead handle.
-  b.on('disconnected', () => { if (browserPool[key] === b) browserPool[key] = null; });
-  browserPool[key] = b;
-  logEvent('info', 'browser.launched', { mode: key });
-  return b;
+
+  browserLaunching[key] = launchPromise;
+  return launchPromise;
 }
 
 /** Cleanly close both pooled browsers on process exit. */
@@ -1538,8 +1552,11 @@ app.post('/api/login-check', async (req, res) => {
     await persist(await captureShotBuf(page, 'SCR 4/4'), 3, page);
 
     // ── Network-hook tie-breaker (Swarm Upgrade v1 — promoted) ───────────
-    // Network auth JSON is now treated as equal-priority with DOM signals.
-    // A 2xx auth response containing balance/userId/token promotes → 'working'.
+    // Network auth JSON is now treated as equal-priority with DOM signals for
+    // the ambiguous 'noAcc' outcome only. Explicit DOM disabled signals
+    // ('permDisabled' / 'tempDisabled') always beat the network hook — the
+    // site's own copy is the ground truth for disabled accounts.
+    // A 2xx auth response containing balance/userId/token promotes noAcc → working.
     // A 4xx auth JSON with error/invalid demotes a DOM-only 'working' → 'noAcc'.
     // 429/captcha → bump domain backoff for future runs.
     if (netSnap) {
@@ -1547,7 +1564,7 @@ app.post('/api/login-check', async (req, res) => {
         bumpDomainBackoff(host);
         note += ' (rate-limited / captcha observed)';
       }
-      if (netSnap.authSuccess && !netSnap.authFailure && outcome !== 'working') {
+      if (outcome === 'noAcc' && netSnap.authSuccess && !netSnap.authFailure) {
         outcome = 'working';
         note = `${site === 'ign' ? 'Ignition' : 'Joe Fortune'} — success confirmed by network auth response`;
       }
