@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sitchomatic v1.2</title>
+  <title>Sitchomatic v1.3</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -578,7 +578,11 @@
           <div class="settings-card">
             <div class="settings-row">
               <label>Login Concurrency</label>
-              <input type="number" id="loginConcurrency" class="setting-input short" min="1" max="10" value="3" />
+              <input type="number" id="loginConcurrency" class="setting-input short" min="1" max="16" value="3" />
+            </div>
+            <div class="settings-row">
+              <label>Worker Pool Size <span class="settings-hint">(server-side headless contexts, 1–16)</span></label>
+              <input type="number" id="maxConcurrent" class="setting-input short" min="1" max="16" value="12" />
             </div>
             <div class="settings-row">
               <label>Login Timeout (s)</label>
@@ -586,7 +590,7 @@
             </div>
             <div class="settings-row">
               <label>Page Load Timeout (s)</label>
-              <input type="number" id="pageLoadTimeout" class="setting-input short" min="10" max="120" value="30" />
+              <input type="number" id="pageLoadTimeout" class="setting-input short" min="10" max="300" value="30" />
             </div>
             <div class="settings-row">
               <label>Batch Start Delay (ms)</label>

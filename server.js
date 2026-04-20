@@ -1,5 +1,5 @@
 /**
- * @fileoverview Sitchomatic Web — Real Browser Automation Server v1.2
+ * @fileoverview Sitchomatic Web — Real Browser Automation Server v1.3
  *
  * Express + Playwright server that performs LIVE browser automation.
  * Serves the webapp static files on port 8791 and provides a REST API
