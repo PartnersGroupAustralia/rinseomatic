@@ -3827,11 +3827,13 @@ function boot() {
       if (!$('screenshotModal').classList.contains('hidden')) renderDebugShots();
     });
     SSE.on('pool.config', (d) => {
-      // Mirror the server-side pool cap change into the local settings so
-      // the UI stays in sync when another tab or curl changes the cap.
+      // Mirror the server-side pool cap change into the local settings and
+      // persist it so the next boot doesn't push our stale localStorage value
+      // back over the top of a cap set by another tab or an external curl.
       if (d && typeof d.maxConcurrent === 'number') {
         state.settings.maxConcurrent = d.maxConcurrent;
         if ($('maxConcurrent')) $('maxConcurrent').value = d.maxConcurrent;
+        saveSettings();
       }
     });
     SSE.connect();
