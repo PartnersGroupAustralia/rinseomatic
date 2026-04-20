@@ -4,3 +4,6 @@ build/
 .cache/
 *.log
 .DS_Store
+debug-shots/
+sessions/
+logs/
