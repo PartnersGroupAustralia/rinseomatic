@@ -386,7 +386,7 @@ let state = {
     maxRequeueCount: 3,
     batchDelayBetweenStartsMs: 50,
     pageLoadTimeout: 180,
-    liveView: false,
+    liveView: true,
     // Network / VPN
     vpnRotation: false,
     dnsRotation: false,
@@ -3107,7 +3107,7 @@ function wireEvents() {
         loginConcurrency: 3, loginTimeout: 60, useEmailRotation: false, theme: 'dark',
         typingSpeedMinMs: 50, typingSpeedMaxMs: 150, requeueOnTimeout: true,
         requeueOnFailure: true, maxRequeueCount: 3, batchDelayBetweenStartsMs: 50,
-        pageLoadTimeout: 180, liveView: false,
+        pageLoadTimeout: 180, liveView: true,
         vpnRotation: false, dnsRotation: false, proxyRotateOnFailure: true,
       };
       state.selectedCardIds.clear(); state.selectedJoeIds.clear(); state.selectedIgnIds.clear();

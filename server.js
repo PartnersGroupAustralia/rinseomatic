@@ -50,6 +50,19 @@ const NAV_TIMEOUT = 30000;
 /** How long to wait after submitting a form before taking a screenshot. */
 const POST_SUBMIT_WAIT = 3000;
 
+// ── Single-Browser Serial Mutex ──────────────────────────────────────────────
+// Hard guarantee: only ONE Chromium process / one automation runs at a time.
+// Every /api/login-check and /api/card-check call queues behind this mutex
+// and runs strictly sequentially. The user can watch each run live without
+// multiple browser windows fighting for focus.
+let _automationChain = Promise.resolve();
+function runExclusive(fn) {
+  const next = _automationChain.then(() => fn(), () => fn());
+  // Swallow rejections in the chain so one failure doesn't poison the queue.
+  _automationChain = next.catch(() => {});
+  return next;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -694,6 +707,9 @@ app.post('/api/login-check', async (req, res) => {
     return res.status(400).json({ error: 'Missing username, password, or loginUrl' });
   }
 
+  // Serialize: wait for any in-flight automation to finish before launching
+  // a new Chromium. Guarantees only one browser open at a time.
+  await runExclusive(async () => {
   let browser;
   const shots = ['', '', '', ''];
   let outcome = 'noAcc';
@@ -894,6 +910,7 @@ app.post('/api/login-check', async (req, res) => {
   }
 
   if (!res.headersSent) res.json({ outcome, note, shots });
+  }); // runExclusive
 });
 
 // ── API: Card Check ───────────────────────────────────────────────────────────
@@ -926,6 +943,9 @@ app.post('/api/card-check', async (req, res) => {
     return res.status(400).json({ error: 'Missing card fields or ppsrUrl' });
   }
 
+  // Serialize against the global automation mutex — only one Chromium open
+  // at a time across login + card checks.
+  await runExclusive(async () => {
   let browser;
   const shots = ['', '', '', ''];
   let outcome = 'dead';
@@ -999,6 +1019,7 @@ app.post('/api/card-check', async (req, res) => {
   }
 
   if (!res.headersSent) res.json({ outcome, note, shots });
+  }); // runExclusive
 });
 
 // ── API: Flow Recorder ────────────────────────────────────────────────────────
