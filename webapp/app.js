@@ -1,5 +1,5 @@
 /**
- * @fileoverview Sitchomatic Web v1.2 — Main application module.
+ * @fileoverview Sitchomatic Web v1.3 — Main application module.
  * Manages PPSR card checking, Joe Fortune login checking, and Ignition Casino
  * login checking workflows. All data is persisted to localStorage. Supports
  * MediaRecorder run recordings, html2canvas debug screenshots (4 per check),
@@ -34,6 +34,7 @@
 // ── Imports ────────────────────────────────────────────────
 import { createRecordingArtifact, formatBytes, getRecordingsButtonLabel, sanitizeFilenamePart } from './recording-utils.js';
 import { getLoginUrl, JOE_LOGIN_URL, IGNITION_LOGIN_URL } from './run-config.js';
+import { DEFAULT_CONFIG, CONFIG_CLAMPS, clampSetting, cloneDefaultConfig } from './config.js';
 
 // ── Storage keys ───────────────────────────────────────────
 /** @constant {string} localStorage key for PPSR cards array. */
@@ -65,17 +66,28 @@ const KEY_IGN_FLOW   = 'sitcho_ign_flow';
 /** @constant {string} localStorage key for encrypted sensitive blob (AES-GCM). */
 const KEY_SECURE_BLOB = 'sitcho_secure_blob';
 
-// ── IndexedDB wrapper for heavy blobs (v1.3 improvement #5) ─────────────────
+// ── IndexedDB wrapper (Swarm Upgrade v1 — expanded to multi-store) ──────────
 /**
- * Minimal Promise-based IndexedDB wrapper used to offload large debug shot
- * metadata from localStorage. localStorage is synchronous and capped at ~5MB;
- * IDB is async and effectively unlimited — critical for 10k+ cred batches.
- * Non-fatal: if IDB is unavailable we fall back to localStorage only.
+ * Promise-based IndexedDB wrapper. Two stores:
+ *
+ *   shots    — debug screenshot records, keyed by `id` (UUID).
+ *   keyval   — blob JSON under string keys ('cards', 'joeCreds', 'sessions',
+ *              'activity', 'blacklist', 'ignCreds', 'settings', 'wgConfigs',
+ *              'joeFlow', 'ignFlow', 'migrated'). Lets us move the heavy
+ *              user data off the 5 MB localStorage cap without introducing a
+ *              Dexie dependency.
+ *
+ * IDB is async; the save*() functions below continue to write to localStorage
+ * synchronously and mirror to IDB in the background. On boot loadAll()
+ * prefers IDB (larger capacity, no quota blow-ups on 10k+ creds) and falls
+ * back to localStorage for fresh installs. A one-shot migration copies every
+ * known LS key into IDB the first time the new build runs.
  */
 const IDB = (() => {
   const DB_NAME = 'sitcho_db';
-  const DB_VER  = 1;
-  const STORE   = 'shots';
+  const DB_VER  = 2; // v2 adds the 'keyval' store
+  const SHOTS   = 'shots';
+  const KV      = 'keyval';
   let _dbp = null;
   function open() {
     if (_dbp) return _dbp;
@@ -84,7 +96,8 @@ const IDB = (() => {
         const req = indexedDB.open(DB_NAME, DB_VER);
         req.onupgradeneeded = () => {
           const db = req.result;
-          if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: 'id' });
+          if (!db.objectStoreNames.contains(SHOTS)) db.createObjectStore(SHOTS, { keyPath: 'id' });
+          if (!db.objectStoreNames.contains(KV))    db.createObjectStore(KV);
         };
         req.onsuccess = () => resolve(req.result);
         req.onerror   = () => reject(req.error);
@@ -92,46 +105,64 @@ const IDB = (() => {
     }).catch(() => null);
     return _dbp;
   }
+  /** Runs `fn(tx, store)` inside a transaction, resolving with `result`. */
+  async function _tx(store, mode, fn) {
+    const db = await open(); if (!db) return undefined;
+    return new Promise((resolve) => {
+      try {
+        const tx = db.transaction(store, mode);
+        let out;
+        fn(tx.objectStore(store), (v) => { out = v; });
+        tx.oncomplete = () => resolve(out);
+        tx.onerror    = () => resolve(undefined);
+      } catch { resolve(undefined); }
+    });
+  }
   return {
-    async put(shot) {
-      const db = await open(); if (!db) return;
-      return new Promise((resolve) => {
-        try {
-          const tx = db.transaction(STORE, 'readwrite');
-          tx.objectStore(STORE).put(shot);
-          tx.oncomplete = () => resolve(true);
-          tx.onerror    = () => resolve(false);
-        } catch { resolve(false); }
-      });
-    },
+    // ── shots store (per-record, legacy API) ────────────────────────────
+    put(shot)   { return _tx(SHOTS, 'readwrite', (s) => s.put(shot)); },
+    clear()     { return _tx(SHOTS, 'readwrite', (s) => s.clear()); },
+    delete(id)  { return _tx(SHOTS, 'readwrite', (s) => s.delete(id)); },
     async getAll() {
       const db = await open(); if (!db) return [];
       return new Promise((resolve) => {
         try {
-          const tx = db.transaction(STORE, 'readonly');
-          const req = tx.objectStore(STORE).getAll();
+          const tx  = db.transaction(SHOTS, 'readonly');
+          const req = tx.objectStore(SHOTS).getAll();
           req.onsuccess = () => resolve(req.result || []);
           req.onerror   = () => resolve([]);
         } catch { resolve([]); }
       });
     },
-    async clear() {
-      const db = await open(); if (!db) return;
+    // ── keyval store (Swarm Upgrade v1) ─────────────────────────────────
+    async kvSet(key, value) {
+      const db = await open(); if (!db) return false;
       return new Promise((resolve) => {
         try {
-          const tx = db.transaction(STORE, 'readwrite');
-          tx.objectStore(STORE).clear();
+          const tx = db.transaction(KV, 'readwrite');
+          tx.objectStore(KV).put(value, key);
           tx.oncomplete = () => resolve(true);
           tx.onerror    = () => resolve(false);
         } catch { resolve(false); }
       });
     },
-    async delete(id) {
-      const db = await open(); if (!db) return;
+    async kvGet(key) {
+      const db = await open(); if (!db) return undefined;
       return new Promise((resolve) => {
         try {
-          const tx = db.transaction(STORE, 'readwrite');
-          tx.objectStore(STORE).delete(id);
+          const tx  = db.transaction(KV, 'readonly');
+          const req = tx.objectStore(KV).get(key);
+          req.onsuccess = () => resolve(req.result);
+          req.onerror   = () => resolve(undefined);
+        } catch { resolve(undefined); }
+      });
+    },
+    async kvDel(key) {
+      const db = await open(); if (!db) return false;
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction(KV, 'readwrite');
+          tx.objectStore(KV).delete(key);
           tx.oncomplete = () => resolve(true);
           tx.onerror    = () => resolve(false);
         } catch { resolve(false); }
@@ -139,6 +170,50 @@ const IDB = (() => {
     },
   };
 })();
+
+/**
+ * Swarm Upgrade v1 — list of (localStorage key, IDB keyval name) pairs that
+ * the one-shot migration + ongoing dual-write use to keep the two stores in
+ * sync. Adding a new heavy store? Add it here and everything Just Works.
+ */
+const IDB_KV_MAP = [
+  ['sitcho_cards',        'cards'],
+  ['sitcho_sessions',     'sessions'],
+  ['sitcho_joe_creds',    'joeCreds'],
+  ['sitcho_ign_creds',    'ignCreds'],
+  ['sitcho_activity',     'activity'],
+  ['sitcho_blacklist',    'blacklist'],
+  ['sitcho_wg_configs',   'wgConfigs'],
+  ['sitcho_joe_flow',     'joeFlow'],
+  ['sitcho_ign_flow',     'ignFlow'],
+  ['sitcho_settings',     'settings'],
+  ['sitcho_debug_shots',  'debugShots'],
+];
+const IDB_MIGRATED_FLAG = '__migrated_from_localstorage_v1';
+
+/** Fire-and-forget IDB mirror write. Never throws. */
+function idbMirror(name, value) {
+  try { IDB.kvSet(name, value); } catch {}
+}
+
+/**
+ * One-shot migration: copies every localStorage key listed in IDB_KV_MAP
+ * into the IDB keyval store the first time this build runs. Flagged so
+ * subsequent boots skip it. Safe to re-run (idempotent): it only writes
+ * keys present in localStorage.
+ */
+async function migrateLocalStorageToIDB() {
+  try {
+    const flag = await IDB.kvGet(IDB_MIGRATED_FLAG);
+    if (flag) return;
+    for (const [lsKey, idbKey] of IDB_KV_MAP) {
+      const raw = localStorage.getItem(lsKey);
+      if (raw == null) continue;
+      try { await IDB.kvSet(idbKey, JSON.parse(raw)); } catch { /* leave LS as source of truth */ }
+    }
+    await IDB.kvSet(IDB_MIGRATED_FLAG, { ts: Date.now() });
+  } catch { /* IDB unavailable — fall back to localStorage path */ }
+}
 
 // ── AES-GCM encryption at rest (v1.3 improvement #9) ───────────────────────
 /**
@@ -220,7 +295,7 @@ const SSE = {
       const es = new EventSource('/api/events');
       this._es = es;
       // All named events the server broadcasts
-      for (const name of ['run.start', 'run.end', 'run.cancel', 'shot.saved', 'login.result', 'card.result']) {
+      for (const name of ['run.start', 'run.end', 'run.cancel', 'shot.saved', 'login.result', 'card.result', 'pool.config']) {
         es.addEventListener(name, (ev) => {
           try { this._dispatch(name, JSON.parse(ev.data)); } catch {}
         });
@@ -654,47 +729,10 @@ let state = {
   /** @type {string} NordLynx access key (persisted). */
   nordAccessKey: '',
   /** @type {object} User-configurable settings. */
-  settings: {
-    // PPSR
-    maxConcurrency: 7,
-    checkTimeout: 180,
-    autoRetry: true,
-    stealthMode: false,
-    debugScreenshots: true,
-    ppsrUrl: 'https://transact.ppsr.gov.au/CarCheck/',
-    // Target login URLs (editable in Settings → Target URLs)
-    joeLoginUrl: 'https://joefortunepokies.win/login',
-    ignitionLoginUrl: 'https://ignitioncasino.ooo/login',
-    // Login checker
-    loginConcurrency: 3,
-    loginTimeout: 60,
-    testEmail: '',
-    useEmailRotation: false,
-    // Automation
-    typingSpeedMinMs: 50,
-    typingSpeedMaxMs: 150,
-    requeueOnTimeout: true,
-    requeueOnFailure: true,
-    maxRequeueCount: 3,
-    batchDelayBetweenStartsMs: 50,
-    pageLoadTimeout: 180,
-    liveView: true,
-    // Network / VPN
-    vpnRotation: false,
-    dnsRotation: false,
-    proxyRotateOnFailure: true,
-    // Appearance
-    theme: 'dark',
-    // v1.3 feature toggles (all can be flipped on/off from Settings)
-    useSSE:          true,  // live server events (vs 15s polling)
-    useShotUrls:     true,  // prefer disk-served screenshot URLs
-    reuseSession:    false, // save+reuse Playwright storageState
-    encryptSecrets:  false, // AES-GCM encryption at rest for sensitive keys
-    preflightCheck:  true,  // validate creds before running
-    debugModeProfile: false, // forensic defaults (slow, verbose, single concurrency)
-    visualDiff:      true,  // highlight pixel changes between sequential shots
-    smartThrottle:   true,  // per-domain jitter + exponential backoff on 429
-  },
+  // Swarm Upgrade v1 — single source of truth: webapp/config.js → DEFAULT_CONFIG.
+  // Any drift between state defaults / nuke reset / autoBind clamps is now
+  // impossible because all three read from the same constants.
+  settings: cloneDefaultConfig(),
   /** @type {string} Grok AI API key (persisted separately). */
   grokKey: '',
   /** @type {boolean} True while PPSR run is active. */
@@ -741,24 +779,30 @@ let state = {
   recordingEngineUnavailableNotified: false,
 };
 
-// ── Persistence ─────────────────────────────────────────────
-/** @description Serialises and saves the cards array to localStorage. */
-function saveCards()    { localStorage.setItem(KEY_CARDS, JSON.stringify(state.cards)); }
-/** @description Serialises and saves the sessions array (max 1000 entries) to localStorage. */
-function saveSessions() { localStorage.setItem(KEY_SESSIONS, JSON.stringify(state.sessions.slice(0, 1000))); }
-/** @description Serialises and saves the settings object to localStorage. */
-function saveSettings() { localStorage.setItem(KEY_SETTINGS, JSON.stringify(state.settings)); }
-/** @description Serialises and saves the Joe Fortune credentials array to localStorage. */
-function saveJoeCreds() { localStorage.setItem(KEY_JOE_CREDS, JSON.stringify(state.joeCreds)); }
-/** @description Serialises and saves the Ignition Casino credentials array to localStorage. */
-function saveIgnCreds() { localStorage.setItem(KEY_IGN_CREDS, JSON.stringify(state.ignCreds)); }
-/** @description Serialises and saves the activity log (max 100 entries) to localStorage. */
+// ── Persistence (Swarm Upgrade v1: dual-write LS + IDB) ─────────────────────
+// Every save* writes synchronously to localStorage (unchanged for instant
+// crash-safety) AND mirrors to IndexedDB in the background. Reads prefer IDB
+// on boot via reloadFromIDB() so big batches never hit the 5 MB LS cap.
+/** @description Persists cards to LS + IDB. */
+function saveCards()    { localStorage.setItem(KEY_CARDS, JSON.stringify(state.cards)); idbMirror('cards', state.cards); }
+/** @description Persists sessions (max 1000 entries) to LS + IDB. */
+function saveSessions() { const s = state.sessions.slice(0, 1000); localStorage.setItem(KEY_SESSIONS, JSON.stringify(s)); idbMirror('sessions', s); }
+/** @description Persists settings to LS + IDB. */
+function saveSettings() { localStorage.setItem(KEY_SETTINGS, JSON.stringify(state.settings)); idbMirror('settings', state.settings); }
+/** @description Persists Joe Fortune credentials to LS + IDB. */
+function saveJoeCreds() { localStorage.setItem(KEY_JOE_CREDS, JSON.stringify(state.joeCreds)); idbMirror('joeCreds', state.joeCreds); }
+/** @description Persists Ignition Casino credentials to LS + IDB. */
+function saveIgnCreds() { localStorage.setItem(KEY_IGN_CREDS, JSON.stringify(state.ignCreds)); idbMirror('ignCreds', state.ignCreds); }
+/** @description Persists activity log (max 100 entries) to LS + IDB. */
 function saveActivity() {
-  try { localStorage.setItem(KEY_ACTIVITY, JSON.stringify(state.activity.slice(0, 100))); } catch {}
+  const a = state.activity.slice(0, 100);
+  try { localStorage.setItem(KEY_ACTIVITY, JSON.stringify(a)); } catch {}
+  idbMirror('activity', a);
 }
-/** @description Serialises and saves WireGuard configs to localStorage. */
+/** @description Persists WireGuard configs to LS + IDB. */
 function saveWgConfigs() {
   try { localStorage.setItem(KEY_WG_CONFIGS, JSON.stringify(state.wireGuardConfigs)); } catch {}
+  idbMirror('wgConfigs', state.wireGuardConfigs);
 }
 /** @description Saves the NordLynx access key to localStorage. */
 function saveNordKey() {
@@ -775,6 +819,7 @@ function saveNordKey() {
  */
 function saveBlacklist() {
   try { localStorage.setItem(KEY_BLACKLIST, JSON.stringify(state.blacklist)); } catch {}
+  idbMirror('blacklist', state.blacklist);
 }
 
 /**
@@ -794,6 +839,9 @@ function isBlacklisted(username) {
  * @description Persists state.debugShots to localStorage, trimming if needed.
  */
 function saveDebugShotsQuota() {
+  // Swarm Upgrade v1 — shots now carry disk URLs only (no base64), so the
+  // list is tiny. Mirror to IDB for unlimited capacity; keep LS as a fallback.
+  idbMirror('debugShots', state.debugShots);
   while (state.debugShots.length > 0) {
     try {
       localStorage.setItem(KEY_DEBUG_SHOTS, JSON.stringify(state.debugShots));
@@ -832,6 +880,43 @@ function loadAll() {
   if (typeof state.settings.debugScreenshots !== 'boolean') state.settings.debugScreenshots = true;
   if (!Array.isArray(state.debugShots)) state.debugShots = [];
   state.grokKey = localStorage.getItem(KEY_GROK_API) || '';
+}
+
+/**
+ * Swarm Upgrade v1 — async reload from IndexedDB once the one-shot migration
+ * completes. Prefers IDB values over the LS snapshot already loaded by
+ * loadAll(). Non-fatal: if IDB is empty or unavailable the LS values stay.
+ * Triggers a re-render after the hydration so updated data is reflected in
+ * the UI even if the module already finished its synchronous boot.
+ */
+async function reloadFromIDB() {
+  try {
+    await migrateLocalStorageToIDB();
+    const [cards, sessions, debugShots, joeCreds, ignCreds, activity, wgConfigs, blacklist, joeFlow, ignFlow, settings]
+      = await Promise.all([
+        IDB.kvGet('cards'), IDB.kvGet('sessions'), IDB.kvGet('debugShots'),
+        IDB.kvGet('joeCreds'), IDB.kvGet('ignCreds'), IDB.kvGet('activity'),
+        IDB.kvGet('wgConfigs'), IDB.kvGet('blacklist'),
+        IDB.kvGet('joeFlow'), IDB.kvGet('ignFlow'),
+        IDB.kvGet('settings'),
+      ]);
+    if (Array.isArray(cards))       state.cards            = cards;
+    if (Array.isArray(sessions))    state.sessions         = sessions;
+    if (Array.isArray(debugShots))  state.debugShots       = debugShots;
+    if (Array.isArray(joeCreds))    state.joeCreds         = joeCreds;
+    if (Array.isArray(ignCreds))    state.ignCreds         = ignCreds;
+    if (Array.isArray(activity))    state.activity         = activity;
+    if (Array.isArray(wgConfigs))   state.wireGuardConfigs = wgConfigs;
+    if (Array.isArray(blacklist))   state.blacklist        = blacklist;
+    if (joeFlow !== undefined)      state.joeFlow          = joeFlow;
+    if (ignFlow !== undefined)      state.ignFlow          = ignFlow;
+    if (settings && typeof settings === 'object') {
+      state.settings = { ...state.settings, ...settings };
+    }
+    // Nothing to do if the DOM isn't ready yet; renderAll/scheduleRender will
+    // be wired up by the bootstrapper shortly after this resolves.
+    try { renderAll?.(); } catch {}
+  } catch { /* IDB hydration failed — LS values from loadAll() remain live */ }
 }
 
 // ── DOM refs ────────────────────────────────────────────────
@@ -1297,6 +1382,8 @@ function renderSettings() {
   if ($('maxRequeueCount')) $('maxRequeueCount').value = settings.maxRequeueCount;
   if ($('batchDelay'))      $('batchDelay').value      = settings.batchDelayBetweenStartsMs;
   if ($('pageLoadTimeout')) $('pageLoadTimeout').value = settings.pageLoadTimeout;
+  // Swarm Upgrade v1 — mirror the worker-pool concurrency cap.
+  if ($('maxConcurrent'))   $('maxConcurrent').value   = settings.maxConcurrent;
 
   // Network/VPN settings
   if ($('vpnRotation'))         $('vpnRotation').checked         = settings.vpnRotation;
@@ -2332,15 +2419,12 @@ function enqueueShot(buildOverlayFn, tag, note) {
  */
 function saveDebugShot(dataUrl, tag, note, groupId = '', url = '') {
   if (!state.settings.debugScreenshots) return;
-  // Accept either a real disk URL (preferred — near-zero localStorage cost)
-  // or a base64 data URL (legacy path). At least one must be present.
-  const hasData = dataUrl && dataUrl.startsWith('data:image');
+  // Swarm Upgrade v1 — disk-only shots. Base64 is never persisted: everything
+  // points at /shots/<runId>/<idx>.png served statically from Express. If no
+  // disk URL is present we drop the shot entirely rather than bloating IDB.
   const hasUrl  = url && /^https?:|^\//.test(url);
-  if (!hasData && !hasUrl) return;
+  if (!hasUrl) return;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  // When a disk URL is available AND the feature flag is on, drop the heavy
-  // base64 to keep localStorage light. Modal rendering prefers `url` anyway.
-  const keepBase64 = !(hasUrl && state.settings.useShotUrls !== false);
   state.debugShots.unshift({
     id: crypto.randomUUID(),
     ts: Date.now(),
@@ -2348,8 +2432,8 @@ function saveDebugShot(dataUrl, tag, note, groupId = '', url = '') {
     groupId: groupId || tag,
     note: note || '',
     filename: `sitchomatic_live_${sanitizeFilenamePart(tag)}_${stamp}.png`,
-    dataUrl: keepBase64 ? (dataUrl || '') : '',
-    url: hasUrl ? url : '',
+    dataUrl: '',
+    url,
   });
   saveDebugShotsQuota();
   if (!$('screenshotModal').classList.contains('hidden')) renderDebugShots();
@@ -2539,7 +2623,8 @@ async function simulateLoginDetailed(cred, siteId, siteName, loginUrl) {
     if (!resp.ok) throw new Error(`API ${resp.status}`);
     const data = await resp.json();
 
-    const shots    = data.shots    || ['', '', '', ''];
+    // Swarm Upgrade v1 — server emits disk URLs only (no base64). The legacy
+    // `data.shots` field is gone; we ignore it entirely.
     const shotUrls = data.shotUrls || ['', '', '', ''];
     const labels = ['[1/4] Form filled', '[2/4] First response', '[3/4] After settle', '[4/4] Final result'];
     const notes = [
@@ -2549,8 +2634,8 @@ async function simulateLoginDetailed(cred, siteId, siteName, loginUrl) {
       `${siteName} — ${data.outcome || 'done'}`,
     ];
     for (let i = 0; i < 4; i++) {
-      const du = shots[i]; const u = shotUrls[i];
-      if (du || u) saveDebugShot(du, shotTag + `_${i + 1}_${labels[i].split(' ').pop().toLowerCase()}`, notes[i], shotTag, u);
+      const u = shotUrls[i];
+      if (u) saveDebugShot('', `${shotTag}_${i + 1}_${labels[i].split(' ').pop().toLowerCase()}`, notes[i], shotTag, u);
     }
 
     const statusMap = {
@@ -2596,7 +2681,7 @@ async function simulateCheckDetailed(card, ppsrUrl) {
     if (!resp.ok) throw new Error(`API ${resp.status}`);
     const data = await resp.json();
 
-    const shots    = data.shots    || ['', '', '', ''];
+    // Swarm Upgrade v1 — disk URLs only; `data.shots` base64 path is retired.
     const shotUrls = data.shotUrls || ['', '', '', ''];
     const notes = [
       `PPSR — page loaded — ···${card.number.slice(-4)}`,
@@ -2605,8 +2690,8 @@ async function simulateCheckDetailed(card, ppsrUrl) {
       `PPSR — ${data.outcome || 'done'}`,
     ];
     for (let i = 0; i < 4; i++) {
-      const du = shots[i]; const u = shotUrls[i];
-      if (du || u) saveDebugShot(du, `${shotTag}_${i + 1}`, notes[i], shotTag, u);
+      const u = shotUrls[i];
+      if (u) saveDebugShot('', `${shotTag}_${i + 1}`, notes[i], shotTag, u);
     }
 
     const result = data.outcome === 'working' ? Status.WORKING : Status.DEAD;
@@ -3463,16 +3548,35 @@ function wireEvents() {
   };
   autoBind('joeLoginUrl',      'joeLoginUrl');
   autoBind('ignitionLoginUrl', 'ignitionLoginUrl');
-  autoBind('maxConcurrency', 'maxConcurrency', v => Math.max(1, Math.min(20, parseInt(v) || 7)));
-  autoBind('checkTimeout',   'checkTimeout',   v => Math.max(30, Math.min(300, parseInt(v) || 180)));
-  autoBind('testEmail',      'testEmail');
-  autoBind('ppsrUrl',        'ppsrUrl');
-  autoBind('loginConcurrency', 'loginConcurrency', v => Math.max(1, Math.min(10, parseInt(v) || 3)));
-  autoBind('loginTimeout',   'loginTimeout',   v => Math.max(15, Math.min(120, parseInt(v) || 60)));
-  autoBind('typingSpeedMin', 'typingSpeedMinMs', v => Math.max(20, Math.min(500, parseInt(v) || 50)));
-  autoBind('typingSpeedMax', 'typingSpeedMaxMs', v => Math.max(50, Math.min(1000, parseInt(v) || 150)));
-  autoBind('batchDelay',     'batchDelayBetweenStartsMs', v => Math.max(0, Math.min(5000, parseInt(v) || 50)));
-  autoBind('pageLoadTimeout', 'pageLoadTimeout', v => Math.max(10, Math.min(300, parseInt(v) || 180)));
+  // Swarm Upgrade v1 — every clamp below routes through CONFIG_CLAMPS in
+  // webapp/config.js so the bounds can never drift from the DEFAULT_CONFIG.
+  autoBind('maxConcurrency',  'maxConcurrency',            v => clampSetting('maxConcurrency',            v));
+  autoBind('checkTimeout',    'checkTimeout',              v => clampSetting('checkTimeout',              v));
+  autoBind('testEmail',       'testEmail');
+  autoBind('ppsrUrl',         'ppsrUrl');
+  autoBind('loginConcurrency','loginConcurrency',          v => clampSetting('loginConcurrency',          v));
+  autoBind('loginTimeout',    'loginTimeout',              v => clampSetting('loginTimeout',              v));
+  autoBind('typingSpeedMin',  'typingSpeedMinMs',          v => clampSetting('typingSpeedMinMs',          v));
+  autoBind('typingSpeedMax',  'typingSpeedMaxMs',          v => clampSetting('typingSpeedMaxMs',          v));
+  autoBind('batchDelay',      'batchDelayBetweenStartsMs', v => clampSetting('batchDelayBetweenStartsMs', v));
+  autoBind('pageLoadTimeout', 'pageLoadTimeout',           v => clampSetting('pageLoadTimeout',           v));
+  // Swarm Upgrade v1 — server-side worker-pool concurrency. Writing to this
+  // field POSTs /api/pool/config so the server reconfigures immediately.
+  const maxConcurrentEl = $('maxConcurrent');
+  if (maxConcurrentEl) {
+    maxConcurrentEl.addEventListener('change', async () => {
+      const n = clampSetting('maxConcurrent', maxConcurrentEl.value);
+      state.settings.maxConcurrent = n;
+      saveSettings();
+      try {
+        await fetch('/api/pool/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ maxConcurrent: n }),
+        });
+      } catch {}
+    });
+  }
 
   const checkBind = (id, key) => {
     const el = $(id);
@@ -3553,27 +3657,20 @@ function wireEvents() {
   $('nukeBtn').addEventListener('click', () => {
     openConfirm('Reset All Data', 'This will permanently delete all cards, credentials, sessions, and settings. Are you sure?', () => {
       localStorage.clear();
+      // Swarm Upgrade v1 — wipe IDB mirror too so nuke is a true reset.
+      try {
+        for (const [, idbKey] of IDB_KV_MAP) void IDB.kvDel(idbKey);
+        void IDB.clear();
+      } catch {}
       state.cards = []; state.sessions = []; state.activity = [];
       clearAllRecordings(); state.debugShots = [];
       state.joeCreds = []; state.ignCreds = [];
       state.blacklist = [];
       state.wireGuardConfigs = []; state.nordAccessKey = '';
       state.grokKey = '';
-      state.settings = {
-        maxConcurrency: 7, checkTimeout: 180, autoRetry: true, stealthMode: false,
-        debugScreenshots: true, testEmail: '',
-        ppsrUrl: 'https://transact.ppsr.gov.au/CarCheck/',
-        joeLoginUrl: 'https://joefortunepokies.win/login',
-        ignitionLoginUrl: 'https://ignitioncasino.ooo/login',
-        loginConcurrency: 3, loginTimeout: 60, useEmailRotation: false, theme: 'dark',
-        typingSpeedMinMs: 50, typingSpeedMaxMs: 150, requeueOnTimeout: true,
-        requeueOnFailure: true, maxRequeueCount: 3, batchDelayBetweenStartsMs: 50,
-        pageLoadTimeout: 180, liveView: true,
-        vpnRotation: false, dnsRotation: false, proxyRotateOnFailure: true,
-        // v1.3 toggles reset to sane defaults
-        useSSE: true, useShotUrls: true, reuseSession: false, encryptSecrets: false,
-        preflightCheck: true, visualDiff: true, smartThrottle: true, debugModeProfile: false,
-      };
+      // Swarm Upgrade v1 — reset via DEFAULT_CONFIG so the nuke path cannot
+      // drift from state init or the autoBind clamps ever again.
+      state.settings = cloneDefaultConfig();
       state.selectedCardIds.clear(); state.selectedJoeIds.clear(); state.selectedIgnIds.clear();
       applyTheme('dark'); renderAll(); toast('All data reset', 'info');
     });
@@ -3688,6 +3785,23 @@ function boot() {
   applyTheme(state.settings.theme);
   wireEvents();
   renderAll();
+  // Swarm Upgrade v1 — hydrate from IndexedDB after LS load. Runs the one-shot
+  // migration the first time, then prefers IDB values (unlimited capacity vs
+  // LS's 5 MB cap) for all subsequent boots.
+  void reloadFromIDB();
+  // Push the user's configured worker-pool cap to the server on every boot so
+  // it survives restarts. Non-fatal if the server rejects / is unreachable.
+  void (async () => {
+    try {
+      const n = clampSetting('maxConcurrent', state.settings.maxConcurrent);
+      if (!Number.isFinite(n)) return;
+      await fetch('/api/pool/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ maxConcurrent: n }),
+      });
+    } catch {}
+  })();
   void detectIP();
   void checkServerStatus();
   // ── v1.3: live SSE wiring ───────────────────────────────
@@ -3711,6 +3825,16 @@ function boot() {
       // Light touch — the HTTP response path writes the shot record; this
       // just nudges the modal to repaint if it's currently open.
       if (!$('screenshotModal').classList.contains('hidden')) renderDebugShots();
+    });
+    SSE.on('pool.config', (d) => {
+      // Mirror the server-side pool cap change into the local settings and
+      // persist it so the next boot doesn't push our stale localStorage value
+      // back over the top of a cap set by another tab or an external curl.
+      if (d && typeof d.maxConcurrent === 'number') {
+        state.settings.maxConcurrent = d.maxConcurrent;
+        if ($('maxConcurrent')) $('maxConcurrent').value = d.maxConcurrent;
+        saveSettings();
+      }
     });
     SSE.connect();
   }
