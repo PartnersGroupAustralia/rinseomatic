@@ -1663,25 +1663,53 @@ function renderFlowRecorder() {
     const detailEl  = $(`${site}FlowDetail`);
     const recordBtn = $(`${site}FlowRecordBtn`);
     const clearBtn  = $(`${site}FlowClearBtn`);
+    const urlInput  = $(`${site}FlowUrl`);
     if (!statusEl) return;
 
+    // Reflect persisted recording URL (or default login URL) into the textbox
+    if (urlInput && document.activeElement !== urlInput) {
+      const saved = flow && !Array.isArray(flow) ? flow.url : '';
+      const fallback = site === 'joe'
+        ? (state.settings.joeLoginUrl || 'https://joefortunepokies.win/login')
+        : (state.settings.ignitionLoginUrl || 'https://ignitioncasino.ooo/?overlay=login');
+      urlInput.value = saved || fallback;
+    }
+
     if (sels) {
-      const delays  = (flow && !Array.isArray(flow) && Array.isArray(flow.delays)) ? flow.delays : [];
-      const avgMs   = delays.length ? Math.round(delays.reduce((a, b) => a + b, 0) / delays.length) : 0;
+      const delays     = (flow && !Array.isArray(flow) && Array.isArray(flow.delays)) ? flow.delays : [];
+      const speed      = (flow && !Array.isArray(flow) && typeof flow.speed === 'number' && flow.speed > 0) ? flow.speed : 1;
+      const effDelays  = delays.map(d => Math.round(d / speed));
+      const avgMs      = effDelays.length ? Math.round(effDelays.reduce((a, b) => a + b, 0) / effDelays.length) : 0;
       const timingNote = avgMs
-        ? `<div class="settings-note" style="padding:2px 0;font-size:0.72rem">Avg delay between clicks: <strong>${avgMs} ms</strong> (${delays.length} intervals)</div>`
+        ? `<div class="settings-note" style="padding:2px 0;font-size:0.72rem">Avg effective delay: <strong>${avgMs} ms</strong> (${effDelays.length} intervals) · speed ×${speed.toFixed(2)}</div>`
         : '';
+
+      const speedPct   = Math.round(speed * 100);
+      const speedRow   = delays.length
+        ? `<div class="flow-speed-row">
+             <span class="flow-speed-label">Speed multiplier</span>
+             <input type="range" min="25" max="400" step="5" value="${speedPct}" class="flow-speed-slider" oninput="window._flowUpdateSpeed('${site}', this.value, true)" onchange="window._flowUpdateSpeed('${site}', this.value, false)" />
+             <span class="flow-speed-value">×${speed.toFixed(2)}</span>
+           </div>` : '';
 
       statusEl.textContent = `✅ ${sels.length} click${sels.length !== 1 ? 's' : ''} recorded`;
       statusEl.className = 'flow-status recorded';
       detailEl.innerHTML =
         timingNote +
-        sels.map((sel, i) =>
-          `<div class="flow-step-row">` +
-          `<span class="flow-step-label">Click ${i + 1}${delays[i - 1] !== undefined ? ` <span style="color:var(--text3);font-size:0.68rem">(+${delays[i - 1]}ms)</span>` : ''}</span>` +
-          `<code class="flow-step-sel">${sel}</code>` +
-          `</div>`
-        ).join('');
+        speedRow +
+        sels.map((sel, i) => {
+          const rawDelay = delays[i - 1];
+          const effDelay = effDelays[i - 1];
+          const delayEdit = rawDelay !== undefined
+            ? `<input type="number" min="0" max="60000" step="50" class="flow-delay-input" value="${rawDelay}" onchange="window._flowUpdateDelay('${site}', ${i - 1}, this.value)" title="Edit raw delay before this click (ms)" />
+               <span class="flow-delay-unit">ms → ${effDelay}ms eff.</span>`
+            : '';
+          return `<div class="flow-step-row">` +
+            `<span class="flow-step-label">Click ${i + 1}</span>` +
+            `<code class="flow-step-sel">${sel}</code>` +
+            delayEdit +
+            `</div>`;
+        }).join('');
       if (clearBtn) clearBtn.classList.remove('hidden');
     } else {
       statusEl.textContent = 'Not recorded';
@@ -1694,6 +1722,46 @@ function renderFlowRecorder() {
 }
 
 /**
+ * Update the speed multiplier on a recorded flow.
+ * @param {'joe'|'ign'} site
+ * @param {number|string} pct - 25..400 (percent; 100 = x1.0)
+ * @param {boolean} live - true while dragging (defer persist), false on change
+ */
+function updateFlowSpeed(site, pct, live) {
+  const flow = site === 'joe' ? state.joeFlow : state.ignFlow;
+  if (!flow || Array.isArray(flow)) return;
+  const speed = Math.max(0.25, Math.min(4, (parseInt(pct, 10) || 100) / 100));
+  flow.speed = speed;
+  if (!live) { saveFlow(site, flow); }
+  // Update only the readout + effective text without a full re-render to keep slider smooth
+  const root = $(`${site}FlowDetail`);
+  if (root) {
+    const readout = root.querySelector('.flow-speed-value');
+    if (readout) readout.textContent = `×${speed.toFixed(2)}`;
+    if (!live) renderFlowRecorder();
+  }
+}
+
+/**
+ * Update a single raw inter-click delay and persist.
+ * @param {'joe'|'ign'} site
+ * @param {number} idx - index into flow.delays
+ * @param {number|string} val - new ms value
+ */
+function updateFlowDelay(site, idx, val) {
+  const flow = site === 'joe' ? state.joeFlow : state.ignFlow;
+  if (!flow || Array.isArray(flow) || !Array.isArray(flow.delays)) return;
+  const ms = Math.max(0, Math.min(60000, parseInt(val, 10) || 0));
+  flow.delays[idx] = ms;
+  saveFlow(site, flow);
+  renderFlowRecorder();
+}
+
+// Expose for inline onchange/oninput handlers in the rendered HTML above
+window._flowUpdateSpeed = updateFlowSpeed;
+window._flowUpdateDelay = updateFlowDelay;
+
+/**
  * Starts a free-form flow recording session for the given site.
  * Opens a headed browser on the login page via the server API.
  * The user clicks elements in order (no fixed limit) then presses "✓ Done".
@@ -1702,9 +1770,14 @@ function renderFlowRecorder() {
  * @param {'joe'|'ign'} site
  */
 async function startFlowRecording(site) {
-  const loginUrl = site === 'joe'
+  const urlInput = $(`${site}FlowUrl`);
+  const typed    = (urlInput && urlInput.value || '').trim();
+  const fallback = site === 'joe'
     ? (state.settings.joeLoginUrl || 'https://joefortunepokies.win/login')
     : (state.settings.ignitionLoginUrl || 'https://ignitioncasino.ooo/?overlay=login');
+  const loginUrl = typed || fallback;
+  try { new URL(loginUrl); }
+  catch { toast('Enter a valid URL (including https://) to record on', 'error'); return; }
 
   const statusEl  = $(`${site}FlowStatus`);
   const detailEl  = $(`${site}FlowDetail`);
@@ -1739,7 +1812,16 @@ async function startFlowRecording(site) {
       return;
     }
 
-    const flowData = { selectors: data.selectors, delays: data.delays || [], count: data.count || data.selectors.length };
+    // Preserve any prior user edits to speed when re-recording
+    const prior = site === 'joe' ? state.joeFlow : state.ignFlow;
+    const priorSpeed = (prior && !Array.isArray(prior) && typeof prior.speed === 'number') ? prior.speed : 1;
+    const flowData = {
+      selectors: data.selectors,
+      delays:    data.delays || [],
+      count:     data.count || data.selectors.length,
+      url:       loginUrl,
+      speed:     priorSpeed,
+    };
     if (site === 'joe') state.joeFlow = flowData;
     else                state.ignFlow = flowData;
     saveFlow(site, flowData);
