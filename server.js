@@ -18,14 +18,185 @@
 import express from 'express';
 import { chromium } from 'playwright';
 import path from 'path';
+import fs from 'fs';
+import fsp from 'fs/promises';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // Serve the webapp static files
 app.use(express.static(path.join(__dirname, 'webapp')));
+
+// ── Disk Directories ─────────────────────────────────────────────────────────
+/** Root folder for all persisted debug screenshots (PNG on disk). */
+const SHOTS_DIR    = path.join(__dirname, 'debug-shots');
+/** Root folder for Playwright storageState JSON per credential (for session reuse). */
+const SESSIONS_DIR = path.join(__dirname, 'sessions');
+/** Root folder for structured JSONL logs (one line per event). */
+const LOGS_DIR     = path.join(__dirname, 'logs');
+for (const d of [SHOTS_DIR, SESSIONS_DIR, LOGS_DIR]) {
+  try { fs.mkdirSync(d, { recursive: true }); } catch {}
+}
+// Serve screenshots at /shots/<runId>/<file>.png so the webapp can load them
+// directly from disk rather than carrying multi-MB base64 blobs in localStorage.
+app.use('/shots', express.static(SHOTS_DIR, { maxAge: '1h' }));
+
+// ── Structured Logger (JSONL) ────────────────────────────────────────────────
+/** Current log file path — rolls per day so a single file never gets huge. */
+function _logFile() {
+  const d = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  return path.join(LOGS_DIR, `events-${d}.jsonl`);
+}
+/**
+ * Append a structured JSONL event to today's log file + echo to stdout.
+ * Never throws — logging failure must never break automation.
+ * @param {string} level  - One of: debug|info|warn|error
+ * @param {string} event  - Short event name (e.g. 'login.start')
+ * @param {object} [data] - Arbitrary structured fields
+ */
+function logEvent(level, event, data = {}) {
+  const line = JSON.stringify({ ts: new Date().toISOString(), level, event, ...data });
+  try { fs.appendFileSync(_logFile(), line + '\n'); } catch {}
+  // Echo to console for live tailing during dev
+  if (level === 'error')      console.error(line);
+  else if (level === 'warn')  console.warn(line);
+  else                        console.log(line);
+}
+
+// ── SSE Event Hub ────────────────────────────────────────────────────────────
+/**
+ * Server-Sent Events hub. Each connected client subscribes via GET /api/events
+ * and receives a stream of JSON events pushed from runs (shot saved, run start,
+ * run end, cancellation, network signal, etc.). Replaces the frontend's 15s
+ * polling model — UI updates are now instant.
+ */
+const sseClients = new Set();
+/**
+ * Broadcast a structured event to every connected SSE client. Safe to call from
+ * anywhere in the automation pipeline. Dropped clients (closed sockets) are
+ * automatically removed.
+ * @param {string} event - Event name (e.g. 'run.progress', 'shot.saved')
+ * @param {object} data  - Arbitrary payload; will be JSON-stringified
+ */
+function broadcast(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of sseClients) {
+    try { res.write(payload); } catch { sseClients.delete(res); }
+  }
+}
+
+app.get('/api/events', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type':  'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection':    'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write(': connected\n\n');
+  sseClients.add(res);
+  const ka = setInterval(() => { try { res.write(': ka\n\n'); } catch {} }, 25000);
+  req.on('close', () => { clearInterval(ka); sseClients.delete(res); });
+});
+
+// ── Run Registry (cancellation + tracking) ────────────────────────────────────
+/**
+ * Map of runId → { controller, site, username, startedAt, page, browser }.
+ * Used so POST /api/cancel/:runId can abort an in-flight automation and close
+ * the underlying Playwright page/browser cleanly.
+ * @type {Map<string, object>}
+ */
+const runRegistry = new Map();
+
+/** Create an AbortController-backed run handle and register it. */
+function startRun(meta) {
+  const runId = crypto.randomUUID();
+  const controller = new AbortController();
+  const handle = { runId, controller, startedAt: Date.now(), ...meta };
+  runRegistry.set(runId, handle);
+  broadcast('run.start', { runId, ...meta, startedAt: handle.startedAt });
+  logEvent('info', 'run.start', { runId, ...meta });
+  return handle;
+}
+function endRun(handle, extra = {}) {
+  if (!handle) return;
+  runRegistry.delete(handle.runId);
+  broadcast('run.end', { runId: handle.runId, durationMs: Date.now() - handle.startedAt, ...extra });
+  logEvent('info', 'run.end', { runId: handle.runId, durationMs: Date.now() - handle.startedAt, ...extra });
+}
+
+app.post('/api/cancel/:runId', (req, res) => {
+  const h = runRegistry.get(req.params.runId);
+  if (!h) return res.status(404).json({ error: 'Run not found' });
+  try { h.controller.abort(); } catch {}
+  // Aggressively tear down the live browser for this run
+  try { h.page?.close().catch(() => {}); } catch {}
+  try { h.context?.close().catch(() => {}); } catch {}
+  logEvent('warn', 'run.cancel', { runId: h.runId });
+  broadcast('run.cancel', { runId: h.runId });
+  res.json({ ok: true, runId: h.runId });
+});
+
+app.get('/api/runs', (_req, res) => {
+  res.json(Array.from(runRegistry.values()).map(h => ({
+    runId: h.runId, site: h.site, username: h.username, startedAt: h.startedAt,
+  })));
+});
+
+// ── Per-Domain Smart Throttling ──────────────────────────────────────────────
+/**
+ * Per-domain throttle config. minDelayMs is the minimum wait between consecutive
+ * runs hitting the same domain; jitterMs adds a random 0..jitterMs on top.
+ * backoffMs is applied (and exponentially grown) whenever a run observes a 429
+ * or captcha signal on that domain.
+ */
+const DOMAIN_THROTTLE = {
+  'joefortunepokies.win': { minDelayMs: 0,    jitterMs: 400, backoffMs: 0 },
+  'ignitioncasino.ooo':   { minDelayMs: 0,    jitterMs: 600, backoffMs: 0 },
+  _default:               { minDelayMs: 0,    jitterMs: 200, backoffMs: 0 },
+};
+/** Last time each domain was hit — used to compute remaining wait. */
+const _domainLastHit = new Map();
+
+function _hostOf(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return '_default'; }
+}
+function _throttleFor(host) { return DOMAIN_THROTTLE[host] || DOMAIN_THROTTLE._default; }
+
+/**
+ * Waits long enough to respect per-domain rate limits before starting a run.
+ * Combines: minDelay (between consecutive hits) + jitter + active backoffMs.
+ * @param {string} url - The target URL whose host will be throttled.
+ */
+async function applyDomainThrottle(url) {
+  const host = _hostOf(url);
+  const cfg  = _throttleFor(host);
+  const last = _domainLastHit.get(host) || 0;
+  const gap  = Date.now() - last;
+  const jitter   = Math.floor(Math.random() * cfg.jitterMs);
+  const waitFor  = Math.max(0, (cfg.minDelayMs + cfg.backoffMs + jitter) - gap);
+  if (waitFor > 0) {
+    logEvent('debug', 'throttle.wait', { host, waitFor, backoffMs: cfg.backoffMs });
+    await new Promise(r => setTimeout(r, waitFor));
+  }
+  _domainLastHit.set(host, Date.now());
+}
+/**
+ * Trigger exponential backoff when a domain returns 429 / shows captcha.
+ * Resets on clean success.
+ */
+function bumpDomainBackoff(host) {
+  const cfg = _throttleFor(host);
+  cfg.backoffMs = Math.min(60_000, cfg.backoffMs ? cfg.backoffMs * 2 : 2_000);
+  logEvent('warn', 'throttle.backoff.bump', { host, backoffMs: cfg.backoffMs });
+}
+function resetDomainBackoff(host) {
+  const cfg = _throttleFor(host);
+  if (cfg.backoffMs) logEvent('info', 'throttle.backoff.reset', { host });
+  cfg.backoffMs = 0;
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -63,6 +234,183 @@ function runExclusive(fn) {
   return next;
 }
 
+// ── Persistent Browser Pool ──────────────────────────────────────────────────
+/**
+ * Keeps a single Chromium browser instance alive across runs. Per-run contexts
+ * are created and destroyed (cheap), but the browser itself is reused — cutting
+ * ~1.5s launch overhead per credential. Re-launches automatically if the browser
+ * crashes or is closed. Two pools: headless and headed (liveView).
+ * @type {{ headless: import('playwright').Browser | null, headed: import('playwright').Browser | null }}
+ */
+const browserPool = { headless: null, headed: null };
+
+/**
+ * Get (or lazy-launch) the persistent browser for the given mode.
+ * @param {boolean} live - true = visible window (liveView), false = headless
+ * @returns {Promise<import('playwright').Browser>}
+ */
+async function getBrowser(live) {
+  const key = live ? 'headed' : 'headless';
+  const existing = browserPool[key];
+  if (existing && existing.isConnected()) return existing;
+
+  const launchArgs = live
+    ? [...BROWSER_ARGS, '--window-size=540,420', '--window-position=40,40']
+    : BROWSER_ARGS;
+  const b = await chromium.launch({
+    headless: !live,
+    args:     launchArgs,
+    slowMo:   live ? 120 : 0,
+  });
+  // When the browser disconnects (crash, user close), clear the slot so the
+  // next request triggers a fresh launch instead of using a dead handle.
+  b.on('disconnected', () => { if (browserPool[key] === b) browserPool[key] = null; });
+  browserPool[key] = b;
+  logEvent('info', 'browser.launched', { mode: key });
+  return b;
+}
+
+/** Cleanly close both pooled browsers on process exit. */
+async function shutdownBrowserPool() {
+  for (const key of ['headless', 'headed']) {
+    const b = browserPool[key];
+    if (b) {
+      try { await b.close(); } catch {}
+      browserPool[key] = null;
+    }
+  }
+}
+process.once('SIGINT',  () => shutdownBrowserPool().finally(() => process.exit(0)));
+process.once('SIGTERM', () => shutdownBrowserPool().finally(() => process.exit(0)));
+
+// ── storageState Session Persistence ─────────────────────────────────────────
+/**
+ * Per-credential storageState path. Stored under sessions/<site>/<sha>.json so
+ * paths stay filesystem-safe even with exotic characters in emails.
+ * @param {string} site     - 'joe' | 'ign'
+ * @param {string} username - Credential username/email
+ */
+function sessionFileFor(site, username) {
+  const sha = crypto.createHash('sha1').update(`${site}:${username}`).digest('hex').slice(0, 16);
+  const dir = path.join(SESSIONS_DIR, site);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  return path.join(dir, `${sha}.json`);
+}
+
+/**
+ * Load a saved storageState JSON for the given cred, or return undefined if
+ * none exists / it's unreadable. Passed to browser.newContext to restore prior
+ * cookies + localStorage so repeat logins can skip the form entirely.
+ */
+async function loadStorageState(site, username) {
+  try {
+    const p = sessionFileFor(site, username);
+    if (!fs.existsSync(p)) return undefined;
+    const raw = await fsp.readFile(p, 'utf8');
+    return JSON.parse(raw);
+  } catch { return undefined; }
+}
+
+/**
+ * Persist the context's storageState so future runs for the same credential
+ * can reuse the authenticated session. Called only after a confirmed success.
+ */
+async function saveStorageState(context, site, username) {
+  try {
+    const p = sessionFileFor(site, username);
+    await context.storageState({ path: p });
+    logEvent('info', 'session.saved', { site, username, path: p });
+  } catch (err) {
+    logEvent('warn', 'session.save.failed', { site, username, error: err.message });
+  }
+}
+
+/**
+ * Delete a stored session (used when a cred becomes perm disabled etc).
+ */
+async function clearStoredSession(site, username) {
+  try { await fsp.unlink(sessionFileFor(site, username)); } catch {}
+}
+
+// ── Disk Screenshot Helpers ──────────────────────────────────────────────────
+/**
+ * Saves a PNG screenshot buffer to disk under debug-shots/<runId>/ and returns
+ * a metadata object { path, url, dataUrl }. Keeping a base64 dataUrl in the
+ * response preserves backwards compatibility with the existing frontend while
+ * giving us a stable disk path for reliable large-batch debugging.
+ *
+ * @param {Buffer|null} buf  - Raw PNG buffer (or null on failure)
+ * @param {string} runId     - Run UUID
+ * @param {number} idx       - Shot index (1..4)
+ * @returns {{path:string, url:string, dataUrl:string}}
+ */
+async function persistShotBuffer(buf, runId, idx) {
+  if (!buf) return { path: '', url: '', dataUrl: '' };
+  const dir = path.join(SHOTS_DIR, runId);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  const filename = `${idx}.png`;
+  const filePath = path.join(dir, filename);
+  try { await fsp.writeFile(filePath, buf); } catch (err) {
+    logEvent('warn', 'shot.write.failed', { runId, idx, error: err.message });
+  }
+  const url = `/shots/${runId}/${filename}`;
+  const dataUrl = `data:image/png;base64,${buf.toString('base64')}`;
+  broadcast('shot.saved', { runId, idx, url });
+  return { path: filePath, url, dataUrl };
+}
+
+// ── Network Response Hooks ───────────────────────────────────────────────────
+/**
+ * Attaches response listeners to a page and returns a live snapshot object
+ * that summarises observed auth-related network activity. This gives the
+ * login outcome pass a robust secondary signal that doesn't depend on
+ * fragile DOM heuristics.
+ *
+ * Tracked:
+ *   - saw429:        true if any response was 429 (rate-limited → backoff)
+ *   - sawCaptcha:    true if hCaptcha/reCaptcha/Cloudflare IUAM appears in any url
+ *   - authSuccess:   true if a 2xx JSON response contains balance/userId/token
+ *   - authFailure:   true if a response contains "invalid"/"incorrect" creds
+ *   - statusCodes:   Set of all status codes seen (for log forensics)
+ *
+ * @param {import('playwright').Page} page
+ * @returns {{saw429:boolean,sawCaptcha:boolean,authSuccess:boolean,authFailure:boolean,statusCodes:Set<number>,responses:Array}}
+ */
+function attachNetworkHooks(page) {
+  const snap = {
+    saw429:      false,
+    sawCaptcha:  false,
+    authSuccess: false,
+    authFailure: false,
+    statusCodes: new Set(),
+    responses:   [],
+  };
+  page.on('response', async (resp) => {
+    try {
+      const status = resp.status();
+      const url    = resp.url();
+      snap.statusCodes.add(status);
+      if (status === 429) snap.saw429 = true;
+      if (/hcaptcha\.com|recaptcha|cloudflare.*cdn-cgi\/challenge|__cf_chl/i.test(url)) {
+        snap.sawCaptcha = true;
+      }
+      // Only sniff bodies of likely auth endpoints to keep things cheap
+      if (status >= 200 && status < 400 && /login|auth|session|signin|account/i.test(url)) {
+        const ct = (resp.headers()['content-type'] || '').toLowerCase();
+        if (ct.includes('application/json')) {
+          const body = await resp.text().catch(() => '');
+          if (body) {
+            if (/"(balance|userId|user_id|accessToken|access_token|sessionToken)"/i.test(body)) snap.authSuccess = true;
+            if (/"(error|invalid|incorrect|disabled|locked)"/i.test(body))                      snap.authFailure = true;
+            snap.responses.push({ url, status, snippet: body.slice(0, 400) });
+          }
+        }
+      }
+    } catch { /* ignore network read errors */ }
+  });
+  return snap;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -76,6 +424,18 @@ function runExclusive(fn) {
  * @returns {Promise<string>} Data URL string (data:image/png;base64,...).
  */
 async function captureShot(page, label) {
+  const buf = await captureShotBuf(page, label);
+  return buf ? `data:image/png;base64,${buf.toString('base64')}` : '';
+}
+
+/**
+ * Same as captureShot but returns the raw PNG Buffer so the caller can persist
+ * it to disk AND convert to dataUrl without double-encoding.
+ * @param {import('playwright').Page} page
+ * @param {string} [label] - badge text (e.g. 'SCR 1/4')
+ * @returns {Promise<Buffer|null>}
+ */
+async function captureShotBuf(page, label) {
   const BADGE_ID = '_sitcho_scr_badge';
   try {
     if (label) {
@@ -100,9 +460,9 @@ async function captureShot(page, label) {
     if (label) {
       await page.evaluate((id) => { document.getElementById(id)?.remove(); }, BADGE_ID).catch(() => {});
     }
-    return `data:image/png;base64,${buf.toString('base64')}`;
+    return buf;
   } catch {
-    return '';
+    return null;
   }
 }
 
@@ -548,7 +908,27 @@ async function determineCardOutcome(page) {
  * backend is available before starting a run.
  */
 app.get('/api/status', (req, res) => {
-  res.json({ ok: true, version: '1.2.0', mode: 'live' });
+  res.json({
+    ok: true,
+    version: '1.3.0',
+    mode: 'live',
+    features: {
+      sse: true,
+      diskScreenshots: true,
+      runCancellation: true,
+      browserPool: true,
+      sessionReuse: true,
+      smartThrottle: true,
+      networkHooks: true,
+      jsonlLogging: true,
+    },
+    activeRuns:  runRegistry.size,
+    sseClients:  sseClients.size,
+    browserPool: {
+      headless: !!browserPool.headless,
+      headed:   !!browserPool.headed,
+    },
+  });
 });
 
 // ── API: Login Check ─────────────────────────────────────────────────────────
@@ -702,37 +1082,65 @@ async function isLoggedIn(page, site) {
  * Response: { outcome, note, shots: [4 base64 PNGs] }
  */
 app.post('/api/login-check', async (req, res) => {
-  const { site, username, password, loginUrl, timeout = NAV_TIMEOUT, liveView = false } = req.body;
+  const {
+    site, username, password, loginUrl,
+    timeout = NAV_TIMEOUT,
+    liveView = false,
+    reuseSession = false, // Tier-3 #11 — opt-in session persistence
+  } = req.body;
   if (!username || !password || !loginUrl) {
     return res.status(400).json({ error: 'Missing username, password, or loginUrl' });
   }
 
-  // Serialize: wait for any in-flight automation to finish before launching
-  // a new Chromium. Guarantees only one browser open at a time.
+  // Register the run FIRST (outside the mutex) so the client can immediately
+  // see it and cancel it. The actual work still serialises behind the mutex.
+  const runHandle = startRun({ site, username, loginUrl, kind: 'login' });
+
+  // Domain-aware throttling: respect cooldowns / backoff before starting.
+  await applyDomainThrottle(loginUrl);
+
   await runExclusive(async () => {
-  let browser;
-  const shots = ['', '', '', ''];
+  let context;
+  const shotBufs = [null, null, null, null];
+  const shotUrls = ['', '', '', ''];
+  const shotDataUrls = ['', '', '', ''];
   let outcome = 'noAcc';
   let note = 'Check did not complete';
+  let netSnap = null;
+  const host = _hostOf(loginUrl);
+  const signal = runHandle.controller.signal;
+
+  /** Persist a shot buf (or null) into slot i and return its dataUrl. */
+  const persist = async (buf, i) => {
+    shotBufs[i] = buf;
+    const meta = await persistShotBuffer(buf, runHandle.runId, i + 1);
+    shotUrls[i]     = meta.url;
+    shotDataUrls[i] = meta.dataUrl;
+    return meta.dataUrl;
+  };
 
   try {
-    // liveView: small visible Chromium window so the user can watch each step.
-    // Uses a reduced viewport and slowMo so the flow mirrors recorder timing.
-    const launchArgs = liveView
-      ? [...BROWSER_ARGS, '--window-size=540,420', '--window-position=40,40']
-      : BROWSER_ARGS;
-    browser = await chromium.launch({
-      headless: !liveView,
-      args: launchArgs,
-      slowMo: liveView ? 120 : 0,
-    });
-    const context = await browser.newContext({
+    // Use the persistent browser pool — re-uses the already-launched Chromium
+    // and avoids the ~1.5s cold start per credential.
+    const browser = await getBrowser(!!liveView);
+    const storageState = reuseSession ? await loadStorageState(site, username) : undefined;
+    context = await browser.newContext({
       viewport: liveView ? { width: 540, height: 420 } : { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: true,
+      storageState,
     });
+    runHandle.context = context;
     const page = await context.newPage();
+    runHandle.page = page;
     page.setDefaultTimeout(timeout);
+
+    // Attach live network hooks — any 429 / captcha / auth-JSON is tracked and
+    // becomes a secondary signal for the outcome check below.
+    netSnap = attachNetworkHooks(page);
+
+    /** Helper — bail out early if client cancelled this runId. */
+    const bail = () => { if (signal.aborted) throw new Error('run cancelled'); };
 
     // Navigation freeze: when `frozen` flips true, any further top-level
     // document navigation (e.g. Ignition's post-login redirect to the lobby)
@@ -756,13 +1164,21 @@ app.post('/api/login-check', async (req, res) => {
     // Bulletproofing: if navigation fails (cert, DNS, timeout) we still want
     // to return a screenshot of the error state so the user has visual proof
     // rather than 4 blank slots.
+    bail();
     try {
       await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout });
     } catch (navErr) {
       note = `Navigation failed: ${navErr.message.split('\n')[0]}`;
-      shots[0] = await captureShot(page, 'SCR 1/4').catch(() => '');
-      shots[1] = shots[0]; shots[2] = shots[0]; shots[3] = shots[0];
-      return res.json({ outcome: 'noAcc', note, shots });
+      const buf = await captureShotBuf(page, 'SCR 1/4').catch(() => null);
+      const du  = await persist(buf, 0);
+      await persist(buf, 1); await persist(buf, 2); await persist(buf, 3);
+      logEvent('warn', 'login.nav.failed', { runId: runHandle.runId, site, username, error: navErr.message });
+      return res.json({
+        runId: runHandle.runId,
+        outcome: 'noAcc', note,
+        shots: [du, du, du, du],
+        shotUrls,
+      });
     }
     // Ignition takes longer to paint the login overlay + cookie banner.
     // Wait 6000ms for Ignition, 2000ms for all other sites.
@@ -775,7 +1191,8 @@ app.post('/api/login-check', async (req, res) => {
 
     // SCR 1/4 — 0.7s after the last field click (both fields now filled)
     await page.waitForTimeout(700);
-    shots[0] = await captureShot(page, 'SCR 1/4');
+    bail();
+    await persist(await captureShotBuf(page, 'SCR 1/4'), 0);
 
     // ── Step 2: First submit → SCR 2/4 (2000ms fixed) → poll outcome ─────
     // Screenshot timing is hardcoded: 2000ms after first submit click so the
@@ -789,7 +1206,8 @@ app.post('/api/login-check', async (req, res) => {
 
     await page.waitForTimeout(2000); // hardcoded: 2000ms after 1st submit
     await dismissCookiePopup(page);
-    shots[1] = await captureShot(page, 'SCR 2/4');
+    bail();
+    await persist(await captureShotBuf(page, 'SCR 2/4'), 1);
 
     // Poll for outcome — returns immediately if the response is already visible
     respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
@@ -815,7 +1233,8 @@ app.post('/api/login-check', async (req, res) => {
 
       await page.waitForTimeout(2500); // hardcoded: 2500ms after 2nd submit
       await dismissCookiePopup(page);
-      shots[2] = await captureShot(page, 'SCR 3/4');
+      bail();
+      await persist(await captureShotBuf(page, 'SCR 3/4'), 2);
 
       respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
 
@@ -834,7 +1253,7 @@ app.post('/api/login-check', async (req, res) => {
       }
     } else {
       // Outcome already determined after attempt 1 — capture current state for SCR 3/4
-      shots[2] = await captureShot(page, 'SCR 3/4');
+      await persist(await captureShotBuf(page, 'SCR 3/4'), 2);
     }
 
     // ── Step 4: In-place final state → SCR 4/4 (2000ms settle) ─────────────
@@ -893,7 +1312,31 @@ app.post('/api/login-check', async (req, res) => {
       }
     }
 
-    shots[3] = await captureShot(page, 'SCR 4/4');
+    await persist(await captureShotBuf(page, 'SCR 4/4'), 3);
+
+    // ── Network-hook tie-breaker ─────────────────────────────────────────
+    // If DOM heuristics said 'noAcc' but network saw an auth-success JSON
+    // (balance/userId/token in a 2xx response), promote to 'working'.
+    // Conversely if an auth-failure JSON was seen and DOM said 'working',
+    // leave working alone (DOM is stronger). 429 → bump domain backoff.
+    if (netSnap) {
+      if (netSnap.saw429 || netSnap.sawCaptcha) {
+        bumpDomainBackoff(host);
+        note += ' (rate-limited / captcha observed)';
+      }
+      if (outcome === 'noAcc' && netSnap.authSuccess && !netSnap.authFailure) {
+        outcome = 'working';
+        note = `${site === 'ign' ? 'Ignition' : 'Joe Fortune'} — success confirmed by network auth response`;
+      }
+      if (outcome === 'working') resetDomainBackoff(host);
+    }
+
+    // ── Session persistence: save storageState only on confirmed success ──
+    if (outcome === 'working') {
+      await saveStorageState(context, site, username);
+    } else if (outcome === 'permDisabled') {
+      await clearStoredSession(site, username);
+    }
 
     // ── Session end: clear cookies + storage for hygiene, THEN close ──────
     // Only at the very end of the session — never between submits.
@@ -903,13 +1346,38 @@ app.post('/api/login-check', async (req, res) => {
     }).catch(() => {});
 
   } catch (err) {
-    note = `Automation error: ${err.message}`;
-    outcome = 'noAcc';
+    if (signal.aborted) {
+      note = 'Run cancelled by client';
+      outcome = 'cancelled';
+    } else {
+      note = `Automation error: ${err.message}`;
+      outcome = 'noAcc';
+    }
+    logEvent('error', 'login.error', { runId: runHandle.runId, site, username, error: err.message });
   } finally {
-    if (browser) await browser.close().catch(() => {});
+    // IMPORTANT: close only the context, NOT the browser — keep the pool warm.
+    if (context) await context.close().catch(() => {});
+    endRun(runHandle, { outcome, site, username });
   }
 
-  if (!res.headersSent) res.json({ outcome, note, shots });
+  broadcast('login.result', {
+    runId: runHandle.runId, site, username, outcome, note,
+    shotUrls,
+  });
+
+  if (!res.headersSent) res.json({
+    runId: runHandle.runId,
+    outcome, note,
+    shots:    shotDataUrls, // backwards-compatible (base64)
+    shotUrls,                // new: stable disk-served URLs
+    network:  netSnap ? {
+      saw429: netSnap.saw429,
+      sawCaptcha: netSnap.sawCaptcha,
+      authSuccess: netSnap.authSuccess,
+      authFailure: netSnap.authFailure,
+      statusCodes: [...netSnap.statusCodes],
+    } : null,
+  });
   }); // runExclusive
 });
 
@@ -943,39 +1411,59 @@ app.post('/api/card-check', async (req, res) => {
     return res.status(400).json({ error: 'Missing card fields or ppsrUrl' });
   }
 
+  const runHandle = startRun({ kind: 'card', last4: String(number).slice(-4), ppsrUrl });
+  await applyDomainThrottle(ppsrUrl);
+
   // Serialize against the global automation mutex — only one Chromium open
   // at a time across login + card checks.
   await runExclusive(async () => {
-  let browser;
-  const shots = ['', '', '', ''];
+  let context;
+  const shotUrls = ['', '', '', ''];
+  const shotDataUrls = ['', '', '', ''];
   let outcome = 'dead';
   let note = 'Check did not complete';
+  const signal = runHandle.controller.signal;
+  const bail = () => { if (signal.aborted) throw new Error('run cancelled'); };
+
+  const persist = async (buf, i) => {
+    const meta = await persistShotBuffer(buf, runHandle.runId, i + 1);
+    shotUrls[i]     = meta.url;
+    shotDataUrls[i] = meta.dataUrl;
+    return meta.dataUrl;
+  };
 
   try {
-    browser = await chromium.launch({ headless: true, args: BROWSER_ARGS });
-    const context = await browser.newContext({
+    const browser = await getBrowser(false);
+    context = await browser.newContext({
       viewport: { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: true,
     });
+    runHandle.context = context;
     const page = await context.newPage();
+    runHandle.page = page;
     page.setDefaultTimeout(timeout);
+    attachNetworkHooks(page);
 
     // Navigate to check page — if it fails, capture whatever the page shows
     // so the user has visual evidence of the failure mode.
+    bail();
     try {
       await page.goto(ppsrUrl, { waitUntil: 'domcontentloaded', timeout });
     } catch (navErr) {
       note = `Navigation failed: ${navErr.message.split('\n')[0]}`;
-      const frame = await captureShot(page, 'SCR 1/4').catch(() => '');
-      shots[0] = frame; shots[1] = frame; shots[2] = frame; shots[3] = frame;
-      return res.json({ outcome: 'dead', note, shots });
+      const buf = await captureShotBuf(page, 'SCR 1/4').catch(() => null);
+      const du = await persist(buf, 0);
+      await persist(buf, 1); await persist(buf, 2); await persist(buf, 3);
+      logEvent('warn', 'card.nav.failed', { runId: runHandle.runId, error: navErr.message });
+      return res.json({ runId: runHandle.runId, outcome: 'dead', note, shots: [du, du, du, du], shotUrls });
     }
     await page.waitForTimeout(2000);
     await dismissCookiePopup(page);
 
     // Shot 1: page loaded, form visible
-    shots[0] = await captureShot(page, 'SCR 1/4');
+    bail();
+    await persist(await captureShotBuf(page, 'SCR 1/4'), 0);
 
     // Fill card form
     const filled = await fillCardForm(page, number, mm, yy, cvv);
@@ -984,7 +1472,7 @@ app.post('/api/card-check', async (req, res) => {
     }
 
     // Shot 2: form filled with card details
-    shots[1] = await captureShot(page, 'SCR 2/4');
+    await persist(await captureShotBuf(page, 'SCR 2/4'), 1);
 
     // Submit
     const clicked = await clickSubmit(page);
@@ -1001,7 +1489,8 @@ app.post('/api/card-check', async (req, res) => {
     await dismissCookiePopup(page);
 
     // Shot 3: first response after submit
-    shots[2] = await captureShot(page, 'SCR 3/4');
+    bail();
+    await persist(await captureShotBuf(page, 'SCR 3/4'), 2);
 
     // Determine outcome
     const result = await determineCardOutcome(page);
@@ -1009,16 +1498,29 @@ app.post('/api/card-check', async (req, res) => {
     note = result.note;
 
     // Shot 4: final state
-    shots[3] = await captureShot(page, 'SCR 4/4');
+    await persist(await captureShotBuf(page, 'SCR 4/4'), 3);
 
   } catch (err) {
-    note = `Automation error: ${err.message}`;
-    outcome = 'dead';
+    if (signal.aborted) {
+      note = 'Run cancelled by client';
+      outcome = 'cancelled';
+    } else {
+      note = `Automation error: ${err.message}`;
+      outcome = 'dead';
+    }
+    logEvent('error', 'card.error', { runId: runHandle.runId, error: err.message });
   } finally {
-    if (browser) await browser.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    endRun(runHandle, { outcome, kind: 'card' });
   }
 
-  if (!res.headersSent) res.json({ outcome, note, shots });
+  broadcast('card.result', { runId: runHandle.runId, outcome, note, shotUrls });
+  if (!res.headersSent) res.json({
+    runId: runHandle.runId,
+    outcome, note,
+    shots: shotDataUrls,
+    shotUrls,
+  });
   }); // runExclusive
 });
 
@@ -1255,7 +1757,10 @@ app.post('/api/record-flow', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Sitchomatic server running at http://localhost:${PORT}`);
-  console.log(`  Webapp:  http://localhost:${PORT}/`);
-  console.log(`  API:     http://localhost:${PORT}/api/status`);
-  console.log(`  Mode:    LIVE browser automation (Playwright Chromium)`);
+  console.log(`  Webapp:     http://localhost:${PORT}/`);
+  console.log(`  Status:     http://localhost:${PORT}/api/status`);
+  console.log(`  SSE events: http://localhost:${PORT}/api/events`);
+  console.log(`  Shots:      http://localhost:${PORT}/shots/<runId>/<n>.png`);
+  console.log(`  Mode:       LIVE browser automation (persistent pool + disk shots + SSE)`);
+  logEvent('info', 'server.start', { port: PORT, version: '1.3.0' });
 });
