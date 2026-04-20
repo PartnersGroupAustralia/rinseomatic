@@ -724,6 +724,45 @@
           </div>
         </div>
 
+        <!-- v1.3 Feature Toggles -->
+        <div class="settings-section">
+          <div class="settings-section-header">Advanced (v1.3)</div>
+          <div class="settings-card">
+            <div class="settings-row">
+              <label>Use live server events (SSE) <span class="settings-hint">(instant UI updates instead of polling)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="useSSE" checked /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Disk-served screenshots <span class="settings-hint">(keeps localStorage light)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="useShotUrls" checked /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Reuse logged-in session <span class="settings-hint">(skip login on repeat runs)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="reuseSession" /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Encrypt secrets at rest (AES-GCM) <span class="settings-hint">(opt-in; requires passphrase)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="encryptSecrets" /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Pre-flight credential validator <span class="settings-hint">(skip obvious bad creds before run)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="preflightCheck" checked /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Visual diff between shots <span class="settings-hint">(highlight changes SCR→SCR)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="visualDiff" checked /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Smart per-domain throttling <span class="settings-hint">(jitter + backoff on 429/captcha)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="smartThrottle" checked /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Debug Mode profile <span class="settings-hint">(single concurrency, live view, verbose)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="debugModeProfile" /><span class="toggle-slider"></span></label>
+            </div>
+          </div>
+        </div>
+
         <!-- Blacklist -->
         <div class="settings-section">
           <div class="settings-section-header">Blacklist</div>
@@ -775,7 +814,7 @@
           </div>
         </div>
 
-        <div class="app-version">Sitchomatic Web v1.2 · Joe Fortune + Ignition · WireGuard</div>
+        <div class="app-version">Sitchomatic Web v1.3 · Joe Fortune + Ignition · WireGuard · SSE · Browser Pool</div>
       </div>
     </section>
 

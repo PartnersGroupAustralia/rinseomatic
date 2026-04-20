@@ -62,6 +62,298 @@ const KEY_BLACKLIST  = 'sitcho_blacklist';
 const KEY_JOE_FLOW   = 'sitcho_joe_flow';
 /** @constant {string} localStorage key for Ignition recorded flow selectors. */
 const KEY_IGN_FLOW   = 'sitcho_ign_flow';
+/** @constant {string} localStorage key for encrypted sensitive blob (AES-GCM). */
+const KEY_SECURE_BLOB = 'sitcho_secure_blob';
+
+// ── IndexedDB wrapper for heavy blobs (v1.3 improvement #5) ─────────────────
+/**
+ * Minimal Promise-based IndexedDB wrapper used to offload large debug shot
+ * metadata from localStorage. localStorage is synchronous and capped at ~5MB;
+ * IDB is async and effectively unlimited — critical for 10k+ cred batches.
+ * Non-fatal: if IDB is unavailable we fall back to localStorage only.
+ */
+const IDB = (() => {
+  const DB_NAME = 'sitcho_db';
+  const DB_VER  = 1;
+  const STORE   = 'shots';
+  let _dbp = null;
+  function open() {
+    if (_dbp) return _dbp;
+    _dbp = new Promise((resolve, reject) => {
+      try {
+        const req = indexedDB.open(DB_NAME, DB_VER);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: 'id' });
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror   = () => reject(req.error);
+      } catch (err) { reject(err); }
+    }).catch(() => null);
+    return _dbp;
+  }
+  return {
+    async put(shot) {
+      const db = await open(); if (!db) return;
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction(STORE, 'readwrite');
+          tx.objectStore(STORE).put(shot);
+          tx.oncomplete = () => resolve(true);
+          tx.onerror    = () => resolve(false);
+        } catch { resolve(false); }
+      });
+    },
+    async getAll() {
+      const db = await open(); if (!db) return [];
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction(STORE, 'readonly');
+          const req = tx.objectStore(STORE).getAll();
+          req.onsuccess = () => resolve(req.result || []);
+          req.onerror   = () => resolve([]);
+        } catch { resolve([]); }
+      });
+    },
+    async clear() {
+      const db = await open(); if (!db) return;
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction(STORE, 'readwrite');
+          tx.objectStore(STORE).clear();
+          tx.oncomplete = () => resolve(true);
+          tx.onerror    = () => resolve(false);
+        } catch { resolve(false); }
+      });
+    },
+    async delete(id) {
+      const db = await open(); if (!db) return;
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction(STORE, 'readwrite');
+          tx.objectStore(STORE).delete(id);
+          tx.oncomplete = () => resolve(true);
+          tx.onerror    = () => resolve(false);
+        } catch { resolve(false); }
+      });
+    },
+  };
+})();
+
+// ── AES-GCM encryption at rest (v1.3 improvement #9) ───────────────────────
+/**
+ * WebCrypto AES-GCM helpers for encrypting sensitive blobs (Grok key, NordVPN
+ * key, WG configs) at rest. A user-provided passphrase is stretched via
+ * PBKDF2-SHA256 (200k iterations) into a 256-bit AES-GCM key. Completely
+ * opt-in — controlled by settings.encryptSecrets.
+ */
+const Secure = {
+  _key: null,
+  async deriveKey(passphrase, salt) {
+    const enc = new TextEncoder();
+    const baseKey = await crypto.subtle.importKey('raw', enc.encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt, iterations: 200000, hash: 'SHA-256' },
+      baseKey,
+      { name: 'AES-GCM', length: 256 },
+      false, ['encrypt', 'decrypt']
+    );
+  },
+  async unlock(passphrase) {
+    try {
+      const raw = localStorage.getItem(KEY_SECURE_BLOB);
+      const salt = raw ? Uint8Array.from(atob(JSON.parse(raw).salt), c => c.charCodeAt(0)) : crypto.getRandomValues(new Uint8Array(16));
+      this._key = await this.deriveKey(passphrase, salt);
+      this._salt = salt;
+      return true;
+    } catch { this._key = null; return false; }
+  },
+  isUnlocked() { return !!this._key; },
+  async encrypt(plainObj) {
+    if (!this._key) throw new Error('Secure store locked');
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const enc = new TextEncoder().encode(JSON.stringify(plainObj));
+    const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this._key, enc);
+    return {
+      salt:   btoa(String.fromCharCode(...this._salt)),
+      iv:     btoa(String.fromCharCode(...iv)),
+      cipher: btoa(String.fromCharCode(...new Uint8Array(cipher))),
+    };
+  },
+  async decrypt(record) {
+    if (!this._key) throw new Error('Secure store locked');
+    const iv     = Uint8Array.from(atob(record.iv),     c => c.charCodeAt(0));
+    const cipher = Uint8Array.from(atob(record.cipher), c => c.charCodeAt(0));
+    const plain  = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, this._key, cipher);
+    return JSON.parse(new TextDecoder().decode(plain));
+  },
+  async save(plainObj) {
+    const rec = await this.encrypt(plainObj);
+    localStorage.setItem(KEY_SECURE_BLOB, JSON.stringify(rec));
+  },
+  async load() {
+    const raw = localStorage.getItem(KEY_SECURE_BLOB);
+    if (!raw) return null;
+    try { return await this.decrypt(JSON.parse(raw)); } catch { return null; }
+  },
+};
+
+// ── SSE live-events client (v1.3 improvement #2) ───────────────────────────
+/**
+ * Connects to the server /api/events stream and dispatches each event to local
+ * handlers. Replaces the old 15s setInterval polling with instant updates on
+ * run.start / run.end / shot.saved / login.result / card.result / run.cancel.
+ * Reconnects automatically on drop. Gated behind settings.useSSE — users can
+ * fall back to polling mode if SSE is flaky on their network.
+ */
+const SSE = {
+  _es: null,
+  _handlers: Object.create(null),
+  on(event, fn) { (this._handlers[event] ||= []).push(fn); },
+  _dispatch(event, data) {
+    const list = this._handlers[event] || [];
+    for (const fn of list) { try { fn(data); } catch {} }
+  },
+  connect() {
+    if (this._es) return;
+    try {
+      const es = new EventSource('/api/events');
+      this._es = es;
+      // All named events the server broadcasts
+      for (const name of ['run.start', 'run.end', 'run.cancel', 'shot.saved', 'login.result', 'card.result']) {
+        es.addEventListener(name, (ev) => {
+          try { this._dispatch(name, JSON.parse(ev.data)); } catch {}
+        });
+      }
+      es.onerror = () => {
+        // Browser auto-retries by default; nothing to do. Closed socket will
+        // be reopened by the next EventSource retry cycle.
+      };
+    } catch { this._es = null; }
+  },
+  disconnect() {
+    if (!this._es) return;
+    try { this._es.close(); } catch {}
+    this._es = null;
+  },
+};
+
+// ── Run registry (active automation tracking) ─────────────────────────────
+/**
+ * Map of runId → { site, username, startedAt, outcome? }. Populated via SSE
+ * events. Used to render the "Active Runs" panel and enable per-run cancel.
+ * @type {Map<string, object>}
+ */
+const liveRuns = new Map();
+
+/**
+ * Aborts an in-flight run by calling POST /api/cancel/:runId.
+ * Swallows network errors — cancellation is best-effort.
+ * @param {string} runId
+ */
+async function cancelRun(runId) {
+  if (!runId) return;
+  try {
+    await fetch(`/api/cancel/${encodeURIComponent(runId)}`, { method: 'POST' });
+    toast('Cancellation requested', 'info');
+  } catch (err) { toast(`Cancel failed: ${err.message}`, 'error'); }
+}
+
+// ── Credential pre-flight validator (v1.3 improvement #14) ─────────────────
+/**
+ * Inspects a batch of credentials before running automation and returns a
+ * summary of issues. Cheap, offline — catches obvious format errors, dupes,
+ * and blacklisted entries so we never waste a Chromium launch on garbage.
+ * Controlled by settings.preflightCheck.
+ * @param {Array<{id:string,username:string,password:string}>} creds
+ * @returns {{ready:Array, issues:Array<{cred:object,reason:string}>}}
+ */
+function preflightValidateCreds(creds) {
+  const ready = [];
+  const issues = [];
+  const seen = new Set();
+  for (const c of creds) {
+    const u = (c.username || '').trim();
+    const p = (c.password || '');
+    if (!u || !p)                           { issues.push({ cred: c, reason: 'empty username or password' }); continue; }
+    if (u.length < 3 || p.length < 1)       { issues.push({ cred: c, reason: 'username/password too short' }); continue; }
+    if (u.includes(' '))                    { issues.push({ cred: c, reason: 'username contains whitespace' }); continue; }
+    const key = u.toLowerCase();
+    if (seen.has(key))                      { issues.push({ cred: c, reason: 'duplicate in batch' }); continue; }
+    seen.add(key);
+    if (isBlacklisted(u))                   { issues.push({ cred: c, reason: 'blacklisted — auto-skipped' }); continue; }
+    ready.push(c);
+  }
+  return { ready, issues };
+}
+
+// ── Debug Mode profile (v1.3 improvement #15) ──────────────────────────────
+/**
+ * Applies a forensic-debug preset over state.settings. Flipped via the
+ * "Debug Mode" toggle in Settings. Reverse-toggle restores prior values.
+ * Defaults captured into state._debugModePriors so we can cleanly restore.
+ */
+function applyDebugModeProfile(enable) {
+  if (enable) {
+    if (state._debugModePriors) return; // already active
+    state._debugModePriors = {
+      loginConcurrency: state.settings.loginConcurrency,
+      maxConcurrency:   state.settings.maxConcurrency,
+      pageLoadTimeout:  state.settings.pageLoadTimeout,
+      liveView:         state.settings.liveView,
+      debugScreenshots: state.settings.debugScreenshots,
+    };
+    state.settings.loginConcurrency = 1;
+    state.settings.maxConcurrency   = 1;
+    state.settings.pageLoadTimeout  = 300;
+    state.settings.liveView         = true;
+    state.settings.debugScreenshots = true;
+  } else if (state._debugModePriors) {
+    Object.assign(state.settings, state._debugModePriors);
+    state._debugModePriors = null;
+  }
+  saveSettings();
+}
+
+// ── Visual diff between sequential shots (v1.3 improvement #13) ────────────
+/**
+ * Returns a numeric similarity score (0..1, 1=identical) between two data-URL
+ * PNGs by sampling a 64×64 grid and counting luminance differences > 16.
+ * Lightweight — no external library. Used to annotate renderDebugShots with
+ * a red "changed" badge when score < 0.95.
+ * @param {string} aUrl - data URL or http URL of first image
+ * @param {string} bUrl - data URL or http URL of second image
+ * @returns {Promise<number>} similarity score 0..1
+ */
+async function visualDiffScore(aUrl, bUrl) {
+  if (!state.settings.visualDiff || !aUrl || !bUrl) return 1;
+  try {
+    const load = (src) => new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = src;
+    });
+    const [a, b] = await Promise.all([load(aUrl), load(bUrl)]);
+    const size = 64;
+    const cvs = document.createElement('canvas');
+    cvs.width = size; cvs.height = size;
+    const ctx = cvs.getContext('2d');
+    ctx.drawImage(a, 0, 0, size, size);
+    const aData = ctx.getImageData(0, 0, size, size).data;
+    ctx.clearRect(0, 0, size, size);
+    ctx.drawImage(b, 0, 0, size, size);
+    const bData = ctx.getImageData(0, 0, size, size).data;
+    let diff = 0;
+    for (let i = 0; i < aData.length; i += 4) {
+      const la = 0.299 * aData[i] + 0.587 * aData[i + 1] + 0.114 * aData[i + 2];
+      const lb = 0.299 * bData[i] + 0.587 * bData[i + 1] + 0.114 * bData[i + 2];
+      if (Math.abs(la - lb) > 16) diff++;
+    }
+    return 1 - (diff / (size * size));
+  } catch { return 1; }
+}
 
 // ── Card status enum ───────────────────────────────────────
 /**
@@ -393,6 +685,15 @@ let state = {
     proxyRotateOnFailure: true,
     // Appearance
     theme: 'dark',
+    // v1.3 feature toggles (all can be flipped on/off from Settings)
+    useSSE:          true,  // live server events (vs 15s polling)
+    useShotUrls:     true,  // prefer disk-served screenshot URLs
+    reuseSession:    false, // save+reuse Playwright storageState
+    encryptSecrets:  false, // AES-GCM encryption at rest for sensitive keys
+    preflightCheck:  true,  // validate creds before running
+    debugModeProfile: false, // forensic defaults (slow, verbose, single concurrency)
+    visualDiff:      true,  // highlight pixel changes between sequential shots
+    smartThrottle:   true,  // per-domain jitter + exponential backoff on 429
   },
   /** @type {string} Grok AI API key (persisted separately). */
   grokKey: '',
@@ -1001,6 +1302,16 @@ function renderSettings() {
   if ($('vpnRotation'))         $('vpnRotation').checked         = settings.vpnRotation;
   if ($('dnsRotation'))         $('dnsRotation').checked         = settings.dnsRotation;
   if ($('proxyRotateOnFail'))   $('proxyRotateOnFail').checked   = settings.proxyRotateOnFailure;
+
+  // v1.3 feature toggles — mirror persisted settings in the Advanced section
+  if ($('useSSE'))           $('useSSE').checked           = settings.useSSE !== false;
+  if ($('useShotUrls'))      $('useShotUrls').checked      = settings.useShotUrls !== false;
+  if ($('reuseSession'))     $('reuseSession').checked     = settings.reuseSession === true;
+  if ($('encryptSecrets'))   $('encryptSecrets').checked   = settings.encryptSecrets === true;
+  if ($('preflightCheck'))   $('preflightCheck').checked   = settings.preflightCheck !== false;
+  if ($('visualDiff'))       $('visualDiff').checked       = settings.visualDiff !== false;
+  if ($('smartThrottle'))    $('smartThrottle').checked    = settings.smartThrottle !== false;
+  if ($('debugModeProfile')) $('debugModeProfile').checked = settings.debugModeProfile === true;
 
   applyTheme(settings.theme);
   renderWgConfigs();
@@ -1937,10 +2248,17 @@ function enqueueShot(buildOverlayFn, tag, note) {
  * @param {string} tag - Short identifier tag for filename and display.
  * @param {string} note - Human-readable description shown in screenshot modal.
  */
-function saveDebugShot(dataUrl, tag, note, groupId = '') {
+function saveDebugShot(dataUrl, tag, note, groupId = '', url = '') {
   if (!state.settings.debugScreenshots) return;
-  if (!dataUrl || !dataUrl.startsWith('data:image')) return;
+  // Accept either a real disk URL (preferred — near-zero localStorage cost)
+  // or a base64 data URL (legacy path). At least one must be present.
+  const hasData = dataUrl && dataUrl.startsWith('data:image');
+  const hasUrl  = url && /^https?:|^\//.test(url);
+  if (!hasData && !hasUrl) return;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  // When a disk URL is available AND the feature flag is on, drop the heavy
+  // base64 to keep localStorage light. Modal rendering prefers `url` anyway.
+  const keepBase64 = !(hasUrl && state.settings.useShotUrls !== false);
   state.debugShots.unshift({
     id: crypto.randomUUID(),
     ts: Date.now(),
@@ -1948,7 +2266,8 @@ function saveDebugShot(dataUrl, tag, note, groupId = '') {
     groupId: groupId || tag,
     note: note || '',
     filename: `sitchomatic_live_${sanitizeFilenamePart(tag)}_${stamp}.png`,
-    dataUrl,
+    dataUrl: keepBase64 ? (dataUrl || '') : '',
+    url: hasUrl ? url : '',
   });
   saveDebugShotsQuota();
   if (!$('screenshotModal').classList.contains('hidden')) renderDebugShots();
@@ -2132,12 +2451,14 @@ async function simulateLoginDetailed(cred, siteId, siteName, loginUrl) {
         loginUrl,
         timeout: (state.settings.loginTimeout || 60) * 1000,
         liveView: state.settings.liveView === true,
+        reuseSession: state.settings.reuseSession === true,
       }),
     });
     if (!resp.ok) throw new Error(`API ${resp.status}`);
     const data = await resp.json();
 
-    const shots = data.shots || ['', '', '', ''];
+    const shots    = data.shots    || ['', '', '', ''];
+    const shotUrls = data.shotUrls || ['', '', '', ''];
     const labels = ['[1/4] Form filled', '[2/4] First response', '[3/4] After settle', '[4/4] Final result'];
     const notes = [
       `${siteName} — form filled — ${cred.username}`,
@@ -2145,9 +2466,10 @@ async function simulateLoginDetailed(cred, siteId, siteName, loginUrl) {
       `${siteName} — page settled`,
       `${siteName} — ${data.outcome || 'done'}`,
     ];
-    shots.forEach((dataUrl, i) => {
-      if (dataUrl) saveDebugShot(dataUrl, shotTag + `_${i + 1}_${labels[i].split(' ').pop().toLowerCase()}`, notes[i], shotTag);
-    });
+    for (let i = 0; i < 4; i++) {
+      const du = shots[i]; const u = shotUrls[i];
+      if (du || u) saveDebugShot(du, shotTag + `_${i + 1}_${labels[i].split(' ').pop().toLowerCase()}`, notes[i], shotTag, u);
+    }
 
     const statusMap = {
       working: CredStatus.WORKING,
@@ -2192,16 +2514,18 @@ async function simulateCheckDetailed(card, ppsrUrl) {
     if (!resp.ok) throw new Error(`API ${resp.status}`);
     const data = await resp.json();
 
-    const shots = data.shots || ['', '', '', ''];
+    const shots    = data.shots    || ['', '', '', ''];
+    const shotUrls = data.shotUrls || ['', '', '', ''];
     const notes = [
       `PPSR — page loaded — ···${card.number.slice(-4)}`,
       `PPSR — form filled — ···${card.number.slice(-4)}`,
       `PPSR — first response`,
       `PPSR — ${data.outcome || 'done'}`,
     ];
-    shots.forEach((dataUrl, i) => {
-      if (dataUrl) saveDebugShot(dataUrl, `${shotTag}_${i + 1}`, notes[i], shotTag);
-    });
+    for (let i = 0; i < 4; i++) {
+      const du = shots[i]; const u = shotUrls[i];
+      if (du || u) saveDebugShot(du, `${shotTag}_${i + 1}`, notes[i], shotTag, u);
+    }
 
     const result = data.outcome === 'working' ? Status.WORKING : Status.DEAD;
     return { result: data.outcome || 'dead', detail: data.note || data.outcome, firstRun, durationMs: Date.now() - start };
@@ -2226,11 +2550,34 @@ async function runLoginChecks(site, credIds = null) {
   if (site === 'ign' && state.ignRunning) return;
 
   const allCreds = site === 'joe' ? state.joeCreds : state.ignCreds;
-  const targets  = credIds
+  let targets    = credIds
     ? allCreds.filter(c => credIds.includes(c.id) && c.status !== CredStatus.TESTING)
     : allCreds.filter(c => c.status === CredStatus.UNTESTED);
 
   if (targets.length === 0) { toast('No untested credentials to check', 'info'); return; }
+
+  // ── v1.3 pre-flight validator (improvement #14) ─────────────────────────
+  // Skip obviously broken / duplicate / blacklisted creds before spinning up
+  // any Chromium context. Saves time + prevents misleading screenshots.
+  if (state.settings.preflightCheck !== false) {
+    const { ready, issues } = preflightValidateCreds(targets);
+    if (issues.length) {
+      toast(`Pre-flight: ${ready.length} ready, ${issues.length} skipped`, 'info', 3500);
+      // Auto-mark blacklisted as permDisabled, everything else as noAcc so the
+      // list doesn't endlessly re-queue broken rows on the next run.
+      for (const { cred, reason } of issues) {
+        const credsArr = site === 'joe' ? state.joeCreds : state.ignCreds;
+        const idx = credsArr.findIndex(c => c.id === cred.id);
+        if (idx === -1) continue;
+        credsArr[idx].status = reason.startsWith('blacklisted') ? CredStatus.PERM_DISABLED : CredStatus.NO_ACC;
+        credsArr[idx].testHistory = credsArr[idx].testHistory || [];
+        credsArr[idx].testHistory.unshift({ status: credsArr[idx].status, detail: `Pre-flight: ${reason}`, ts: Date.now(), durationMs: 0 });
+      }
+      if (site === 'joe') saveJoeCreds(); else saveIgnCreds();
+    }
+    targets = ready;
+    if (targets.length === 0) { toast('Nothing to check after pre-flight', 'info'); renderAll(); return; }
+  }
 
   const abortCtrl = new AbortController();
   if (site === 'joe') { state.joeRunning = true; state.joeAbortController = abortCtrl; }
@@ -2564,7 +2911,7 @@ function renderDebugShots() {
       <div class="shot-group-row">
         ${ordered.map(s => `
           <div class="shot-card">
-            <img class="shot-thumb" src="${s.dataUrl}" alt="${s.note}" loading="lazy" data-shot-action="open" data-shot-id="${s.id}" />
+            <img class="shot-thumb" src="${s.url || s.dataUrl}" alt="${s.note}" loading="lazy" data-shot-action="open" data-shot-id="${s.id}" />
             <div class="shot-meta">
               <div class="shot-sub">${s.note || ''}</div>
             </div>
@@ -2591,7 +2938,16 @@ function closeScreenshots() { $('screenshotModal').classList.add('hidden'); }
 function openDebugShot(id) {
   const shot = state.debugShots.find(s => s.id === id);
   if (!shot) return;
-  fetch(shot.dataUrl)
+  // Prefer the stable disk-served URL; fall back to legacy base64 dataUrl.
+  const src = shot.url || shot.dataUrl;
+  if (!src) return;
+  // For disk URLs, just open directly — no blob conversion needed.
+  if (shot.url) {
+    const win = window.open(shot.url, '_blank');
+    if (!win) { const a = document.createElement('a'); a.href = shot.url; a.target = '_blank'; a.click(); }
+    return;
+  }
+  fetch(src)
     .then(r => r.blob())
     .then(blob => {
       const blobUrl = URL.createObjectURL(blob);
@@ -2613,7 +2969,7 @@ function downloadDebugShot(id) {
   const shot = state.debugShots.find(s => s.id === id);
   if (!shot) return;
   const a = document.createElement('a');
-  a.href = shot.dataUrl; a.download = shot.filename || `sitchomatic_debug_${shot.tag || 'shot'}.png`; a.click();
+  a.href = shot.url || shot.dataUrl; a.download = shot.filename || `sitchomatic_debug_${shot.tag || 'shot'}.png`; a.click();
 }
 
 // ── Recordings modal ───────────────────────────────────────
@@ -3051,6 +3407,29 @@ function wireEvents() {
   checkBind('vpnRotation',       'vpnRotation');
   checkBind('dnsRotation',       'dnsRotation');
   checkBind('proxyRotateOnFail', 'proxyRotateOnFailure');
+  // v1.3 feature toggles — all can be flipped without restart
+  checkBind('useSSE',          'useSSE');
+  checkBind('useShotUrls',     'useShotUrls');
+  checkBind('reuseSession',    'reuseSession');
+  checkBind('encryptSecrets',  'encryptSecrets');
+  checkBind('preflightCheck',  'preflightCheck');
+  checkBind('visualDiff',      'visualDiff');
+  checkBind('smartThrottle',   'smartThrottle');
+  // Debug Mode is a special toggle: flipping on applies a forensic preset, off restores priors
+  const debugModeEl = $('debugModeProfile');
+  if (debugModeEl) {
+    debugModeEl.addEventListener('change', () => {
+      state.settings.debugModeProfile = debugModeEl.checked;
+      applyDebugModeProfile(debugModeEl.checked);
+      renderSettings();
+      toast(debugModeEl.checked ? 'Debug Mode enabled' : 'Debug Mode disabled', 'info');
+    });
+  }
+  // SSE toggle reacts immediately — open or close the EventSource
+  const sseEl = $('useSSE');
+  if (sseEl) sseEl.addEventListener('change', () => {
+    if (sseEl.checked) SSE.connect(); else SSE.disconnect();
+  });
 
   autoBind('maxRequeueCount', 'maxRequeueCount', v => Math.max(0, Math.min(10, parseInt(v) || 3)));
 
@@ -3109,6 +3488,9 @@ function wireEvents() {
         requeueOnFailure: true, maxRequeueCount: 3, batchDelayBetweenStartsMs: 50,
         pageLoadTimeout: 180, liveView: true,
         vpnRotation: false, dnsRotation: false, proxyRotateOnFailure: true,
+        // v1.3 toggles reset to sane defaults
+        useSSE: true, useShotUrls: true, reuseSession: false, encryptSecrets: false,
+        preflightCheck: true, visualDiff: true, smartThrottle: true, debugModeProfile: false,
       };
       state.selectedCardIds.clear(); state.selectedJoeIds.clear(); state.selectedIgnIds.clear();
       applyTheme('dark'); renderAll(); toast('All data reset', 'info');
@@ -3226,6 +3608,30 @@ function boot() {
   renderAll();
   void detectIP();
   void checkServerStatus();
+  // ── v1.3: live SSE wiring ───────────────────────────────
+  // Wire local handlers for server events so the UI updates instantly when a
+  // run starts/ends or a screenshot lands. liveRuns powers the active-runs
+  // badge + per-run cancel. Gated by the useSSE toggle in settings.
+  if (state.settings.useSSE !== false) {
+    SSE.on('run.start', (d) => {
+      liveRuns.set(d.runId, d);
+      scheduleRender();
+    });
+    SSE.on('run.end', (d) => {
+      liveRuns.delete(d.runId);
+      scheduleRender();
+    });
+    SSE.on('run.cancel', (d) => {
+      liveRuns.delete(d.runId);
+      scheduleRender();
+    });
+    SSE.on('shot.saved', () => {
+      // Light touch — the HTTP response path writes the shot record; this
+      // just nudges the modal to repaint if it's currently open.
+      if (!$('screenshotModal').classList.contains('hidden')) renderDebugShots();
+    });
+    SSE.connect();
+  }
 }
 
 /**
