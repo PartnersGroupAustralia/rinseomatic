@@ -2759,7 +2759,7 @@ async function runLoginChecks(site, credIds = null) {
   renderAll();
   const recordingId = await startRunRecording(site, `${siteName} Login`);
 
-  const concurrency = Math.min(state.settings.loginConcurrency, targets.length, 6);
+  const concurrency = Math.min(state.settings.loginConcurrency, targets.length);
   let done = 0, working = 0, noAcc = 0;
   const queue = [...targets];
 
@@ -2831,6 +2831,11 @@ async function runLoginChecks(site, credIds = null) {
  * @param {'joe'|'ign'} site - Site identifier.
  */
 async function stopLoginChecks(site) {
+  // Cancel every server-side run for this site so Playwright contexts are freed
+  // immediately instead of running to completion in the background.
+  for (const [runId, info] of liveRuns) {
+    if (info.site === site || info.kind === 'login') cancelRun(runId);
+  }
   if (site === 'joe') {
     if (state.joeAbortController) state.joeAbortController.abort();
     state.joeRunning = false;
@@ -2878,7 +2883,7 @@ async function runChecks(cardIds = null) {
   renderAll();
   const recordingId = await startRunRecording('ppsr', 'PPSR Check Run');
 
-  const concurrency = Math.min(state.settings.maxConcurrency, targets.length, 8);
+  const concurrency = Math.min(state.settings.maxConcurrency, targets.length);
   let done = 0, working = 0, dead = 0;
   const queue = [...targets];
 
@@ -2952,6 +2957,10 @@ async function runChecks(cardIds = null) {
  * BUG-08 fix: awaits stopRunRecording.
  */
 async function stopRun() {
+  // Cancel every server-side card-check run so Playwright contexts are freed.
+  for (const [runId, info] of liveRuns) {
+    if (info.kind === 'card') cancelRun(runId);
+  }
   if (state.abortController) { state.abortController.abort(); state.abortController = null; }
   state.isRunning = false;
   hideProgress();

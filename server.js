@@ -174,7 +174,7 @@ function _throttleFor(host) { return DOMAIN_THROTTLE[host] || DOMAIN_THROTTLE._d
  * Combines: minDelay (between consecutive hits) + jitter + active backoffMs.
  * @param {string} url - The target URL whose host will be throttled.
  */
-async function applyDomainThrottle(url) {
+async function applyDomainThrottle(url, signal) {
   const host = _hostOf(url);
   const cfg  = _throttleFor(host);
   const last = _domainLastHit.get(host) || 0;
@@ -182,8 +182,12 @@ async function applyDomainThrottle(url) {
   const jitter   = Math.floor(Math.random() * cfg.jitterMs);
   const waitFor  = Math.max(0, (cfg.minDelayMs + cfg.backoffMs + jitter) - gap);
   if (waitFor > 0) {
+    if (signal?.aborted) return;
     logEvent('debug', 'throttle.wait', { host, waitFor, backoffMs: cfg.backoffMs });
-    await new Promise(r => setTimeout(r, waitFor));
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, waitFor);
+      if (signal) signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+    });
   }
   _domainLastHit.set(host, Date.now());
 }
@@ -442,14 +446,23 @@ async function releaseContext(lease, { destroy = false } = {}) {
       try { w.resolve({ context, mode: lease.mode, fresh: false }); } catch {}
       return;
     }
-    // No idle context but slot free — caller asked for a fresh-ish lease;
-    // just resolve — they'll create one.
+    // No idle context but slot free — create one for the waiter. The async
+    // getBrowser + _newContext calls yield to the event loop, during which the
+    // waiter's AbortSignal may fire. If the signal wins the promise race the
+    // resolve() below is a no-op and we must close the orphan context and
+    // correct the active count to prevent a leak.
     if (pool.active + pool.idle.length < _poolCapFor(lease.mode)) {
       try {
         const browser = await getBrowser(lease.mode === 'headed');
         const context = await _newContext(browser, lease.mode === 'headed');
         pool.active++;
-        w.resolve({ context, mode: lease.mode, fresh: false });
+        if (w.signal?.aborted) {
+          // Waiter was cancelled while we were creating the context — reclaim.
+          pool.active = Math.max(0, pool.active - 1);
+          pool.idle.push(context);
+        } else {
+          w.resolve({ context, mode: lease.mode, fresh: false });
+        }
       } catch (err) { w.reject(err); }
       return;
     }
@@ -649,23 +662,11 @@ function attachNetworkHooks(page) {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Captures a viewport screenshot from a Playwright page and returns it as a
- * base64-encoded PNG data URL. Injects a "SCR X/4" badge into the top-right
+ * Captures a viewport screenshot from a Playwright page and returns the raw
+ * PNG Buffer for disk persistence. Injects a "SCR X/4" badge into the top-right
  * corner of the live page before screenshotting so the label is burned into
  * the real browser image, then removes the badge afterwards.
  *
- * @param {import('playwright').Page} page - The Playwright page to capture.
- * @param {string} [label] - Optional label to burn in, e.g. 'SCR 1/4'.
- * @returns {Promise<string>} Data URL string (data:image/png;base64,...).
- */
-async function captureShot(page, label) {
-  const buf = await captureShotBuf(page, label);
-  return buf ? `data:image/png;base64,${buf.toString('base64')}` : '';
-}
-
-/**
- * Same as captureShot but returns the raw PNG Buffer so the caller can persist
- * it to disk AND convert to dataUrl without double-encoding.
  * @param {import('playwright').Page} page
  * @param {string} [label] - badge text (e.g. 'SCR 1/4')
  * @returns {Promise<Buffer|null>}
@@ -1314,7 +1315,7 @@ async function isLoggedIn(page, site) {
  *   loginUrl   {string}
  *   timeout    {number} optional page timeout ms
  *
- * Response: { outcome, note, shots: [4 base64 PNGs] }
+ * Response: { outcome, note, shotUrls: [4 disk URLs], htmlUrls: [4 disk URLs] }
  */
 app.post('/api/login-check', async (req, res) => {
   const {
@@ -1333,7 +1334,7 @@ app.post('/api/login-check', async (req, res) => {
   const runHandle = startRun({ site, username, loginUrl, kind: 'login' });
 
   // Domain-aware throttling: respect cooldowns / backoff before starting.
-  await applyDomainThrottle(loginUrl);
+  await applyDomainThrottle(loginUrl, runHandle.controller.signal);
 
   let lease = null;
   let destroyContext = false;
@@ -1643,7 +1644,8 @@ app.post('/api/login-check', async (req, res) => {
  * Response:
  *   outcome    {string} 'working' | 'dead'
  *   note       {string} human-readable result description
- *   shots      {string[]} array of 4 base64 PNG data URLs
+ *   shotUrls   {string[]} array of 4 disk-served PNG URLs
+ *   htmlUrls   {string[]} array of 4 disk-served HTML URLs
  *     [0] page loaded, form visible
  *     [1] form filled with card details
  *     [2] first response after submit
@@ -1656,7 +1658,7 @@ app.post('/api/card-check', async (req, res) => {
   }
 
   const runHandle = startRun({ kind: 'card', last4: String(number).slice(-4), ppsrUrl });
-  await applyDomainThrottle(ppsrUrl);
+  await applyDomainThrottle(ppsrUrl, runHandle.controller.signal);
 
   let lease = null;
   let destroyContext = false;
