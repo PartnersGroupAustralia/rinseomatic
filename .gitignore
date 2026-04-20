@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.cache/
+*.log
+.DS_Store
+debug-shots/
+sessions/
+logs/
+.playwright-mcp/
+.zenflow/
+.zenflow-attachments/
+test-*.png
+runs/
