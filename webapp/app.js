@@ -1382,6 +1382,7 @@ function renderSettings() {
   if ($('maxRequeueCount')) $('maxRequeueCount').value = settings.maxRequeueCount;
   if ($('batchDelay'))      $('batchDelay').value      = settings.batchDelayBetweenStartsMs;
   if ($('pageLoadTimeout')) $('pageLoadTimeout').value = settings.pageLoadTimeout;
+  if ($('maxConcurrent'))   $('maxConcurrent').value   = settings.maxConcurrent;
 
   // Network/VPN settings
   if ($('vpnRotation'))         $('vpnRotation').checked         = settings.vpnRotation;
@@ -2432,10 +2433,11 @@ function saveDebugShot(dataUrl, tag, note, groupId = '', url = '') {
     groupId: groupId || tag,
     note: note || '',
     filename: `sitchomatic_live_${sanitizeFilenamePart(tag)}_${stamp}.png`,
-    // Always drop base64 from the persisted record — the modal renderer
-    // prefers `url` and the heavy blob was the primary localStorage hog.
-    dataUrl: '',
-    url: hasUrl ? url : (hasData ? dataUrl : ''),
+    // Prefer disk-served URL; fall back to base64 only when no URL is available.
+    // `openDebugShot` routes `dataUrl` through fetch→blob to sidestep top-level
+    // data-URL navigation blocks, so base64 must land in `dataUrl`, not `url`.
+    dataUrl: hasUrl ? '' : (hasData ? dataUrl : ''),
+    url: hasUrl ? url : '',
   });
   saveDebugShotsQuota();
   if (!$('screenshotModal').classList.contains('hidden')) renderDebugShots();
