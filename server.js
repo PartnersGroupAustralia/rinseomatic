@@ -1192,7 +1192,29 @@ app.post('/api/login-check', async (req, res) => {
     // SCR 1/4 — 0.7s after the last field click (both fields now filled)
     await page.waitForTimeout(700);
     bail();
-    await persist(await captureShotBuf(page, 'SCR 1/4'), 0);
+    await persist(await captureShotBuf(page, 'SCR 1/4').catch(() => null), 0);
+
+    // ── Freeze navigation BEFORE the first submit ─────────────────────────
+    // Bug fix: previously freeze activated only before SCR 4/4, which meant
+    // Ignition/Joe could redirect or reload the page between SCR 2/4 and
+    // SCR 3/4 — causing the page to go blank and screenshots to be missed.
+    // Now every submit click + every screenshot happens on the original URL.
+    frozen = true;
+    await page.evaluate(() => {
+      try {
+        window.addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = ''; }, true);
+        const noop = () => {};
+        try { window.location.assign  = noop; } catch {}
+        try { window.location.replace = noop; } catch {}
+        try { window.location.reload  = noop; } catch {}
+        // Also swallow form submits that would trigger a full-page refresh —
+        // XHR/fetch submits continue to work (the route handler only blocks
+        // top-level document navigations).
+        document.addEventListener('submit', (e) => {
+          try { if (e.target && e.target.tagName === 'FORM') e.preventDefault(); } catch {}
+        }, true);
+      } catch { /* ignore */ }
+    }).catch(() => {});
 
     // ── Step 2: First submit → SCR 2/4 (2000ms fixed) → poll outcome ─────
     // Screenshot timing is hardcoded: 2000ms after first submit click so the
@@ -1201,13 +1223,13 @@ app.post('/api/login-check', async (req, res) => {
     let respType = RESP.UNKNOWN;
     const siteName = site === 'ign' ? 'Ignition' : 'Joe Fortune';
 
-    const clicked1 = await clickSubmit(page);
-    if (!clicked1) await page.keyboard.press('Enter');
+    const clicked1 = await clickSubmit(page).catch(() => false);
+    if (!clicked1) await page.keyboard.press('Enter').catch(() => {});
 
-    await page.waitForTimeout(2000); // hardcoded: 2000ms after 1st submit
-    await dismissCookiePopup(page);
+    await page.waitForTimeout(2000).catch(() => {}); // 2000ms after 1st submit
+    await dismissCookiePopup(page).catch(() => {});
     bail();
-    await persist(await captureShotBuf(page, 'SCR 2/4'), 1);
+    await persist(await captureShotBuf(page, 'SCR 2/4').catch(() => null), 1);
 
     // Poll for outcome — returns immediately if the response is already visible
     respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
@@ -1227,16 +1249,16 @@ app.post('/api/login-check', async (req, res) => {
     // ── Step 3: Retry submit → SCR 3/4 (2500ms fixed) → poll outcome ─────
     // Screenshot taken 2500ms after the second submit click.
     if (respType === RESP.WRONG_PASS_1 || respType === RESP.WRONG_PASS_2 || respType === RESP.UNKNOWN) {
-      await fillLoginForm(page, username, password);
-      const clicked2 = await clickSubmit(page);
-      if (!clicked2) await page.keyboard.press('Enter');
+      await fillLoginForm(page, username, password).catch(() => {});
+      const clicked2 = await clickSubmit(page).catch(() => false);
+      if (!clicked2) await page.keyboard.press('Enter').catch(() => {});
 
-      await page.waitForTimeout(2500); // hardcoded: 2500ms after 2nd submit
-      await dismissCookiePopup(page);
+      await page.waitForTimeout(2500).catch(() => {}); // 2500ms after 2nd submit
+      await dismissCookiePopup(page).catch(() => {});
       bail();
-      await persist(await captureShotBuf(page, 'SCR 3/4'), 2);
+      await persist(await captureShotBuf(page, 'SCR 3/4').catch(() => null), 2);
 
-      respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
+      respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site).catch(() => RESP.UNKNOWN);
 
       if (respType === RESP.SUCCESS) {
         outcome = 'working';
@@ -1253,32 +1275,18 @@ app.post('/api/login-check', async (req, res) => {
       }
     } else {
       // Outcome already determined after attempt 1 — capture current state for SCR 3/4
-      await persist(await captureShotBuf(page, 'SCR 3/4'), 2);
+      await persist(await captureShotBuf(page, 'SCR 3/4').catch(() => null), 2);
     }
 
     // ── Step 4: In-place final state → SCR 4/4 (2000ms settle) ─────────────
     // DO NOT navigate — we want the exact page state resulting from the user's
-    // submits, with cookies/localStorage/JS state intact. This gives a clean
-    // visual timeline across SCR 1–4 on a single URL. We only read signals
-    // from the current page.
+    // submits, with cookies/localStorage/JS state intact. Navigation freeze
+    // is already active (enabled before the first submit) so this is purely a
+    // settle window before capturing the final screenshot.
     const needsFallback = outcome !== 'working' && outcome !== 'permDisabled' && outcome !== 'tempDisabled';
 
-    // Freeze page navigation so any post-submit redirect (Ignition jumps to
-    // the lobby after the 4th click) doesn't pull us off the response page
-    // before we capture SCR 4/4. Also block client-side reloads via JS.
-    frozen = true;
-    await page.evaluate(() => {
-      try {
-        window.addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = ''; }, true);
-        const noop = () => {};
-        try { window.location.assign  = noop; } catch {}
-        try { window.location.replace = noop; } catch {}
-        try { window.location.reload  = noop; } catch {}
-      } catch { /* ignore */ }
-    }).catch(() => {});
-
     await page.waitForTimeout(2000).catch(() => {}); // 2000ms settle before SCR 4/4
-    await dismissCookiePopup(page);
+    await dismissCookiePopup(page).catch(() => {});
 
     if (needsFallback) {
       const finalUrl  = (page.url() || '').toLowerCase();
@@ -1312,7 +1320,7 @@ app.post('/api/login-check', async (req, res) => {
       }
     }
 
-    await persist(await captureShotBuf(page, 'SCR 4/4'), 3);
+    await persist(await captureShotBuf(page, 'SCR 4/4').catch(() => null), 3);
 
     // ── Network-hook tie-breaker ─────────────────────────────────────────
     // If DOM heuristics said 'noAcc' but network saw an auth-success JSON
@@ -1498,7 +1506,7 @@ app.post('/api/card-check', async (req, res) => {
     note = result.note;
 
     // Shot 4: final state
-    await persist(await captureShotBuf(page, 'SCR 4/4'), 3);
+    await persist(await captureShotBuf(page, 'SCR 4/4').catch(() => null), 3);
 
   } catch (err) {
     if (signal.aborted) {
