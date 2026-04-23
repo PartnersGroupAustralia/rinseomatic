@@ -1322,6 +1322,43 @@ app.post('/api/login-check', async (req, res) => {
 
     await persist(await captureShotBuf(page, 'SCR 4/4').catch(() => null), 3);
 
+    // ── Post-SCR4 re-evaluation (UPGRADE-ONLY) ───────────────────────────
+    // Bugfix: a transient TEMP_DISABLED / PERM_DISABLED banner detected early
+    // by waitForLoginResponse can be superseded by a real successful login by
+    // the time SCR 4/4 is captured (e.g. the site replaced the error banner
+    // with a "Welcome back" header + logged-in chrome). Never demote an
+    // already-working outcome — only upgrade from noAcc/tempDisabled to
+    // working when both the URL has moved off the login page AND the auth-
+    // only DOM/cookie signals are present on the final state.
+    if (outcome !== 'working') {
+      try {
+        const finalUrl2  = (page.url() || '').toLowerCase();
+        const finalBody2 = ((await page.textContent('body').catch(() => '')) || '').toLowerCase();
+        const offLogin2 = !finalUrl2.includes('/login')
+          && !finalUrl2.includes('/sign-in')
+          && !finalUrl2.includes('/signin')
+          && !finalUrl2.includes('overlay=login')
+          && !finalUrl2.includes('modal=login')
+          && !finalUrl2.includes('action=login');
+        const authConfirmed = await isLoggedIn(page, site).catch(() => false);
+
+        // Text-based success hints visible on the final frame
+        const sawSuccessBanner = /welcome\s+back\b/i.test(finalBody2)
+          && !/your email and\/or password/i.test(finalBody2)
+          && !/account has been disabled/i.test(finalBody2)
+          && !/temporarily disabled/i.test(finalBody2);
+
+        if ((offLogin2 || sawSuccessBanner) && authConfirmed) {
+          const prev = outcome;
+          outcome = 'working';
+          note = `${siteName} — success confirmed on final state (upgraded from ${prev})`;
+          logEvent('info', 'login.outcome.upgraded', {
+            runId: runHandle.runId, site, username, from: prev, to: 'working',
+          });
+        }
+      } catch { /* ignore — keep earlier outcome */ }
+    }
+
     // ── Network-hook tie-breaker ─────────────────────────────────────────
     // If DOM heuristics said 'noAcc' but network saw an auth-success JSON
     // (balance/userId/token in a 2xx response), promote to 'working'.
