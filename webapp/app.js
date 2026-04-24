@@ -679,6 +679,9 @@ let state = {
     batchDelayBetweenStartsMs: 50,
     pageLoadTimeout: 180,
     liveView: true,
+    // Multi-submit login handler (strict no-refresh multi-click flow)
+    postSubmitWait: 3000,    // ms waited after every submit click before classification
+    maxSubmitClicks: 6,      // cap on submit clicks per cred
     // Network / VPN
     vpnRotation: false,
     dnsRotation: false,
@@ -1297,6 +1300,8 @@ function renderSettings() {
   if ($('maxRequeueCount')) $('maxRequeueCount').value = settings.maxRequeueCount;
   if ($('batchDelay'))      $('batchDelay').value      = settings.batchDelayBetweenStartsMs;
   if ($('pageLoadTimeout')) $('pageLoadTimeout').value = settings.pageLoadTimeout;
+  if ($('postSubmitWait'))  $('postSubmitWait').value  = settings.postSubmitWait || 3000;
+  if ($('maxSubmitClicks')) $('maxSubmitClicks').value = settings.maxSubmitClicks || 6;
 
   // Network/VPN settings
   if ($('vpnRotation'))         $('vpnRotation').checked         = settings.vpnRotation;
@@ -2534,6 +2539,8 @@ async function simulateLoginDetailed(cred, siteId, siteName, loginUrl) {
         timeout: (state.settings.loginTimeout || 60) * 1000,
         liveView: state.settings.liveView === true,
         reuseSession: state.settings.reuseSession === true,
+        postSubmitWait: state.settings.postSubmitWait || 3000,
+        maxSubmitClicks: state.settings.maxSubmitClicks || 6,
       }),
     });
     if (!resp.ok) throw new Error(`API ${resp.status}`);
@@ -3473,6 +3480,8 @@ function wireEvents() {
   autoBind('typingSpeedMax', 'typingSpeedMaxMs', v => Math.max(50, Math.min(1000, parseInt(v) || 150)));
   autoBind('batchDelay',     'batchDelayBetweenStartsMs', v => Math.max(0, Math.min(5000, parseInt(v) || 50)));
   autoBind('pageLoadTimeout', 'pageLoadTimeout', v => Math.max(10, Math.min(300, parseInt(v) || 180)));
+  autoBind('postSubmitWait',  'postSubmitWait',  v => Math.max(500, Math.min(15000, parseInt(v) || 3000)));
+  autoBind('maxSubmitClicks', 'maxSubmitClicks', v => Math.max(1, Math.min(12, parseInt(v) || 6)));
 
   const checkBind = (id, key) => {
     const el = $(id);
@@ -3569,6 +3578,7 @@ function wireEvents() {
         typingSpeedMinMs: 50, typingSpeedMaxMs: 150, requeueOnTimeout: true,
         requeueOnFailure: true, maxRequeueCount: 3, batchDelayBetweenStartsMs: 50,
         pageLoadTimeout: 180, liveView: true,
+        postSubmitWait: 3000, maxSubmitClicks: 6,
         vpnRotation: false, dnsRotation: false, proxyRotateOnFailure: true,
         // v1.3 toggles reset to sane defaults
         useSSE: true, useShotUrls: true, reuseSession: false, encryptSecrets: false,

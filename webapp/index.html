@@ -601,6 +601,14 @@
               <input type="number" id="typingSpeedMax" class="setting-input short" min="50" max="1000" value="150" />
             </div>
             <div class="settings-row">
+              <label>Post-Submit Wait (ms) <span class="settings-hint">(time to wait after every submit click before outcome check)</span></label>
+              <input type="number" id="postSubmitWait" class="setting-input short" min="500" max="15000" value="3000" />
+            </div>
+            <div class="settings-row">
+              <label>Max Submit Clicks <span class="settings-hint">(per credential, stops early on SUCCESS/DISABLED)</span></label>
+              <input type="number" id="maxSubmitClicks" class="setting-input short" min="1" max="12" value="6" />
+            </div>
+            <div class="settings-row">
               <label>Test Email (rotation)</label>
               <input type="email" id="testEmail" class="setting-input" placeholder="test@email.com" />
             </div>

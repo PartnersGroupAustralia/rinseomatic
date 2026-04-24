@@ -359,6 +359,37 @@ async function persistShotBuffer(buf, runId, idx) {
   return { path: filePath, url, dataUrl };
 }
 
+/**
+ * Persists a per-attempt screenshot + full HTML dump to
+ * `debug-shots/<runId>/attempt-<n>.(png|html)` for forensic replay.
+ * Always writes whatever we have — a null buf still writes the HTML, and
+ * a missing html still writes the PNG — so the user always gets something
+ * to inspect after every submit click in the multi-submit login flow.
+ *
+ * @param {Buffer|null} buf  Raw PNG
+ * @param {string|null} html Full document HTML (page.content())
+ * @param {string} runId
+ * @param {number} attempt 1-based attempt index
+ * @returns {{png:string, html:string}} served URLs (empty strings if write failed)
+ */
+async function persistAttemptArtifacts(buf, html, runId, attempt) {
+  const dir = path.join(SHOTS_DIR, runId);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  const out = { png: '', html: '' };
+  if (buf) {
+    const fp = path.join(dir, `attempt-${attempt}.png`);
+    try { await fsp.writeFile(fp, buf); out.png = `/shots/${runId}/attempt-${attempt}.png`; }
+    catch (err) { logEvent('warn', 'attempt.png.write.failed', { runId, attempt, error: err.message }); }
+  }
+  if (html) {
+    const fp = path.join(dir, `attempt-${attempt}.html`);
+    try { await fsp.writeFile(fp, html); out.html = `/shots/${runId}/attempt-${attempt}.html`; }
+    catch (err) { logEvent('warn', 'attempt.html.write.failed', { runId, attempt, error: err.message }); }
+  }
+  broadcast('attempt.saved', { runId, attempt, png: out.png, html: out.html });
+  return out;
+}
+
 // ── Network Response Hooks ───────────────────────────────────────────────────
 /**
  * Attaches response listeners to a page and returns a live snapshot object
@@ -1058,6 +1089,63 @@ async function isLoggedIn(page, site) {
 }
 
 /**
+ * Strong post-submit outcome classifier. Looks at the CURRENT page only —
+ * does NOT navigate or reload. Returns one of:
+ *   { type: 'SUCCESS' }                         // welcome banner / off-login URL + auth signals
+ *   { type: 'DISABLED', perm: true|false }      // perm = contact customer service, !perm = rate-limited/temp
+ *   { type: 'BAD_CREDS', stage: 1|2 }           // stage 2 = "remain incorrect" second-warning banner
+ *   { type: 'UNKNOWN' }                          // keep clicking / wait longer
+ *
+ * @param {import('playwright').Page} page
+ * @param {'joe'|'ign'} site
+ * @returns {Promise<{type:string, perm?:boolean, stage?:number}>}
+ */
+async function classifyLoginOutcome(page, site) {
+  try {
+    const body = ((await page.textContent('body').catch(() => '')) || '').toLowerCase();
+    const url  = (page.url() || '').toLowerCase();
+
+    // ── Disabled (check before success because these render on login page) ──
+    if (/your account has been disabled\.\s*please,?\s*contact\s+customer\s+service/i.test(body)
+        || /contact us immediately/i.test(body)) {
+      return { type: 'DISABLED', perm: true };
+    }
+    if (/temporarily disabled.*failed login attempt/i.test(body)
+        || /too many failed.*attempts?/i.test(body)) {
+      return { type: 'DISABLED', perm: false };
+    }
+
+    // ── Bad credentials banners ─────────────────────────────────────────────
+    if (/your email and\/or password remain incorrect/i.test(body)) {
+      return { type: 'BAD_CREDS', stage: 2 };
+    }
+    if (/oops.*your email and\/or password are incorrect/i.test(body)
+        || /email and\/or password are incorrect/i.test(body)) {
+      return { type: 'BAD_CREDS', stage: 1 };
+    }
+    if (site === 'ign' && /incorrect (email|username|password)|invalid (email|username|password|credentials)/i.test(body)) {
+      return { type: 'BAD_CREDS', stage: 1 };
+    }
+
+    // ── Success: off-login URL OR visible welcome banner + auth-only DOM ────
+    const offLogin = !url.includes('/login')
+      && !url.includes('/sign-in')
+      && !url.includes('/signin')
+      && !url.includes('overlay=login')
+      && !url.includes('modal=login')
+      && !url.includes('action=login');
+    const welcomeBanner = /welcome\s+back\b|welcome!/i.test(body)
+      && !/your email and\/or password/i.test(body);
+    const authed = await isLoggedIn(page, site).catch(() => false);
+    if ((offLogin || welcomeBanner) && authed) return { type: 'SUCCESS' };
+
+    return { type: 'UNKNOWN' };
+  } catch {
+    return { type: 'UNKNOWN' };
+  }
+}
+
+/**
  * POST /api/login-check
  * Performs a real Playwright login attempt against the target casino site.
  *
@@ -1087,7 +1175,12 @@ app.post('/api/login-check', async (req, res) => {
     timeout = NAV_TIMEOUT,
     liveView = false,
     reuseSession = false, // Tier-3 #11 — opt-in session persistence
+    // Multi-submit knobs — configurable via request body, clamped to sane ranges.
+    postSubmitWait: postSubmitWaitRaw,
+    maxSubmitClicks: maxSubmitClicksRaw,
   } = req.body;
+  const postSubmitWait = Math.max(500, Math.min(15000, parseInt(postSubmitWaitRaw) || 3000));
+  const maxSubmitClicks = Math.max(1, Math.min(12, parseInt(maxSubmitClicksRaw) || 6));
   if (!username || !password || !loginUrl) {
     return res.status(400).json({ error: 'Missing username, password, or loginUrl' });
   }
@@ -1107,6 +1200,7 @@ app.post('/api/login-check', async (req, res) => {
   let outcome = 'noAcc';
   let note = 'Check did not complete';
   let netSnap = null;
+  let attemptLog = []; // [{ n, type, perm? }] — forensic audit of every submit
   const host = _hostOf(loginUrl);
   const signal = runHandle.controller.signal;
 
@@ -1216,110 +1310,88 @@ app.post('/api/login-check', async (req, res) => {
       } catch { /* ignore */ }
     }).catch(() => {});
 
-    // ── Step 2: First submit → SCR 2/4 (2000ms fixed) → poll outcome ─────
-    // Screenshot timing is hardcoded: 2000ms after first submit click so the
-    // page has time to render the immediate response before we capture it.
-    // After the screenshot we poll to confirm the outcome (fast if already visible).
-    let respType = RESP.UNKNOWN;
+    // ── Multi-submit login loop ───────────────────────────────────────────
+    // STRICT RULES (per feature request):
+    //   • NEVER reload / navigate between submits — frozen flag + beforeunload
+    //     handler + submit-event preventDefault enforce single-page flow.
+    //   • After EVERY submit click: wait `postSubmitWait` ms (default 3000),
+    //     then classify the CURRENT page state (no refresh).
+    //   • Save attempt-<n>.png + attempt-<n>.html to disk for every attempt.
+    //   • Stop on SUCCESS or DISABLED. Otherwise keep clicking up to
+    //     `maxSubmitClicks` (default 6). BAD_CREDS is NOT a stop condition
+    //     until the max is hit — we still try once more in case the banner
+    //     was stale.
     const siteName = site === 'ign' ? 'Ignition' : 'Joe Fortune';
+    attemptLog = [];
+    let classification = { type: 'UNKNOWN' };
+    let attempts = 0;
 
-    const clicked1 = await clickSubmit(page).catch(() => false);
-    if (!clicked1) await page.keyboard.press('Enter').catch(() => {});
+    for (let n = 1; n <= maxSubmitClicks; n++) {
+      bail();
 
-    await page.waitForTimeout(2000).catch(() => {}); // 2000ms after 1st submit
-    await dismissCookiePopup(page).catch(() => {});
-    bail();
-    await persist(await captureShotBuf(page, 'SCR 2/4').catch(() => null), 1);
+      // If the password field was cleared by the site between attempts,
+      // re-fill (doesn't navigate). If still populated, just click again.
+      try {
+        const pwdLoc = page.locator('input[type="password"]:visible').first();
+        const pwdVisible = await pwdLoc.isVisible({ timeout: 200 }).catch(() => false);
+        if (pwdVisible) {
+          const val = await pwdLoc.inputValue().catch(() => '');
+          if (!val) await fillLoginForm(page, username, password).catch(() => {});
+        }
+      } catch { /* ignore */ }
 
-    // Poll for outcome — returns immediately if the response is already visible
-    respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
+      const clicked = await clickSubmit(page).catch(() => false);
+      if (!clicked) await page.keyboard.press('Enter').catch(() => {});
 
-    // Evaluate result after first attempt
-    if (respType === RESP.SUCCESS) {
-      outcome = 'working';
-      note = `${siteName} — login successful`;
-    } else if (respType === RESP.PERM_DISABLED) {
-      outcome = 'permDisabled';
-      note = `${siteName} — account permanently disabled (contact Customer Service)`;
-    } else if (respType === RESP.TEMP_DISABLED) {
-      outcome = 'tempDisabled';
-      note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
-    }
-
-    // ── Step 3: Retry submit → SCR 3/4 (2500ms fixed) → poll outcome ─────
-    // Screenshot taken 2500ms after the second submit click.
-    if (respType === RESP.WRONG_PASS_1 || respType === RESP.WRONG_PASS_2 || respType === RESP.UNKNOWN) {
-      await fillLoginForm(page, username, password).catch(() => {});
-      const clicked2 = await clickSubmit(page).catch(() => false);
-      if (!clicked2) await page.keyboard.press('Enter').catch(() => {});
-
-      await page.waitForTimeout(2500).catch(() => {}); // 2500ms after 2nd submit
+      await page.waitForTimeout(postSubmitWait).catch(() => {});
       await dismissCookiePopup(page).catch(() => {});
       bail();
-      await persist(await captureShotBuf(page, 'SCR 3/4').catch(() => null), 2);
 
-      respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site).catch(() => RESP.UNKNOWN);
+      // Capture artifacts for THIS attempt (PNG + full HTML dump)
+      const buf  = await captureShotBuf(page, `attempt-${n}`).catch(() => null);
+      const html = await page.content().catch(() => '');
+      await persistAttemptArtifacts(buf, html, runHandle.runId, n);
 
-      if (respType === RESP.SUCCESS) {
-        outcome = 'working';
-        note = `${siteName} — login successful (attempt 2)`;
-      } else if (respType === RESP.PERM_DISABLED) {
-        outcome = 'permDisabled';
-        note = `${siteName} — account permanently disabled (contact Customer Service)`;
-      } else if (respType === RESP.TEMP_DISABLED) {
-        outcome = 'tempDisabled';
-        note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
-      } else if (respType === RESP.WRONG_PASS_2) {
-        outcome = 'noAcc';
-        note = `${siteName} — incorrect credentials on retry (account does not exist or wrong password)`;
-      }
+      // Update the legacy 4-shot UI slots for frontend compatibility:
+      //   slot 1 (SCR 2/4) = first attempt
+      //   slot 2 (SCR 3/4) = latest attempt so far (overwritten each loop)
+      //   slot 3 (SCR 4/4) = captured AFTER the loop from the final settled state
+      if (n === 1) await persist(buf, 1);
+      await persist(buf, 2);
+      attempts = n;
+
+      classification = await classifyLoginOutcome(page, site);
+      attemptLog.push({ n, type: classification.type, ...(classification.perm != null ? { perm: classification.perm } : {}) });
+      logEvent('info', 'login.attempt', {
+        runId: runHandle.runId, site, username, attempt: n,
+        type: classification.type, perm: classification.perm, stage: classification.stage,
+      });
+
+      if (classification.type === 'SUCCESS' || classification.type === 'DISABLED') break;
+    }
+
+    // Map final classification → user-facing outcome
+    if (classification.type === 'SUCCESS') {
+      outcome = 'working';
+      note = `${siteName} — login successful (attempt ${attempts}/${maxSubmitClicks})`;
+    } else if (classification.type === 'DISABLED' && classification.perm) {
+      outcome = 'permDisabled';
+      note = `${siteName} — account permanently disabled (contact Customer Service)`;
+    } else if (classification.type === 'DISABLED') {
+      outcome = 'tempDisabled';
+      note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
+    } else if (classification.type === 'BAD_CREDS') {
+      outcome = 'noAcc';
+      note = `${siteName} — incorrect credentials after ${attempts} attempt(s)`;
     } else {
-      // Outcome already determined after attempt 1 — capture current state for SCR 3/4
-      await persist(await captureShotBuf(page, 'SCR 3/4').catch(() => null), 2);
+      outcome = 'noAcc';
+      note = `${siteName} — no conclusive signal after ${attempts} attempt(s)`;
     }
 
-    // ── Step 4: In-place final state → SCR 4/4 (2000ms settle) ─────────────
-    // DO NOT navigate — we want the exact page state resulting from the user's
-    // submits, with cookies/localStorage/JS state intact. Navigation freeze
-    // is already active (enabled before the first submit) so this is purely a
-    // settle window before capturing the final screenshot.
-    const needsFallback = outcome !== 'working' && outcome !== 'permDisabled' && outcome !== 'tempDisabled';
-
-    await page.waitForTimeout(2000).catch(() => {}); // 2000ms settle before SCR 4/4
+    // ── SCR 4/4: final state (2000ms settle, still on the same page) ──────
+    await page.waitForTimeout(2000).catch(() => {});
     await dismissCookiePopup(page).catch(() => {});
-
-    if (needsFallback) {
-      const finalUrl  = (page.url() || '').toLowerCase();
-      const finalBody = ((await page.textContent('body').catch(() => '')) || '').toLowerCase();
-
-      // URL-based success: moved off the login page via normal site nav
-      const offLoginPage = !finalUrl.includes('/login')
-        && !finalUrl.includes('/sign-in')
-        && !finalUrl.includes('/signin')
-        && !finalUrl.includes('overlay=login')
-        && !finalUrl.includes('modal=login')
-        && !finalUrl.includes('action=login');
-
-      // Site-aware auth-only check (DOM locators + auth cookie + no password input).
-      // Avoids false positives from generic marketing text on logged-out homepages
-      // (e.g. Ignition's `?overlay=login` landing page).
-      const loggedIn = await isLoggedIn(page, site);
-
-      if (offLoginPage && loggedIn) {
-        outcome = 'working';
-        note = `${siteName} — auth-only signals detected on current page (no navigation)`;
-      } else if (/your account has been disabled\.\s*please,?\s*contact\s+customer\s+service/i.test(finalBody)) {
-        outcome = 'permDisabled';
-        note = `${siteName} — account permanently disabled (detected on final state)`;
-      } else if (/temporarily disabled due to too many failed login attempt/i.test(finalBody)) {
-        outcome = 'tempDisabled';
-        note = `${siteName} — temporarily disabled (detected on final state)`;
-      } else {
-        outcome = 'noAcc';
-        note = `${siteName} — no success signal detected after retries`;
-      }
-    }
-
+    bail();
     await persist(await captureShotBuf(page, 'SCR 4/4').catch(() => null), 3);
 
     // ── Post-SCR4 re-evaluation (UPGRADE-ONLY) ───────────────────────────
@@ -1407,7 +1479,7 @@ app.post('/api/login-check', async (req, res) => {
 
   broadcast('login.result', {
     runId: runHandle.runId, site, username, outcome, note,
-    shotUrls,
+    shotUrls, attempts: attemptLog,
   });
 
   if (!res.headersSent) res.json({
@@ -1415,6 +1487,7 @@ app.post('/api/login-check', async (req, res) => {
     outcome, note,
     shots:    shotDataUrls, // backwards-compatible (base64)
     shotUrls,                // new: stable disk-served URLs
+    attempts: attemptLog,    // [{ n, type, perm? }] — every submit click's classification
     network:  netSnap ? {
       saw429: netSnap.saw429,
       sawCaptcha: netSnap.sawCaptcha,
