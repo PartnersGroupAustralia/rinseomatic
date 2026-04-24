@@ -682,6 +682,11 @@ let state = {
     // Multi-submit login handler (strict no-refresh multi-click flow)
     postSubmitWait: 3000,    // ms waited after every submit click before classification
     maxSubmitClicks: 6,      // cap on submit clicks per cred
+    // Per-site overrides — 0 / empty means "use global value above"
+    joePostSubmitWait: 0,
+    joeMaxSubmitClicks: 0,
+    ignPostSubmitWait: 0,
+    ignMaxSubmitClicks: 0,
     // Network / VPN
     vpnRotation: false,
     dnsRotation: false,
@@ -1302,6 +1307,10 @@ function renderSettings() {
   if ($('pageLoadTimeout')) $('pageLoadTimeout').value = settings.pageLoadTimeout;
   if ($('postSubmitWait'))  $('postSubmitWait').value  = settings.postSubmitWait || 3000;
   if ($('maxSubmitClicks')) $('maxSubmitClicks').value = settings.maxSubmitClicks || 6;
+  if ($('joePostSubmitWait'))  $('joePostSubmitWait').value  = settings.joePostSubmitWait || 0;
+  if ($('joeMaxSubmitClicks')) $('joeMaxSubmitClicks').value = settings.joeMaxSubmitClicks || 0;
+  if ($('ignPostSubmitWait'))  $('ignPostSubmitWait').value  = settings.ignPostSubmitWait || 0;
+  if ($('ignMaxSubmitClicks')) $('ignMaxSubmitClicks').value = settings.ignMaxSubmitClicks || 0;
 
   // Network/VPN settings
   if ($('vpnRotation'))         $('vpnRotation').checked         = settings.vpnRotation;
@@ -2539,8 +2548,15 @@ async function simulateLoginDetailed(cred, siteId, siteName, loginUrl) {
         timeout: (state.settings.loginTimeout || 60) * 1000,
         liveView: state.settings.liveView === true,
         reuseSession: state.settings.reuseSession === true,
-        postSubmitWait: state.settings.postSubmitWait || 3000,
-        maxSubmitClicks: state.settings.maxSubmitClicks || 6,
+        // Per-site overrides fall back to global when the site-specific value is 0/empty.
+        postSubmitWait:
+          (siteId === 'joe' && Number(state.settings.joePostSubmitWait) > 0 && state.settings.joePostSubmitWait) ||
+          (siteId === 'ign' && Number(state.settings.ignPostSubmitWait) > 0 && state.settings.ignPostSubmitWait) ||
+          state.settings.postSubmitWait || 3000,
+        maxSubmitClicks:
+          (siteId === 'joe' && Number(state.settings.joeMaxSubmitClicks) > 0 && state.settings.joeMaxSubmitClicks) ||
+          (siteId === 'ign' && Number(state.settings.ignMaxSubmitClicks) > 0 && state.settings.ignMaxSubmitClicks) ||
+          state.settings.maxSubmitClicks || 6,
       }),
     });
     if (!resp.ok) throw new Error(`API ${resp.status}`);
@@ -3482,6 +3498,16 @@ function wireEvents() {
   autoBind('pageLoadTimeout', 'pageLoadTimeout', v => Math.max(10, Math.min(300, parseInt(v) || 180)));
   autoBind('postSubmitWait',  'postSubmitWait',  v => Math.max(500, Math.min(15000, parseInt(v) || 3000)));
   autoBind('maxSubmitClicks', 'maxSubmitClicks', v => Math.max(1, Math.min(12, parseInt(v) || 6)));
+  // Per-site overrides — 0 means "use global"; otherwise clamped to sane ranges.
+  const siteOverride = (v, lo, hi) => {
+    const n = parseInt(v);
+    if (!n || n <= 0) return 0;
+    return Math.max(lo, Math.min(hi, n));
+  };
+  autoBind('joePostSubmitWait',  'joePostSubmitWait',  v => siteOverride(v, 500, 15000));
+  autoBind('joeMaxSubmitClicks', 'joeMaxSubmitClicks', v => siteOverride(v, 1, 12));
+  autoBind('ignPostSubmitWait',  'ignPostSubmitWait',  v => siteOverride(v, 500, 15000));
+  autoBind('ignMaxSubmitClicks', 'ignMaxSubmitClicks', v => siteOverride(v, 1, 12));
 
   const checkBind = (id, key) => {
     const el = $(id);
@@ -3579,6 +3605,8 @@ function wireEvents() {
         requeueOnFailure: true, maxRequeueCount: 3, batchDelayBetweenStartsMs: 50,
         pageLoadTimeout: 180, liveView: true,
         postSubmitWait: 3000, maxSubmitClicks: 6,
+        joePostSubmitWait: 0, joeMaxSubmitClicks: 0,
+        ignPostSubmitWait: 0, ignMaxSubmitClicks: 0,
         vpnRotation: false, dnsRotation: false, proxyRotateOnFailure: true,
         // v1.3 toggles reset to sane defaults
         useSSE: true, useShotUrls: true, reuseSession: false, encryptSecrets: false,

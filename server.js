@@ -22,6 +22,8 @@ import fs from 'fs';
 import fsp from 'fs/promises';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { PNG } from 'pngjs';
+import pixelmatch from 'pixelmatch';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -388,6 +390,71 @@ async function persistAttemptArtifacts(buf, html, runId, attempt) {
   }
   broadcast('attempt.saved', { runId, attempt, png: out.png, html: out.html });
   return out;
+}
+
+/**
+ * Generates a visual diff between two PNG buffers using pixelmatch.
+ * Writes `diff-<n>-vs-<prev>.png` into the run's debug-shots folder and a
+ * small `diff-<n>.json` with change stats. Automatically resizes the larger
+ * image down by clipping to the smaller image's dimensions so a mismatched
+ * viewport (e.g. after a layout shift) still produces a usable diff.
+ *
+ * @param {Buffer|null} prevBuf previous attempt's PNG
+ * @param {Buffer|null} curBuf  current attempt's PNG
+ * @param {string} runId
+ * @param {number} n            1-based current attempt index
+ * @returns {Promise<{url:string, changedPixels:number, totalPixels:number, changedPct:number}|null>}
+ */
+async function persistAttemptDiff(prevBuf, curBuf, runId, n) {
+  if (!prevBuf || !curBuf || n < 2) return null;
+  try {
+    const prev = PNG.sync.read(prevBuf);
+    const cur  = PNG.sync.read(curBuf);
+    const w = Math.min(prev.width,  cur.width);
+    const h = Math.min(prev.height, cur.height);
+    if (w < 2 || h < 2) return null;
+
+    // Clip both images to the common (w,h) rectangle so pixelmatch can run.
+    const clip = (src) => {
+      if (src.width === w && src.height === h) return src.data;
+      const out = Buffer.alloc(w * h * 4);
+      for (let y = 0; y < h; y++) {
+        src.data.copy(out, y * w * 4, y * src.width * 4, y * src.width * 4 + w * 4);
+      }
+      return out;
+    };
+    const prevData = clip(prev);
+    const curData  = clip(cur);
+    const diffPng  = new PNG({ width: w, height: h });
+
+    const changedPixels = pixelmatch(prevData, curData, diffPng.data, w, h, {
+      threshold: 0.12,          // per-channel tolerance (0..1) — forgiving of AA noise
+      includeAA: false,
+      alpha: 0.35,
+      diffColor: [255, 64, 64], // red = pixels that changed
+    });
+
+    const dir = path.join(SHOTS_DIR, runId);
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+    const pngPath = path.join(dir, `diff-${n}-vs-${n - 1}.png`);
+    await fsp.writeFile(pngPath, PNG.sync.write(diffPng));
+
+    const totalPixels = w * h;
+    const changedPct  = totalPixels > 0 ? (changedPixels / totalPixels) * 100 : 0;
+    const stats = {
+      url: `/shots/${runId}/diff-${n}-vs-${n - 1}.png`,
+      prevAttempt: n - 1, curAttempt: n,
+      width: w, height: h,
+      changedPixels, totalPixels,
+      changedPct: Number(changedPct.toFixed(3)),
+    };
+    try { await fsp.writeFile(path.join(dir, `diff-${n}.json`), JSON.stringify(stats, null, 2)); } catch {}
+    broadcast('attempt.diff', { runId, attempt: n, ...stats });
+    return stats;
+  } catch (err) {
+    logEvent('warn', 'attempt.diff.failed', { runId, attempt: n, error: err.message });
+    return null;
+  }
 }
 
 // ── Network Response Hooks ───────────────────────────────────────────────────
@@ -1325,6 +1392,7 @@ app.post('/api/login-check', async (req, res) => {
     attemptLog = [];
     let classification = { type: 'UNKNOWN' };
     let attempts = 0;
+    let prevAttemptBuf = null; // previous attempt's PNG buffer for visual diff
 
     for (let n = 1; n <= maxSubmitClicks; n++) {
       bail();
@@ -1352,6 +1420,12 @@ app.post('/api/login-check', async (req, res) => {
       const html = await page.content().catch(() => '');
       await persistAttemptArtifacts(buf, html, runHandle.runId, n);
 
+      // Visual diff vs previous attempt — only attempts 2..N.
+      // Gives a clear "did the page change?" signal for debugging stuck
+      // submits (zero change = page frozen / request never fired).
+      const diffStats = await persistAttemptDiff(prevAttemptBuf, buf, runHandle.runId, n);
+      prevAttemptBuf = buf;
+
       // Update the legacy 4-shot UI slots for frontend compatibility:
       //   slot 1 (SCR 2/4) = first attempt
       //   slot 2 (SCR 3/4) = latest attempt so far (overwritten each loop)
@@ -1361,7 +1435,11 @@ app.post('/api/login-check', async (req, res) => {
       attempts = n;
 
       classification = await classifyLoginOutcome(page, site);
-      attemptLog.push({ n, type: classification.type, ...(classification.perm != null ? { perm: classification.perm } : {}) });
+      attemptLog.push({
+        n, type: classification.type,
+        ...(classification.perm != null ? { perm: classification.perm } : {}),
+        ...(diffStats ? { diff: { url: diffStats.url, changedPixels: diffStats.changedPixels, changedPct: diffStats.changedPct } } : {}),
+      });
       logEvent('info', 'login.attempt', {
         runId: runHandle.runId, site, username, attempt: n,
         type: classification.type, perm: classification.perm, stage: classification.stage,
