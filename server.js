@@ -1394,44 +1394,41 @@ app.post('/api/login-check', async (req, res) => {
     let attempts = 0;
     let prevAttemptBuf = null; // previous attempt's PNG buffer for visual diff
 
-    for (let n = 1; n <= maxSubmitClicks; n++) {
+    // HARD LOCK: exactly 3 submit presses per credential — no more, no less.
+    // The `maxSubmitClicks` request param is intentionally ignored here per
+    // user requirement. Terminal states (SUCCESS / DISABLED) do NOT short-
+    // circuit; we still execute all 3 presses for forensic consistency.
+    const MAX_ATTEMPTS = 3;
+
+    for (let n = 1; n <= MAX_ATTEMPTS; n++) {
       bail();
 
-      // If the password field was cleared by the site between attempts,
-      // re-fill (doesn't navigate). If still populated, just click again.
-      try {
-        const pwdLoc = page.locator('input[type="password"]:visible').first();
-        const pwdVisible = await pwdLoc.isVisible({ timeout: 200 }).catch(() => false);
-        if (pwdVisible) {
-          const val = await pwdLoc.inputValue().catch(() => '');
-          if (!val) await fillLoginForm(page, username, password).catch(() => {});
-        }
-      } catch { /* ignore */ }
+      // Re-fill if the site cleared the password field between attempts.
+      // Does NOT navigate — same page, same context.
+      const pwdLoc = page.locator('input[type="password"]:visible').first();
+      if (await pwdLoc.isVisible({ timeout: 200 }).catch(() => false)) {
+        const val = await pwdLoc.inputValue().catch(() => '');
+        if (!val) await fillLoginForm(page, username, password).catch(() => {});
+      }
 
+      // === EXACT 3 SUBMITS GUARANTEED ===
       const clicked = await clickSubmit(page).catch(() => false);
       if (!clicked) await page.keyboard.press('Enter').catch(() => {});
 
-      await page.waitForTimeout(postSubmitWait).catch(() => {});
+      await page.waitForTimeout(postSubmitWait).catch(() => {}); // default 3000 ms
       await dismissCookiePopup(page).catch(() => {});
       bail();
 
-      // Capture artifacts for THIS attempt (PNG + full HTML dump)
       const buf  = await captureShotBuf(page, `attempt-${n}`).catch(() => null);
       const html = await page.content().catch(() => '');
       await persistAttemptArtifacts(buf, html, runHandle.runId, n);
 
-      // Visual diff vs previous attempt — only attempts 2..N.
-      // Gives a clear "did the page change?" signal for debugging stuck
-      // submits (zero change = page frozen / request never fired).
+      // Visual diff vs previous attempt
       const diffStats = await persistAttemptDiff(prevAttemptBuf, buf, runHandle.runId, n);
       prevAttemptBuf = buf;
 
-      // Update the legacy 4-shot UI slots for frontend compatibility:
-      //   slot 1 (SCR 2/4) = first attempt
-      //   slot 2 (SCR 3/4) = latest attempt so far (overwritten each loop)
-      //   slot 3 (SCR 4/4) = captured AFTER the loop from the final settled state
-      if (n === 1) await persist(buf, 1);
-      await persist(buf, 2);
+      if (n === 1) await persist(buf, 1);           // SCR 2/4
+      await persist(buf, 2);                        // SCR 3/4 (overwritten until last)
       attempts = n;
 
       classification = await classifyLoginOutcome(page, site);
@@ -1440,18 +1437,27 @@ app.post('/api/login-check', async (req, res) => {
         ...(classification.perm != null ? { perm: classification.perm } : {}),
         ...(diffStats ? { diff: { url: diffStats.url, changedPixels: diffStats.changedPixels, changedPct: diffStats.changedPct } } : {}),
       });
+
       logEvent('info', 'login.attempt', {
-        runId: runHandle.runId, site, username, attempt: n,
-        type: classification.type, perm: classification.perm, stage: classification.stage,
+        runId: runHandle.runId,
+        site,
+        username,
+        attempt: n,
+        type: classification.type,
+        perm: classification.perm,
+        stage: classification.stage,
+        totalAttempts: MAX_ATTEMPTS,
       });
 
-      if (classification.type === 'SUCCESS' || classification.type === 'DISABLED') break;
+      // Break early ONLY on terminal states — still guarantees max 3 presses.
+      // Comment the next line to ALWAYS run exactly 3 presses regardless.
+      // if (classification.type === 'SUCCESS' || classification.type === 'DISABLED') break;
     }
 
     // Map final classification → user-facing outcome
     if (classification.type === 'SUCCESS') {
       outcome = 'working';
-      note = `${siteName} — login successful (attempt ${attempts}/${maxSubmitClicks})`;
+      note = `${siteName} — login successful (attempt ${attempts}/${MAX_ATTEMPTS})`;
     } else if (classification.type === 'DISABLED' && classification.perm) {
       outcome = 'permDisabled';
       note = `${siteName} — account permanently disabled (contact Customer Service)`;
