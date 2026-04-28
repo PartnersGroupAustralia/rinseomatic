@@ -877,8 +877,9 @@ ul { list-style: none; }
 .shot-thumb {
   width: 100%;
   height: auto;
-  max-height: 220px;
+  aspect-ratio: 540 / 280;
   object-fit: cover;
+  object-position: top center;
   display: block;
   background: #111;
   cursor: zoom-in;
