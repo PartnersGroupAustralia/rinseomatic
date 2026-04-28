@@ -1,0 +1,251 @@
+#update-overlay{
+    display: none;
+    background: rgba(40, 36, 36, 0.5);
+    height: 100vh;
+    width: 100%;
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 9999;
+}
+
+#update-overlay .popup {
+    width: 90%;
+    margin-left: 5%;
+    height: 190px;
+    border-radius: 12px;
+    overflow: hidden;
+    position: relative;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.04) inset,
+      0 20px 48px rgba(0,0,0,0.65);
+    animation: popIn 0.24s cubic-bezier(0.34,1.3,0.64,1) forwards;
+    position: absolute;
+    z-index: 9;
+    top: 200px;
+}
+
+#update-overlay .dev-tool.popup{
+    top:30px;
+    width: 360px;
+}
+
+ #update-overlay .track {
+    display: flex;
+    width: 100%;
+    height: 100%;
+    transition: transform 0.38s cubic-bezier(0.65,0,0.35,1);
+  }
+ #update-overlay .track.slide { transform: translateX(-50%); }
+
+ #update-overlay .screen {
+    width: calc(100% - 32px );
+    height: 160px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 15px 18px 14px;
+    background: #0f0f14;
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 12px;
+  }
+
+  /* ── SCREEN 1 ── */
+#update-overlay  .s1-top {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    flex: 1;
+    min-height: 0;
+  }
+
+#update-overlay  a.site {
+    color: rgb(255,165,0);
+    font-weight: 600;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    text-decoration-color: rgba(255,165,0,0.45);
+    transition: text-decoration-color 0.15s;
+  }
+#update-overlay  a.site:hover { text-decoration-color: rgb(255,165,0); }
+
+#update-overlay a.s2-link {
+    color: rgba(255,255,255,0.55);
+    font-weight: 600;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    text-decoration-color: rgba(255,255,255,0.2);
+    transition: color 0.15s, text-decoration-color 0.15s;
+  }
+#update-overlay  a.s2-link:hover { color: rgba(255,255,255,0.85); text-decoration-color: rgba(255,255,255,0.5); }
+
+#update-overlay  .popup-msg {
+    flex: 1;
+    font-size: 15px;
+    font-weight: 500;
+    color: rgba(255,255,255,0.82);
+    line-height: 1.6;
+  }
+#update-overlay  .popup-msg .site { color: rgb(255,165,0); font-weight: 600; }
+#update-overlay  .popup-msg .stat { color: #fbbf24; font-weight: 600; }
+
+#update-overlay  .circle-timer {
+    flex-shrink: 0;
+    width: 44px;
+    height: 44px;
+    position: relative;
+  }
+#update-overlay  .circle-timer svg { width: 44px; height: 44px; transform: rotate(-90deg); }
+#update-overlay  .c-bg   { fill: none; stroke: rgba(255,255,255,0.07); stroke-width: 3; }
+#update-overlay  .c-prog {
+    fill: none;
+    stroke: rgb(255,140,0);
+    stroke-width: 3;
+    stroke-linecap: round;
+    stroke-dasharray: 107;
+    stroke-dashoffset: 0;
+    animation: drain 5s linear forwards;
+    filter: drop-shadow(0 0 5px rgba(255,140,0,0.6));
+  }
+ #update-overlay .circle-num {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'DM Mono', monospace;
+    font-size: 16px;
+    font-weight: 600;
+    color: rgb(255,165,0);
+  }
+
+ #update-overlay .safety-badge {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    background: rgba(74,222,128,0.07);
+    border: 1px solid rgba(74,222,128,0.17);
+    margin-top: 10px;
+  }
+#update-overlay  .safety-badge span {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #4ade80;
+    letter-spacing: 0.01em;
+  }
+ #update-overlay .safety-badge .sep { width: 1px; height: 9px; background: rgba(74,222,128,0.22); }
+
+  /* ── SCREEN 2 ── */
+ #update-overlay .s2-screen {
+    justify-content: space-between;
+    position: relative;
+    display: none;
+  }
+
+ #update-overlay .s2-info {
+    font-size: 12px;
+    font-weight: 500;
+    color: rgba(255,255,255,0.3);
+    letter-spacing: 0.01em;
+    width: calc(100% - 26px);
+  }
+
+ #update-overlay .s2-headline {
+    font-size: 15px;
+    font-weight: 600;
+    color: rgba(255,255,255,0.82);
+    line-height: 1.45;
+  }
+
+  #update-overlay .close-btn {
+    position: absolute;
+    top: 12px;
+    right: 14px;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.05);
+    color: rgba(255,255,255,0.4);
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.15s;
+  }
+ #update-overlay .close-btn:hover {
+    background: rgba(248,113,113,0.15);
+    border-color: rgba(248,113,113,0.45);
+    color: #f87171;
+    transform: scale(1.08);
+  }
+
+ #update-overlay .btn-upgrade {
+    width: 100%;
+    padding: 0;
+    border-radius: 7px;
+    border: none;
+    cursor: pointer;
+    font-family: 'DM Sans', sans-serif;
+    background: linear-gradient(135deg, rgb(242,154,0) 0%, rgb(255,140,0) 50%, rgb(255,165,0) 100%);
+    color: #fff;
+    box-shadow: 0 2px 10px rgba(255,140,0,0.35), 0 1px 0 rgba(255,255,255,0.1) inset;
+    transition: transform 0.15s, box-shadow 0.15s;
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    height: 48px;
+  }
+  #update-overlay .btn-upgrade::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: linear-gradient(180deg, rgba(255,255,255,0.1) 0%, transparent 60%);
+    pointer-events: none;
+  }
+  #update-overlay .btn-upgrade .btn-main {
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1;
+  }
+ #update-overlay .btn-upgrade .btn-sub {
+    font-size: 11px;
+    font-weight: 500;
+    opacity: 0.88;
+    letter-spacing: 0.01em;
+    color: rgba(255,255,255,0.9);
+    line-height: 1;
+  }
+ #update-overlay .btn-upgrade:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(255,140,0,0.5); }
+  #update-overlay .btn-upgrade:active { transform: translateY(0); }
+
+  .popup.stopped .c-prog { animation-play-state: paused; }
+
+  @keyframes popIn {
+    from { opacity: 0; transform: scale(0.95) translateY(8px); }
+    to   { opacity: 1; transform: scale(1) translateY(0); }
+  }
+  @keyframes drain {
+    from { stroke-dashoffset: 0; }
+    to   { stroke-dashoffset: 107; }
+  }
+
+.devtool-body #update-overlay{
+  width: 100%;
+  overflow-x: auto;
+  display: none;
+  justify-content: center;
+}
+
+.devtool-body #update-overlay .popup{
+  min-width: 360px;
+  max-width: 360px;
+  margin-top: 30px;
+}

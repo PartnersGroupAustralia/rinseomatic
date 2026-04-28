@@ -1,0 +1,386 @@
+@import url("https://fonts.googleapis.com/css2?family=Cabin:wght@700&family=Lato:wght@300;400;700;900&family=Poppins:wght@300;400;500;600;700;800;900&display=swap");
+
+*{
+    font-family: "Poppins", "sans-serif";
+}
+
+body{
+    padding: 0;
+    margin: 0;
+    font-family: "Poppins", "sans-serif";
+    font-size: 12px;
+    color:#16130e;
+}
+
+input[type=email].input-css, input[type=password].input-css, input[type=text].input-css {
+    width: 100%;
+    padding: 15px;
+    margin: 5px 0 22px 0;
+    display: inline-block;
+    border: none;
+    background: #F3F4F8;
+}
+
+ul.navheader {
+    list-style-type: none !important;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    justify-content: center;
+    background-color: #ffe0a6;
+    border-radius: 0px 0px 10px 10px;
+}
+
+li {
+  float: left;
+}
+
+li a {
+    display: block;
+    padding: 8px;
+    background-color: #ffe0a6;
+
+    color: black;
+    font-size: 17px;
+        text-decoration-line: none;
+}
+
+
+.section-one {
+    width: 80%;
+    margin-left: auto;
+    margin-right: auto;
+    margin-top: 10px;
+}
+
+
+
+#new-email, #new-password, #new-name {
+    width: 97%;
+    padding: 10px;
+    margin: 5px 0 22px 0;
+    display: inline-block;
+    border: none;
+    background: #F3F4F8;
+    border-radius: 60px;
+}
+
+.add-new-team {
+    background-color: #ffe0a6;
+    padding: 12px 0 12px 0;
+    border-radius: 18px;
+    border: unset;
+    outline: unset;
+    font-size: 16px;
+    cursor: pointer;
+}
+
+.d-block{
+    width: 100%;
+
+}
+
+.add-new-team{
+        background-color: #ffe0a6;
+}
+
+
+.team-list{
+    overflow-y: auto;
+    /*height: 400px;*/
+    list-style: none;
+    background-color: #fff;
+    border: 1px solid #d4d4d4;
+    border-radius: 10px;
+    padding-inline-end: 40px
+}
+
+.team-list li{
+    /*width: 100%;*/
+    font-size: 16px;
+    float: left;
+    color: black;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    width: 98%;
+    overflow: hidden;
+    padding: 6px;
+    cursor: pointer;
+    background-color: #fff;
+    border-bottom: 1px solid #d4d4d4;
+}
+
+.team-heading{
+    margin-top: 20px;
+}
+
+.password-section{
+    display: none;
+}
+.update-password-message, .new-team-message{
+    font-size: 15px;
+    margin-top: 16px;
+}
+
+
+.renewsub{
+    margin-bottom: 20px;
+}
+
+a.h-links{
+    padding: 4px 15px 4px 15px;
+    margin: 8px 5px 7px 5px;
+}
+
+a.active {
+    background: #16130e;
+    /*color: white;*/
+    border-radius: 24px;
+    /*padding-left: 10px;
+    padding-right: 10px;*/
+    text-decoration-line: none;
+
+    color: #ffe0a6;
+    padding: 4px 15px 4px 15px;
+    margin: 8px 5px 7px 5px;
+}
+
+a.h-links:hover {
+    background: #16130e;
+    color: #ffe0a6;
+    border-radius: 24px;
+    text-decoration-line: none;
+    padding: 4px 15px 4px 15px;
+    margin: 8px 5px 7px 5px;
+}
+
+
+.loading-view {
+    z-index: 9999999999;
+    position: absolute;
+    background: #fff;
+    top: 0;
+    bottom: 0;
+    left: 0px;
+    right: 0px;
+    opacity: .9;
+    display:none;
+    padding-top: 175px;
+}
+
+.loader {
+  border: 16px solid #f3f3f3;
+  border-radius: 50%;
+  border-top: 16px solid #3498db;
+  width: 120px;
+  height: 120px;
+  -webkit-animation: spin 2s linear infinite; /* Safari */
+  animation: spin 2s linear infinite;
+  margin:auto;
+}
+
+.upgrate-lifetime{
+    background: #ffe0a6;
+    color: black;
+    line-height: 28px;
+    border-radius: 12px;
+}
+
+
+/* Safari */
+@-webkit-keyframes spin {
+  0% { -webkit-transform: rotate(0deg); }
+  100% { -webkit-transform: rotate(360deg); }
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.password-section.section-one{
+    margin-top: 80px;
+}
+
+
+label {
+    margin: 5px;
+}
+
+.add-new-team:hover, .change-password-btn:hover {
+    background: #16130e;
+    color: #ffe0a6;
+}
+
+a:hover {
+  color: #16130e;
+}
+
+.current-plan{
+    color: black;
+    border: 1px solid black;
+    border-radius: 5px;
+    text-align: center;
+    margin: 20px;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.current-header {
+    background: #ffe0a6;
+    margin-top: 0;
+    border-radius: 5px;
+    font-size: 15px;
+}
+
+.upgrade-plan {
+    color: black;
+    border: 1px solid black;
+    border-radius: 5px;
+    text-align: center;
+    margin: 20px;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.upgrade-header {
+    background: #ffe0a6;
+    margin-top: 0;
+    border-radius: 5px;
+    font-size: 15px;
+}
+
+.cancel-plan {
+    color: black;
+    border: 1px solid black;
+    border-radius: 5px;
+    text-align: center;
+    margin: 20px;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.cancel-header {
+    background: #bc2121;
+    margin-top: 0;
+    border-radius: 3px;
+    font-size: 15px;
+    color: white;
+}
+
+button.cancle {
+    font-size: 15px;
+    padding: 6px 10px 6px 10px;
+    border-radius: 29px;
+    border: unset;
+    background: #bc2121;
+    color: white;
+    border: white 1px solid;
+    cursor: pointer;
+    margin-bottom: 5px;
+}
+
+
+.all-ps {
+    /* width: 800px; */
+ /*   display: inline-table;
+    width: 100%;*/
+    margin-top: 20px;
+    margin-bottom: 20px;
+    display: inline-block;
+}
+.card {
+    background: #ffe0a6;
+    max-width: 247px;
+    margin-left: 20px;
+    padding: 15px;
+    min-width: 247px;
+    float: left;
+    margin-top: 20px;
+}
+
+.card-title {
+    width: 100%;
+    font-size: 18px;
+}
+
+.card-price{
+    font-size: 15px;
+    margin-top: 2px;
+    margin-bottom: 2px;
+}
+
+button.buy-now {
+    margin-top: 5px;
+    padding: 5px;
+    width: 100%;
+    background:linear-gradient(45deg, #cf1818db, #ffe0a6);
+    color: black;
+    font-size: 20px;
+    text-transform: capitalize;
+    cursor: pointer;
+}
+
+.billing-section{
+    display: none;
+}
+
+.logout_modal_container{
+    display: none;
+    position: absolute;
+    width: 100vw;
+    height: 100vh;
+    background-color: rgba(0, 0, 0, 0.5);
+    justify-content: center;
+    align-items: center;
+}
+
+.logout_modal{
+    background-color: white;
+    padding: 1rem 3rem;
+    border-radius: 10px;
+}
+
+.modal_description{
+    font-size: 16px;
+    margin: 1rem auto;
+}
+
+.modal_btns{
+    text-align: center;
+}
+
+.modal_btn{
+    border: none;
+    border-radius: 7px;
+    font-size: 14px;
+    padding: 5px 11px;
+    cursor: pointer;
+}
+
+.modal_btn.confirm{
+    background-color: #bc2121;
+    color: white;
+}
+
+.modal_btn.cancel{
+    background-color: #aeaeae;
+}
+
+
+.delete-team-member:hover {
+    background: #16130e;
+    color: #ffe0a6;
+}
+
+
+.delete-team-member {
+    background-color: #f44336;
+    border-radius: 15px;
+    border: unset;
+    outline: unset;
+    cursor: pointer;
+    float: right;
+    color: white;
+}

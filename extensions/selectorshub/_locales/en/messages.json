@@ -1,0 +1,15 @@
+{
+  "language": {
+    "message": "en"
+  },
+  "extName": {
+    "message": "SelectorsHub"
+  },
+  "extDescription": {
+    "message": "Locators Plugin to Auto Generate and Verify Playwright Locators, XPath & CSS Selectors."
+  },
+  "extDefaultTitle": {
+    "message": "Locators Plugin to Auto Generate and Verify Playwright Locators, XPath & CSS Selectors."
+  }
+  
+}

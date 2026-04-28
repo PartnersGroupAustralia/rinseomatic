@@ -1,0 +1,665 @@
+#register_form{
+    display: none;
+}
+
+#email,#password,#company, #licence, .re-inputs, #re_licence {
+	width: 98%;
+	height: 30px;
+	border: none;
+	outline: none;
+	border-bottom: 1px solid #7E7E7E;
+	padding: 5px;
+	margin-bottom: 5px;
+  margin-left: 1%;
+  font-size: 13px;
+  } 
+  #submit_btn{
+	 width: 150px;
+	height: 30px;
+	border: none;
+	outline: none;
+	border-radius: 5px;
+	background: #f29a00a8;
+	color: black;
+	cursor: pointer;
+	text-align: center;
+	 margin-top: 15px;
+  }
+
+  #submit_btn, .forgetbtn, #close_btn, .re-actions, #show_reg_form, #buy_key_btn, #re_submit_btn, #upgrade_to_pro_btn {
+	width: 100%;
+	/* max-width: 320px; */
+	padding: 4px 0px;
+	background: #ffe0a6;
+	border-radius: 20px;
+	border: none;
+	outline: none;
+	color: black;
+	cursor: pointer;
+	text-align: center;
+	margin-top: 15px;
+	font-weight: 500;
+	font-size: 13px;
+	line-height: 23px;
+  }
+  
+  #show_reg_form{
+    margin-top: 3px;
+  }
+  #resend_btn{
+    background: #bd6161;
+  }
+
+  #close_btn{
+	background-color: #ff747e;
+  }
+  #login{
+	margin-top: 8px;
+	font-size: 12px;
+	color: gray;
+  }
+  
+  #login_a{
+	color: #0000FF;
+  }
+  
+  #register_form{
+    padding: 15px 15px 5px 15px
+}
+.invalid-error{
+	color: red;
+	font-size: 16px;
+}
+
+.open-login{
+	display: none;
+}
+
+.forgetbtn{
+	display: none;
+}
+
+.s-mess{
+	font-size: 16px;
+}
+
+.email-container{
+    display: none;
+}
+
+.logout-btn{
+    display: block;
+}
+
+#three-modal{
+	position: absolute;
+	top: 0;
+	left: 0;
+	width: 100vw;
+	height: 100vh;
+	background-color: rgb(0,0,0, .5);
+	display: flex;
+	justify-content: center;
+	align-items: center;
+	z-index: 50;
+	display: none;
+  }
+  .three_modal_content{
+	background-color: #ffffff;
+	position: relative;
+	padding: 1rem 2rem;
+	text-align: center;
+	font-size: 16px;
+	font-weight: 500;
+	border-radius: 5px;
+	margin: 0px 10%;
+	max-width: 550px;
+	border: 1px solid #ffe0a6;
+	margin-top: 50px;
+	text-align: left;
+  }
+
+  .item-row {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	padding: 10px 0;
+	border-bottom: 1px solid #ddd;
+  }
+  
+  .device-item {
+	flex: 1;
+	text-align: left;
+  }
+  
+  .device-close {
+	flex: 0;
+	color: red;
+	cursor: pointer;
+	text-align: right;
+  }
+
+  .close-modal{
+	text-align: right;
+  }
+
+  #registration_footer{
+    font-size: 14px;
+  }
+
+  .input-container{
+	display: block;
+  }
+
+  .update-upgrade-panel{
+	display: none !important;
+  }
+
+  .dev-login-btn{
+	color:black !important;
+  }
+
+  .after-login-footer{
+	display: none;
+  }
+
+  .after-login-footer {
+	display: flex; /* Enables flexbox layout */
+	justify-content: space-evenly; /* Evenly spaces items across the container */
+	align-items: flex-end; /* Aligns items to the bottom of the container */
+	position: absolute; /* Ensure it can be positioned relative to parent */
+	bottom: 0; /* Place it at the bottom of the parent container */
+	width: 100%; /* Ensures it spans the full width of the container */
+	padding: 2px; /* Adds some padding */
+	background-color: #f8f8f8; /* Optional background color */
+	box-shadow: 0 -2px 5px rgba(0, 0, 0, 0.1); /* Optional shadow for visual effect */
+  }
+  
+  .after-login-footer a {
+	text-decoration: none; /* Removes underline from links */
+	color: #2d2e2f; /* Sets link color */
+	font-size: 16px; /* Adjust font size */
+  }
+  
+  .after-login-footer .upgradeBtn {
+	font-weight: bold; /* Makes the Upgrade button bold */
+  }
+  
+  .after-login-footer .logout-btn {
+	font-style: italic; /* Adds a unique style for the logout link */
+  }
+
+  a.after-login, .after-login a{
+	color: #5a5a5a !important;
+  }
+
+  .profile{
+	cursor: pointer;
+  }
+
+  .patronRequestPopUp .hide-when-request{
+	display: none;
+  }
+  
+
+  .after-login.upgradeBtn{
+  	color: white !important;
+  	background: #4CAF50;
+  }
+
+  .upgradeBtn.top.after-login-top-upgrade{
+	display: none;
+	background: #4CAF50;
+  }
+
+  .upgradeBtn.top.home-login-btn{
+	display: none;
+  }
+
+
+  .upgradeBtn.home-login-btn.under-popup,  .upgradeBtn.under-popup.profile {
+    border-radius: 0px;
+    padding: 8px 4px;
+    margin-left: 12px;
+	text-align: center;
+}
+
+.three-warning{
+	font-size: 18px;
+}
+
+#profile-btn{
+	height: 23px;
+  width: 23px;
+  margin-left: -1px;
+  margin-top: 0px;
+}
+
+
+ul.navheader {
+    list-style-type: none !important;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    justify-content: space-evenly;
+    border-radius: 0px 0px 10px 10px;
+}
+
+#register_form li {
+  float: left;
+}
+
+.navheader li a {
+    display: block;
+    padding: 8px;
+    background-color: #EBEBEB;
+    color: black;
+    font-size: 15px;
+    text-decoration-line: none;
+    border-radius: 24px;
+}
+
+
+.section-one {
+    width: 80%;
+    margin-left: auto;
+    margin-right: auto;
+    margin-top: 10px;
+}
+
+
+
+#new-email, #new-password, #new-name {
+    width: 94%;
+    padding: 11px 20px;
+    margin: 5px 0 22px 0;
+    display: inline-block;
+    border: none;
+    background: #F3F4F8;
+    border-radius: 60px;
+}
+
+.add-new-team {
+    background-color: #ffe0a6;
+    padding: 7px 0px;
+    border-radius: 18px;
+    border: unset;
+    outline: unset;
+    font-size: 16px;
+    cursor: pointer;
+}
+
+.d-block{
+    width: 100%;
+}
+
+
+.team-list{
+    overflow-y: auto;
+    /*height: 400px;*/
+    list-style: none;
+    background-color: #fff;
+    border: 1px solid #d4d4d4;
+    border-radius: 10px;
+    padding-inline-end: 40px
+}
+
+.team-list li{
+    /*width: 100%;*/
+    font-size: 16px;
+    float: left;
+    color: black;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    width: 98%;
+    overflow: hidden;
+    padding: 6px;
+    cursor: pointer;
+    background-color: #fff;
+    border-bottom: 1px solid #d4d4d4;
+}
+
+.team-heading{
+    margin-top: 20px;
+}
+
+.password-section{
+    display: none;
+    position: relative;
+}
+.update-password-message, .new-team-message{
+    font-size: 15px;
+    margin-top: 16px;
+}
+
+
+.renewsub{
+    margin-bottom: 20px;
+}
+
+a.h-links{
+    padding: 4px 26px 4px 26px!important;
+    margin: 8px 5px 7px 5px;
+}
+
+a.h-links.active {
+    background: #ffe0a6 !important;
+    border-radius: 24px;
+    text-decoration-line: none;
+    color: #16130e;
+}
+
+.loading-view {
+    z-index: 9999999999;
+    position: absolute;
+    background: #fff;
+    top: 0;
+    bottom: 0;
+    left: 0px;
+    right: 0px;
+    opacity: .9;
+    display:none;
+    padding-top: 175px;
+}
+
+.loader {
+  border: 16px solid #f3f3f3;
+  border-radius: 50%;
+  border-top: 16px solid #3498db;
+  width: 120px;
+  height: 120px;
+  -webkit-animation: spin 2s linear infinite; /* Safari */
+  animation: spin 2s linear infinite;
+  margin:auto;
+}
+
+/* Safari */
+@-webkit-keyframes spin {
+  0% { -webkit-transform: rotate(0deg); }
+  100% { -webkit-transform: rotate(360deg); }
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+
+
+.cancel-header {
+    background: #bc2121;
+    margin-top: 0;
+    border-radius: 3px;
+    font-size: 15px;
+    color: white;
+}
+
+button.cancle {
+    font-size: 15px;
+    padding: 6px 10px 6px 10px;
+    border-radius: 29px;
+    border: unset;
+    background: #bc2121;
+    color: white;
+    border: white 1px solid;
+    cursor: pointer;
+    margin-bottom: 5px;
+}
+
+
+
+
+.logout_modal_container{
+    display: none;
+    position: absolute;
+    width: 100vw;
+    height: 100vh;
+    background-color: rgba(0, 0, 0, 0.5);
+    justify-content: center;
+    align-items: center;
+}
+
+.logout_modal{
+    background-color: white;
+    padding: 1rem 3rem;
+    border-radius: 10px;
+}
+
+.modal_description{
+    font-size: 16px;
+    margin: 1rem auto;
+}
+
+.modal_btns{
+    text-align: center;
+}
+
+.modal_btn{
+    border: none;
+    border-radius: 7px;
+    font-size: 14px;
+    padding: 5px 11px;
+    cursor: pointer;
+}
+
+.modal_btn.confirm{
+    background-color: #bc2121;
+    color: white;
+}
+
+.modal_btn.cancel{
+    background-color: #aeaeae;
+}
+
+
+
+.profile-tab{
+	display: none;
+}
+
+
+.logout_modal_container {
+    display: none;
+    position: absolute;
+  
+    height: 84vh;
+    background-color: rgba(0, 0, 0, 0.5);
+    justify-content: center;
+    align-items: center;
+}
+
+.footer-link:hover{
+	text-decoration: underline !important;
+}
+
+
+#subscription_plan {
+  color: blue;
+  text-decoration: underline;
+  text-align-last: center;
+  margin-bottom: 5px;
+}
+
+.heading {
+  font-size: 14px;
+  font-weight: 500;
+  color: black;
+  text-align: center;
+}
+
+.footer_support_links {
+    display: flex;
+    justify-content: space-evenly;
+}
+
+.licence-container {
+  margin-top: 20px;
+}
+
+
+.footer-link {
+    cursor: pointer;
+    background-color: #EBEBEB;
+    padding: 7px 12px 7px 12px;
+    border-radius: 7px;
+    color: black;
+}
+
+.footer-link:hover {
+  background-color: #ffe0a6;
+  text-decoration: none;
+  text-decoration-line: none !important;
+}
+
+.server-message, .re-actions, .re-otp-container, .register-container, .upgrate-lifetime{
+  display:none;
+}
+
+button.btn.btn-primay.upgrate-lifetime {
+    background: #ffe0a6;
+    color: black;
+    border-radius: 18px;
+}
+
+.header-logo-container {
+    display: flex;
+    align-items: center;
+}
+
+.header-row{
+    margin-top: 10px;
+    margin-bottom: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.image-gradient-border {
+    position: relative;
+    display: inline-block;
+    border-radius: 50%;
+    padding: 2px;
+}
+
+.image-gradient-border img {
+    display: block;
+    border-radius: inherit;
+    object-fit: cover;
+    background: #E5E5E5;
+    height: 30px;
+    width: 30px;
+    padding: 4px;
+}
+
+.image-gradient-border img:hover{
+    background-color: #FFE0A6;
+}
+
+/* .image-gradient-border.margin-right-3 {
+    margin-right: -50px;
+} */
+.image-gradient-border.margin-right-3.close-btn.close-all {
+    margin-right: 6px;
+    margin-top: -13px;
+}
+
+fieldset {
+  border: 1px solid #DADADA !important; /* reapply visible border */
+  border-radius: 20px;                   /* rounded corners */
+  padding: 1px 10px 10px 10px;                      /* inner spacing */
+  margin-bottom: 0.7rem;                /* spacing below */
+}
+
+legend {
+    width: auto;
+    padding: 0 3px;
+    font-weight: 400;
+    font-size: 14px;
+    margin-left: 19px;
+    color: #ff702e;
+}
+
+.no-key-fieldset {
+    margin-bottom: 0px;
+}
+
+.sale-message {
+    background: #ff4d18;
+    color: white;
+    position: absolute;
+    margin-left: -80px;
+    font-size: 9px;
+    margin-top: 15px;
+    border-bottom-left-radius: 12px;
+    padding-left: 10px;
+    border-top-right-radius: 12px;
+    padding-right: 6px;
+}
+
+.re-licence-input-container,#re_submit_btn{
+  display: none;
+}
+
+.have-a-key{
+  margin-bottom: 20px;
+  margin-top: 20px;
+}
+
+#register_form img{
+  height: 30px;
+}
+
+#register_form .header-logo{
+  height: 50px;
+}
+
+.header-row-1{
+  position: relative;
+}
+
+.back-btn-container {
+    position: absolute;
+    top: 36px;
+    left: -48px;
+}
+.close-btn-container{
+    position: absolute;
+    top: 36px;
+    right: -45px;
+}
+ 
+.sidebar-body .sponsor{
+  display: none;
+}
+
+.devtool-body #register_form {
+    float: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-left: 60px;
+    padding-right: 60px;
+}
+
+.devtool-body .three_modal_content {
+    background-color: #ffffff;
+    position: relative;
+    padding: 1rem 2rem;
+    text-align: center;
+    font-size: 16px;
+    font-weight: 500;
+    border-radius: 5px;
+    margin: 0px 7%;
+    /* max-width: 550px; */
+    border: 1px solid #ffe0a6;
+    margin-top: 23px;
+    text-align: left;
+    width: 300px;
+}
+
+.registration-heading{
+    text-align: center;
+    margin-bottom: 10px;
+    font-size: 16px;
+    font-weight: 600;
+}

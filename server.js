@@ -21,6 +21,8 @@ import path from 'path';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import crypto from 'crypto';
+import https from 'https';
+import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
@@ -39,9 +41,118 @@ const SHOTS_DIR    = path.join(__dirname, 'debug-shots');
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 /** Root folder for structured JSONL logs (one line per event). */
 const LOGS_DIR     = path.join(__dirname, 'logs');
-for (const d of [SHOTS_DIR, SESSIONS_DIR, LOGS_DIR]) {
+/** Root folder for preinstalled Chromium extensions (unpacked). */
+const EXTENSIONS_DIR = path.join(__dirname, 'extensions');
+for (const d of [SHOTS_DIR, SESSIONS_DIR, LOGS_DIR, EXTENSIONS_DIR]) {
   try { fs.mkdirSync(d, { recursive: true }); } catch {}
 }
+
+// ── SelectorsHub Chrome Extension (preinstalled) ────────────────────────────
+/** Chrome Web Store extension ID for SelectorsHub. */
+const SELECTORSHUB_EXT_ID = 'ndgimibanhlabgdgjcpbbndiehljcpfh';
+/** Local on-disk path where the unpacked extension lives. */
+const SELECTORSHUB_DIR    = path.join(EXTENSIONS_DIR, 'selectorshub');
+
+/** Stream-download a URL to a local file, following redirects. */
+function _httpsDownload(url, destPath, redirects = 5) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirects > 0) {
+        res.resume();
+        return _httpsDownload(res.headers.location, destPath, redirects - 1).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`download failed: HTTP ${res.statusCode} for ${url}`));
+      }
+      const out = fs.createWriteStream(destPath);
+      res.pipe(out);
+      out.on('finish', () => out.close(() => resolve(destPath)));
+      out.on('error', reject);
+    });
+    req.on('error', reject);
+  });
+}
+
+/**
+ * CRX files are a custom header followed by a regular ZIP archive.
+ *   CRX2: "Cr24" magic (4) + version (4) + pubKeyLen (4) + sigLen (4) + key + sig + zip
+ *   CRX3: "Cr24" magic (4) + version (4) + headerLen (4) + header + zip
+ * Strip the header so the resulting file is a plain ZIP we can unzip.
+ */
+function _stripCrxHeader(crxPath, zipPath) {
+  const buf = fs.readFileSync(crxPath);
+  if (buf.slice(0, 4).toString() !== 'Cr24') {
+    throw new Error('not a CRX file (bad magic)');
+  }
+  const version = buf.readUInt32LE(4);
+  let zipStart;
+  if (version === 2) {
+    const pubKeyLen = buf.readUInt32LE(8);
+    const sigLen    = buf.readUInt32LE(12);
+    zipStart = 16 + pubKeyLen + sigLen;
+  } else if (version === 3) {
+    const headerLen = buf.readUInt32LE(8);
+    zipStart = 12 + headerLen;
+  } else {
+    throw new Error(`unsupported CRX version ${version}`);
+  }
+  fs.writeFileSync(zipPath, buf.slice(zipStart));
+}
+
+/**
+ * Ensures the SelectorsHub extension is downloaded and unpacked at
+ * SELECTORSHUB_DIR. Idempotent: if a manifest.json already exists, it returns
+ * immediately. Never throws — on failure logs a warning and returns null so
+ * browser launches still succeed without the extension.
+ * @returns {Promise<string|null>} path to unpacked extension dir, or null.
+ */
+async function ensureSelectorsHubExtension() {
+  try {
+    const manifestPath = path.join(SELECTORSHUB_DIR, 'manifest.json');
+    if (fs.existsSync(manifestPath)) return SELECTORSHUB_DIR;
+    fs.mkdirSync(SELECTORSHUB_DIR, { recursive: true });
+    const tmpCrx = path.join(EXTENSIONS_DIR, `${SELECTORSHUB_EXT_ID}.crx`);
+    const tmpZip = path.join(EXTENSIONS_DIR, `${SELECTORSHUB_EXT_ID}.zip`);
+    const url =
+      `https://clients2.google.com/service/update2/crx?response=redirect` +
+      `&os=mac&arch=x64&os_arch=x86_64&nacl_arch=x86-64` +
+      `&prod=chromiumcrx&prodchannel=unknown&prodversion=124.0.0.0` +
+      `&acceptformat=crx2,crx3&x=id%3D${SELECTORSHUB_EXT_ID}%26uc`;
+    logEvent('info', 'extension.download.start', { id: SELECTORSHUB_EXT_ID });
+    await _httpsDownload(url, tmpCrx);
+    _stripCrxHeader(tmpCrx, tmpZip);
+    execFileSync('unzip', ['-o', '-q', tmpZip, '-d', SELECTORSHUB_DIR], { stdio: 'ignore' });
+    try { fs.unlinkSync(tmpCrx); } catch {}
+    try { fs.unlinkSync(tmpZip); } catch {}
+    if (!fs.existsSync(manifestPath)) throw new Error('manifest.json missing after unzip');
+    logEvent('info', 'extension.installed', { id: SELECTORSHUB_EXT_ID, dir: SELECTORSHUB_DIR });
+    return SELECTORSHUB_DIR;
+  } catch (err) {
+    logEvent('warn', 'extension.install.failed', { id: SELECTORSHUB_EXT_ID, error: String(err.message || err) });
+    return null;
+  }
+}
+
+/**
+ * Returns the Chromium launch args to load preinstalled extensions. Empty
+ * array if no extensions are available. Extensions only work in non-headless
+ * mode — caller is responsible for skipping these args for headless launches.
+ */
+function extensionLaunchArgs() {
+  const dirs = [];
+  try {
+    if (fs.existsSync(path.join(SELECTORSHUB_DIR, 'manifest.json'))) dirs.push(SELECTORSHUB_DIR);
+  } catch {}
+  if (!dirs.length) return [];
+  const list = dirs.join(',');
+  return [`--load-extension=${list}`, `--disable-extensions-except=${list}`];
+}
+
+// Kick off the install in the background so the first run isn't blocked
+// waiting for the download. Subsequent launches (after install completes)
+// will pick up the args via extensionLaunchArgs().
+ensureSelectorsHubExtension();
 // Serve screenshots at /shots/<runId>/<file>.png so the webapp can load them
 // directly from disk rather than carrying multi-MB base64 blobs in localStorage.
 app.use('/shots', express.static(SHOTS_DIR, { maxAge: '1h' }));
@@ -256,8 +367,9 @@ async function getBrowser(live) {
   const existing = browserPool[key];
   if (existing && existing.isConnected()) return existing;
 
+  if (live) await ensureSelectorsHubExtension();
   const launchArgs = live
-    ? [...BROWSER_ARGS, '--window-size=540,840', '--window-position=40,40']
+    ? [...BROWSER_ARGS, '--window-size=540,840', '--window-position=40,40', ...extensionLaunchArgs()]
     : BROWSER_ARGS;
   const b = await chromium.launch({
     headless: !live,
@@ -1236,10 +1348,12 @@ async function getPairBrowser(slot) {
   const existing = pairBrowserPool[slot];
   if (existing && existing.isConnected()) return existing;
   const xy = slot === 'joeSlot' ? '40,40' : '600,40';
+  await ensureSelectorsHubExtension();
   const args = [
     '--no-sandbox', '--disable-setuid-sandbox',
     '--disable-blink-features=AutomationControlled', '--disable-infobars',
     '--window-size=540,840', `--window-position=${xy}`,
+    ...extensionLaunchArgs(),
   ];
   const b = await chromium.launch({ headless: false, args, slowMo: 120 });
   b.on('disconnected', () => { if (pairBrowserPool[slot] === b) pairBrowserPool[slot] = null; });
@@ -2097,7 +2211,8 @@ app.post('/api/record-flow', async (req, res) => {
 
   let browser;
   try {
-    browser = await chromium.launch({ headless: false, args: ['--window-size=1280,800'] });
+    await ensureSelectorsHubExtension();
+    browser = await chromium.launch({ headless: false, args: ['--window-size=1280,800', ...extensionLaunchArgs()] });
     const context = await browser.newContext({
       viewport: { width: 1280, height: 800 },
       ignoreHTTPSErrors: true,
