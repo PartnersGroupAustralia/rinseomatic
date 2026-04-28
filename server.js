@@ -1491,18 +1491,29 @@ async function runPairSide({ slot, siteId, username, password, loginUrl, timeout
         const val = await pwdLoc.inputValue().catch(() => '');
         if (!val) await fillLoginForm(page, username, password).catch(() => {});
       }
-      // PAIR mode: prefer the canonical #loginSubmit button on both sites,
-      // fall back to clickSubmit/Enter if it isn't present for some reason.
+      // PAIR mode: press Enter from the password field as the FIRST option
+      // (overrides any prior rule). Fall back to #loginSubmit, then the
+      // generic clickSubmit helper, then a bare Enter on whatever is focused.
       let clicked = false;
       try {
-        const sub = page.locator('#loginSubmit').first();
-        if ((await sub.count()) > 0) {
-          await sub.click({ timeout: 1500, force: false }).catch(async () => {
-            await sub.evaluate(n => n.click()).catch(() => {});
-          });
+        const pwd = page.locator('input[type="password"]:visible').first();
+        if (await pwd.isVisible({ timeout: 200 }).catch(() => false)) {
+          await pwd.focus().catch(() => {});
+          await pwd.press('Enter').catch(() => {});
           clicked = true;
         }
       } catch {}
+      if (!clicked) {
+        try {
+          const sub = page.locator('#loginSubmit').first();
+          if ((await sub.count()) > 0) {
+            await sub.click({ timeout: 1500, force: false }).catch(async () => {
+              await sub.evaluate(n => n.click()).catch(() => {});
+            });
+            clicked = true;
+          }
+        } catch {}
+      }
       if (!clicked) clicked = await clickSubmit(page).catch(() => false);
       if (!clicked) await page.keyboard.press('Enter').catch(() => {});
       await page.waitForTimeout(postSubmitWait).catch(() => {});
