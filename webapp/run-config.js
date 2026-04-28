@@ -6,8 +6,8 @@
 /** @constant {string} Joe Fortune casino login URL. */
 export const JOE_LOGIN_URL = 'https://joefortunepokies.win/login';
 
-/** @constant {string} Ignition Casino login URL — mirrored from Joe Fortune. */
-export const IGNITION_LOGIN_URL = 'https://joefortunepokies.win/login';
+/** @constant {string} Ignition Casino login URL. */
+export const IGNITION_LOGIN_URL = 'https://ignitioncasino.ooo/login';
 
 /**
  * Returns the login URL for the given site identifier.

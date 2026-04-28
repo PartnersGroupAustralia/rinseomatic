@@ -506,7 +506,7 @@ let state = {
     ppsrUrl: 'https://transact.ppsr.gov.au/CarCheck/',
     // Target login URLs (editable in Settings → Target URLs)
     joeLoginUrl: 'https://joefortunepokies.win/login',
-    ignitionLoginUrl: 'https://joefortunepokies.win/login',
+    ignitionLoginUrl: 'https://ignitioncasino.ooo/login',
     // Login checker
     loginConcurrency: 3,
     loginTimeout: 60,
@@ -1527,7 +1527,7 @@ function renderFlowRecorder() {
       const saved = flow && !Array.isArray(flow) ? flow.url : '';
       const fallback = site === 'joe'
         ? (state.settings.joeLoginUrl || 'https://joefortunepokies.win/login')
-        : (state.settings.ignitionLoginUrl || 'https://joefortunepokies.win/login');
+        : (state.settings.ignitionLoginUrl || 'https://ignitioncasino.ooo/login');
       urlInput.value = saved || fallback;
     }
 
@@ -1630,7 +1630,7 @@ async function startFlowRecording(site) {
   const typed    = (urlInput && urlInput.value || '').trim();
   const fallback = site === 'joe'
     ? (state.settings.joeLoginUrl || 'https://joefortunepokies.win/login')
-    : (state.settings.ignitionLoginUrl || 'https://joefortunepokies.win/login');
+    : (state.settings.ignitionLoginUrl || 'https://ignitioncasino.ooo/login');
   const loginUrl = typed || fallback;
   try { new URL(loginUrl); }
   catch { toast('Enter a valid URL (including https://) to record on', 'error'); return; }
@@ -3384,7 +3384,7 @@ function wireEvents() {
         debugScreenshots: true, testEmail: '',
         ppsrUrl: 'https://transact.ppsr.gov.au/CarCheck/',
         joeLoginUrl: 'https://joefortunepokies.win/login',
-        ignitionLoginUrl: 'https://joefortunepokies.win/login',
+        ignitionLoginUrl: 'https://ignitioncasino.ooo/login',
         loginConcurrency: 3, loginTimeout: 60, useEmailRotation: false, theme: 'dark',
         typingSpeedMinMs: 50, typingSpeedMaxMs: 150, requeueOnTimeout: true,
         requeueOnFailure: true, maxRequeueCount: 3, batchDelayBetweenStartsMs: 50,
