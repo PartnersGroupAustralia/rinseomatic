@@ -257,7 +257,7 @@ async function getBrowser(live) {
   if (existing && existing.isConnected()) return existing;
 
   const launchArgs = live
-    ? [...BROWSER_ARGS, '--window-size=540,420', '--window-position=40,40']
+    ? [...BROWSER_ARGS, '--window-size=540,840', '--window-position=40,40']
     : BROWSER_ARGS;
   const b = await chromium.launch({
     headless: !live,
@@ -554,7 +554,8 @@ async function captureShotBuf(page, label) {
         document.body.appendChild(el);
       }, [BADGE_ID, label]).catch(() => {});
     }
-    const buf = await page.screenshot({ fullPage: false, type: 'png' });
+    await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+    const buf = await page.screenshot({ fullPage: true, type: 'png' });
     if (label) {
       await page.evaluate((id) => { document.getElementById(id)?.remove(); }, BADGE_ID).catch(() => {});
     }
@@ -1286,7 +1287,7 @@ app.post('/api/login-check', async (req, res) => {
     const browser = await getBrowser(!!liveView);
     const storageState = reuseSession ? await loadStorageState(site, username) : undefined;
     context = await browser.newContext({
-      viewport: liveView ? { width: 540, height: 420 } : { width: 1280, height: 800 },
+      viewport: liveView ? { width: 540, height: 840 } : { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: true,
       storageState,
