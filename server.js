@@ -155,9 +155,9 @@ app.get('/api/runs', (_req, res) => {
  * or captcha signal on that domain.
  */
 const DOMAIN_THROTTLE = {
-  'joefortunepokies.win': { minDelayMs: 0,    jitterMs: 400, backoffMs: 0 },
-  'ignitioncasino.ooo':   { minDelayMs: 0,    jitterMs: 600, backoffMs: 0 },
-  _default:               { minDelayMs: 0,    jitterMs: 200, backoffMs: 0 },
+  'joefortunepokies.win': { minDelayMs: 0,    jitterMs: 0, backoffMs: 0 },
+  'ignitioncasino.ooo':   { minDelayMs: 0,    jitterMs: 0, backoffMs: 0 },
+  _default:               { minDelayMs: 0,    jitterMs: 0, backoffMs: 0 },
 };
 /** Last time each domain was hit — used to compute remaining wait. */
 const _domainLastHit = new Map();
