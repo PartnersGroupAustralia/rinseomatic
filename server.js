@@ -1412,6 +1412,7 @@ async function runPairSide({ slot, siteId, username, password, loginUrl, timeout
     });
 
     bail();
+    const windowOpenedAt = Date.now();
     try {
       await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout });
     } catch (navErr) {
@@ -1426,6 +1427,44 @@ async function runPairSide({ slot, siteId, username, password, loginUrl, timeout
     await page.waitForTimeout(700);
     bail();
     await persist(await captureShotBuf(page, 'PAIR 1/4').catch(() => null), 0);
+
+    // PAIR-ONLY cookie gate: do not start the submit-press loop until the
+    // cookie notice is dismissed in this window. Hard ceiling of 8s from the
+    // moment this window was opened (page.goto). Runs even if the first
+    // dismissCookiePopup above already clicked — re-checks visibility.
+    const isCookieBannerVisible = async () => {
+      const bannerSelectors = [
+        '[class*="cookie-banner"]', '[class*="cookie-notice"]', '[class*="cookie-consent"]',
+        '[id*="cookie-banner"]', '[id*="cookie-notice"]', '[id*="cookie-consent"]',
+        '#onetrust-banner-sdk', '#CybotCookiebotDialog', '.truste_overlay', '#didomi-host',
+        '[class*="gdpr" i]', '[class*="consent" i]:not(input):not(form)',
+        '[aria-label*="cookie" i]', '[role="dialog"][class*="cookie" i]',
+      ];
+      for (const sel of bannerSelectors) {
+        try {
+          const el = page.locator(sel).first();
+          if ((await el.count()) > 0 && await el.isVisible({ timeout: 80 }).catch(() => false)) return true;
+        } catch {}
+      }
+      return false;
+    };
+    const COOKIE_GATE_MS = 8000;
+    let cookieGateOutcome = 'absent';
+    while (Date.now() - windowOpenedAt < COOKIE_GATE_MS) {
+      bail();
+      const visible = await isCookieBannerVisible();
+      if (!visible) { cookieGateOutcome = 'dismissed'; break; }
+      await dismissCookiePopup(page).catch(() => {});
+      await page.waitForTimeout(200).catch(() => {});
+      if (!(await isCookieBannerVisible())) { cookieGateOutcome = 'dismissed'; break; }
+    }
+    if (cookieGateOutcome !== 'dismissed' && (Date.now() - windowOpenedAt) >= COOKIE_GATE_MS) {
+      cookieGateOutcome = 'timeout';
+    }
+    logEvent('info', 'pair.cookieGate', {
+      runId, siteId, outcome: cookieGateOutcome,
+      elapsedMs: Date.now() - windowOpenedAt,
+    });
 
     frozen = true;
     await page.evaluate(() => {
