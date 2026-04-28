@@ -1081,11 +1081,6 @@ async function waitForLoginResponse(page, maxWaitMs = RESPONSE_POLL_MS, site = '
     if (/your email and\/or password remain incorrect.*further failed attempt/i.test(body)) return RESP.WRONG_PASS_2;
     if (/oops.*your email and\/or password are incorrect.*caps lock/i.test(body)) return RESP.WRONG_PASS_1;
 
-    // Ignition-specific wrong-password text
-    if (site === 'ign') {
-      if (/incorrect (email|username|password)|invalid (email|username|password|credentials)/i.test(body)) return RESP.WRONG_PASS_1;
-    }
-
     // ── Success: URL must have left the login page AND auth-only signals ──
     const isOffLoginPage = !url.includes('/login')
       && !url.includes('/sign-in')
@@ -1114,24 +1109,14 @@ async function isLoggedIn(page, site) {
   try {
     // 1. Auth-only DOM elements — logout button / profile menu / balance chip.
     //    These are absent when logged out.
-    const authOnlyLocators = site === 'ign'
-      ? [
-          'a:has-text("Log Out")', 'a:has-text("Log out")', 'a:has-text("Logout")',
-          'button:has-text("Log Out")', 'button:has-text("Logout")',
-          '[data-testid*="logout" i]',
-          '[class*="user-menu"]', '[class*="account-menu"]',
-          '[class*="balance"]', '[data-testid*="balance" i]',
-          'a[href*="/cashier"]', 'a[href*="/account"]:has-text("Account")',
-          'button:has-text("Deposit")',
-        ]
-      : [
-          // Joe Fortune: logout link, balance, user avatar, deposit button
-          'a:has-text("Logout")', 'a:has-text("Log Out")', 'a:has-text("Sign Out")',
-          'button:has-text("Logout")', 'button:has-text("Deposit")',
-          '[class*="user-avatar"]', '[class*="profile-avatar"]',
-          '[class*="balance"]', '[data-testid*="balance" i]',
-          'a[href*="/account"]', 'a[href*="/cashier"]',
-        ];
+    // Joe Fortune locator list applied to all sites (Ignition mirrored from Joe).
+    const authOnlyLocators = [
+      'a:has-text("Logout")', 'a:has-text("Log Out")', 'a:has-text("Sign Out")',
+      'button:has-text("Logout")', 'button:has-text("Deposit")',
+      '[class*="user-avatar"]', '[class*="profile-avatar"]',
+      '[class*="balance"]', '[data-testid*="balance" i]',
+      'a[href*="/account"]', 'a[href*="/cashier"]',
+    ];
 
     for (const sel of authOnlyLocators) {
       const el = page.locator(sel).first();
@@ -1189,9 +1174,6 @@ async function classifyLoginOutcome(page, site) {
     }
     if (/oops.*your email and\/or password are incorrect/i.test(body)
         || /email and\/or password are incorrect/i.test(body)) {
-      return { type: 'BAD_CREDS', stage: 1 };
-    }
-    if (site === 'ign' && /incorrect (email|username|password)|invalid (email|username|password|credentials)/i.test(body)) {
       return { type: 'BAD_CREDS', stage: 1 };
     }
 
@@ -1342,9 +1324,8 @@ app.post('/api/login-check', async (req, res) => {
         shotUrls,
       });
     }
-    // Ignition takes longer to paint the login overlay + cookie banner.
-    // Wait 6000ms for Ignition, 2000ms for all other sites.
-    const initialLoadWait = site === 'ign' ? 6000 : 2000;
+    // Joe Fortune timing applied to all sites (Ignition mirrored from Joe).
+    const initialLoadWait = 2000;
     await page.waitForTimeout(initialLoadWait);
     await dismissCookiePopup(page);
 
