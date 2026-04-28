@@ -1448,7 +1448,7 @@ async function runPairSide({ slot, siteId, username, password, loginUrl, timeout
       }
       return false;
     };
-    const COOKIE_GATE_MS = 8000;
+    const COOKIE_GATE_MS = 7000;
     let cookieGateOutcome = 'absent';
     while (Date.now() - windowOpenedAt < COOKIE_GATE_MS) {
       bail();
@@ -1480,7 +1480,7 @@ async function runPairSide({ slot, siteId, username, password, loginUrl, timeout
       } catch {}
     }).catch(() => {});
 
-    const MAX_ATTEMPTS = 3;
+    const MAX_ATTEMPTS = 4;
     let classification = { type: 'UNKNOWN' };
     let attempts = 0;
     let prevAttemptBuf = null;
@@ -1491,7 +1491,19 @@ async function runPairSide({ slot, siteId, username, password, loginUrl, timeout
         const val = await pwdLoc.inputValue().catch(() => '');
         if (!val) await fillLoginForm(page, username, password).catch(() => {});
       }
-      const clicked = await clickSubmit(page).catch(() => false);
+      // PAIR mode: prefer the canonical #loginSubmit button on both sites,
+      // fall back to clickSubmit/Enter if it isn't present for some reason.
+      let clicked = false;
+      try {
+        const sub = page.locator('#loginSubmit').first();
+        if ((await sub.count()) > 0) {
+          await sub.click({ timeout: 1500, force: false }).catch(async () => {
+            await sub.evaluate(n => n.click()).catch(() => {});
+          });
+          clicked = true;
+        }
+      } catch {}
+      if (!clicked) clicked = await clickSubmit(page).catch(() => false);
       if (!clicked) await page.keyboard.press('Enter').catch(() => {});
       await page.waitForTimeout(postSubmitWait).catch(() => {});
       await dismissCookiePopup(page).catch(() => {});
