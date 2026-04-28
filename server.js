@@ -1196,6 +1196,37 @@ async function classifyLoginOutcome(page, site) {
 }
 
 // ── PAIRED MODE (experimental — completely isolated from single-site flow) ──
+// Rotating UA pool used ONLY by the paired endpoint. Each credential gets a
+// fresh UA picked round-robin; both sides of the pair share the same UA so
+// the two windows look like the same client hitting two different sites.
+const PAIR_USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1',
+  'Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+  'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+  'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36',
+  'Mozilla/5.0 (Linux; Android 14; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+];
+let _pairUaIndex = 0;
+function nextPairUserAgent() {
+  const ua = PAIR_USER_AGENTS[_pairUaIndex % PAIR_USER_AGENTS.length];
+  _pairUaIndex = (_pairUaIndex + 1) % PAIR_USER_AGENTS.length;
+  return ua;
+}
 // Adds a new automation lane that opens TWO live browser windows side-by-side
 // (Joe on the left, Ignition on the right) and tests the SAME credential
 // pair in parallel against both sites. Implemented as 100% additive code:
@@ -1228,7 +1259,7 @@ function runPairExclusive(fn) {
  * navigation, classify, screenshots) but runs against a pre-allocated browser
  * for its dedicated window slot. Returns a per-side result object.
  */
-async function runPairSide({ slot, siteId, username, password, loginUrl, timeout, postSubmitWait, runId, signal }) {
+async function runPairSide({ slot, siteId, username, password, loginUrl, timeout, postSubmitWait, runId, signal, userAgent }) {
   const sideTag = `${siteId}_pair`;
   const shotBufs = [null, null, null, null];
   const shotUrls = ['', '', '', ''];
@@ -1248,7 +1279,7 @@ async function runPairSide({ slot, siteId, username, password, loginUrl, timeout
     const browser = await getPairBrowser(slot);
     context = await browser.newContext({
       viewport: { width: 540, height: 840 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      userAgent: userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: true,
     });
     const page = await context.newPage();
@@ -1389,18 +1420,20 @@ app.post('/api/login-check-pair', async (req, res) => {
   const runHandle = startRun({ kind: 'pair', username, joeUrl, ignUrl });
   await runPairExclusive(async () => {
     const signal = runHandle.controller.signal;
+    const userAgent = nextPairUserAgent();
+    logEvent('info', 'pair.ua.rotate', { runId: runHandle.runId, username, userAgent });
     let joeRes, ignRes;
     try {
       [joeRes, ignRes] = await Promise.all([
-        runPairSide({ slot: 'joeSlot', siteId: 'joe', username, password, loginUrl: joeUrl, timeout, postSubmitWait, runId: runHandle.runId, signal }),
-        runPairSide({ slot: 'ignSlot', siteId: 'ign', username, password, loginUrl: ignUrl, timeout, postSubmitWait, runId: runHandle.runId, signal }),
+        runPairSide({ slot: 'joeSlot', siteId: 'joe', username, password, loginUrl: joeUrl, timeout, postSubmitWait, runId: runHandle.runId, signal, userAgent }),
+        runPairSide({ slot: 'ignSlot', siteId: 'ign', username, password, loginUrl: ignUrl, timeout, postSubmitWait, runId: runHandle.runId, signal, userAgent }),
       ]);
     } catch (err) {
       logEvent('error', 'pair.run.error', { runId: runHandle.runId, error: err.message });
     } finally {
       endRun(runHandle, { kind: 'pair', username });
     }
-    broadcast('pair.result', { runId: runHandle.runId, username, joe: joeRes, ign: ignRes });
+    broadcast('pair.result', { runId: runHandle.runId, username, joe: joeRes, ign: ignRes, userAgent });
     if (!res.headersSent) res.json({
       runId: runHandle.runId,
       joe: joeRes || { outcome: 'noAcc', note: 'Joe side failed to start', shotUrls: ['','','',''], shots: ['','','',''], attempts: [] },
