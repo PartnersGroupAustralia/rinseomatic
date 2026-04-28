@@ -217,6 +217,11 @@
       <span class="tab-label">Ignition</span>
       <span id="ignitionBadge" class="badge hidden">0</span>
     </button>
+    <button class="tab-btn" data-tab="pair">
+      <span class="tab-icon">⚡</span>
+      <span class="tab-label">Both</span>
+      <span id="pairBadge" class="badge hidden">0</span>
+    </button>
     <button class="tab-btn" data-tab="sessions">
       <span class="tab-icon">📋</span><span class="tab-label">Sessions</span>
     </button>
@@ -438,6 +443,59 @@
         <div class="batch-bar hidden" id="ignBatchBar">
           <button class="btn-outline" id="ignCheckSelectedBtn">▶ Check Selected</button>
           <span id="ignSelectedCount" class="selected-count"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════ BOTH (PAIRED) ═══════ -->
+    <section class="tab-panel" id="tab-pair">
+      <div class="panel-scroll">
+        <div class="toolbar">
+          <div class="site-tag pair">⚡ Both (Joe + Ignition)</div>
+          <div class="toolbar-actions">
+            <button class="icon-text-btn danger" id="clearPairBtn">🗑</button>
+            <button class="icon-text-btn" id="importPairBtn">＋ Import</button>
+          </div>
+        </div>
+        <div class="login-stat-row">
+          <div class="login-stat"><div class="login-stat-num" id="pairStatTotal">0</div><div class="login-stat-label">Total</div></div>
+          <div class="login-stat"><div class="login-stat-num green" id="pairStatBoth">0</div><div class="login-stat-label">Both Working</div></div>
+          <div class="login-stat"><div class="login-stat-num green" id="pairStatEither">0</div><div class="login-stat-label">Either Working</div></div>
+          <div class="login-stat"><div class="login-stat-num red" id="pairStatNone">0</div><div class="login-stat-label">Neither</div></div>
+        </div>
+        <div class="status-card">
+          <div class="status-left">
+            <span class="status-dot" id="pairStatusDot"></span>
+            <span id="pairStatusLabel">Idle</span>
+          </div>
+          <div class="status-right">
+            <button id="pairRunBtn" class="run-btn">▶ Run Both</button>
+            <button id="pairStopBtn" class="stop-btn hidden">■ Stop</button>
+          </div>
+        </div>
+        <div class="toolbar" style="padding-top:4px">
+          <span class="toolbar-title" id="pairCredsTitle">Credentials (0)</span>
+          <div class="toolbar-actions">
+            <button class="icon-text-btn" id="pairExportBtn">📤 Export</button>
+          </div>
+        </div>
+        <div class="filter-row" id="pairFilterRow">
+          <button class="filter-chip active" data-filter="all" data-site="pair">All</button>
+          <button class="filter-chip" data-filter="untested" data-site="pair">Untested</button>
+          <button class="filter-chip" data-filter="both" data-site="pair">✅ Both</button>
+          <button class="filter-chip" data-filter="either" data-site="pair">◐ Either</button>
+          <button class="filter-chip" data-filter="none" data-site="pair">❌ Neither</button>
+        </div>
+        <div id="pairEmpty" class="empty-state">
+          <div class="empty-icon">⚡</div>
+          <div class="empty-title">No Paired Credentials</div>
+          <div class="empty-sub">Import username:password pairs. Each will be tested against Joe AND Ignition simultaneously in two side-by-side windows.</div>
+          <button class="btn-primary" id="importPairBtn2">＋ Import Credentials</button>
+        </div>
+        <ul class="card-list" id="pairCredList"></ul>
+        <div class="batch-bar hidden" id="pairBatchBar">
+          <button class="btn-outline" id="pairCheckSelectedBtn">▶ Check Selected</button>
+          <span id="pairSelectedCount" class="selected-count"></span>
         </div>
       </div>
     </section>

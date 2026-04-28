@@ -54,6 +54,7 @@ const KEY_GROK_API   = 'sitcho_grok_api';
 const KEY_JOE_CREDS  = 'sitcho_joe_creds';
 /** @constant {string} localStorage key for Ignition Casino credentials array. */
 const KEY_IGN_CREDS  = 'sitcho_ign_creds';
+const KEY_PAIR_CREDS = 'sitcho_pair_creds';
 /** @constant {string} localStorage key for debug screenshot array. */
 const KEY_DEBUG_SHOTS = 'sitcho_debug_shots';
 /** @constant {string} localStorage key for activity log array. */
@@ -479,6 +480,8 @@ let state = {
   joeCreds: [],
   /** @type {Array} Ignition Casino credential objects. */
   ignCreds: [],
+  /** @type {Array} Paired credential objects ({id, username, password, joeStatus, ignStatus, joeDetail, ignDetail, testHistory}). */
+  pairCreds: [],
   /** @type {Array} WireGuard config objects parsed from imported .conf files. */
   wireGuardConfigs: [],
   /** @type {Array<{id:string, username:string, ts:number, note:string}>} Blacklisted usernames — auto-marked as Perm Disabled on import. */
@@ -553,6 +556,14 @@ let state = {
   joeRunning: false,
   /** @type {boolean} True while Ignition login run is active. */
   ignRunning: false,
+  /** @type {boolean} True while paired login run is active. */
+  pairRunning: false,
+  /** @type {AbortController|null} Active AbortController for the paired run. */
+  pairAbortController: null,
+  /** @type {Set<string>} IDs of selected paired credentials. */
+  selectedPairIds: new Set(),
+  /** @type {string} Current filter for Paired credentials list. */
+  pairFilter: 'all',
   /** @type {string} ID of the currently active tab panel. */
   activeTab: 'dashboard',
   /** @type {string} Current filter applied to the sessions list. */
@@ -602,6 +613,8 @@ function saveSettings() { localStorage.setItem(KEY_SETTINGS, JSON.stringify(stat
 function saveJoeCreds() { localStorage.setItem(KEY_JOE_CREDS, JSON.stringify(state.joeCreds)); }
 /** @description Serialises and saves the Ignition Casino credentials array to localStorage. */
 function saveIgnCreds() { localStorage.setItem(KEY_IGN_CREDS, JSON.stringify(state.ignCreds)); }
+/** @description Serialises and saves the Paired credentials array to localStorage. */
+function savePairCreds() { try { localStorage.setItem(KEY_PAIR_CREDS, JSON.stringify(state.pairCreds)); } catch {} }
 /** @description Serialises and saves the activity log (max 100 entries) to localStorage. */
 function saveActivity() {
   try { localStorage.setItem(KEY_ACTIVITY, JSON.stringify(state.activity.slice(0, 100))); } catch {}
@@ -669,6 +682,7 @@ function loadAll() {
   try { state.debugShots    = JSON.parse(localStorage.getItem(KEY_DEBUG_SHOTS)) || []; } catch { state.debugShots = []; }
   try { state.joeCreds      = JSON.parse(localStorage.getItem(KEY_JOE_CREDS))  || []; } catch { state.joeCreds = []; }
   try { state.ignCreds      = JSON.parse(localStorage.getItem(KEY_IGN_CREDS))  || []; } catch { state.ignCreds = []; }
+  try { state.pairCreds     = JSON.parse(localStorage.getItem(KEY_PAIR_CREDS)) || []; } catch { state.pairCreds = []; }
   try { state.activity      = JSON.parse(localStorage.getItem(KEY_ACTIVITY))   || []; } catch { state.activity = []; }
   try { state.wireGuardConfigs = JSON.parse(localStorage.getItem(KEY_WG_CONFIGS)) || []; } catch { state.wireGuardConfigs = []; }
   try { state.blacklist        = JSON.parse(localStorage.getItem(KEY_BLACKLIST))   || []; } catch { state.blacklist = []; }
@@ -1185,6 +1199,7 @@ function renderAll() {
   renderWorking();
   renderCredSite('joe');
   renderCredSite('ign');
+  renderPair();
   renderSessions();
   renderSettings();
   renderBlacklist();
@@ -1343,7 +1358,7 @@ let importCredParsed = [];
  */
 function openImportCred(site) {
   state.importCredSite = site;
-  const siteName = site === 'joe' ? 'Joe Fortune' : 'Ignition';
+  const siteName = site === 'joe' ? 'Joe Fortune' : site === 'pair' ? 'Paired (Joe + Ignition)' : 'Ignition';
   $('importCredTitle').textContent = `Import ${siteName} Credentials`;
   $('importCredText').value = '';
   $('importCredFeedback').innerHTML = '<span class="hint-text">Formats: user:pass · user|pass · user;pass · user,pass · user pass</span>';
@@ -1373,7 +1388,8 @@ function onImportCredInput() {
   if (!site) { toast('Import session lost — please reopen', 'error'); return; }
   const text     = $('importCredText').value;
   const allParsed = smartParseCreds(text);
-  const existing  = new Set((site === 'joe' ? state.joeCreds : state.ignCreds).map(c => c.username + ':' + c.password));
+  const targetCreds = site === 'joe' ? state.joeCreds : site === 'pair' ? state.pairCreds : state.ignCreds;
+  const existing  = new Set(targetCreds.map(c => c.username + ':' + c.password));
   importCredParsed = allParsed.filter(c => !existing.has(c.username + ':' + c.password));
   const dupes = allParsed.length - importCredParsed.length;
 
@@ -1413,6 +1429,17 @@ function confirmImportCred() {
     return c;
   });
   if (site === 'joe') { state.joeCreds.push(...toImport); saveJoeCreds(); }
+  else if (site === 'pair') {
+    const pairImport = toImport.map(c => ({
+      id: c.id || crypto.randomUUID(),
+      username: c.username, password: c.password,
+      joeStatus: CredStatus.UNTESTED, ignStatus: CredStatus.UNTESTED,
+      joeDetail: '', ignDetail: '',
+      testHistory: [], addedAt: Date.now(),
+    }));
+    state.pairCreds.push(...pairImport);
+    savePairCreds();
+  }
   else                { state.ignCreds.push(...toImport); saveIgnCreds(); }
   let msg = `Added ${toImport.length} credential(s)`;
   if (blacklistedCount > 0) msg += ` — ${blacklistedCount} auto-marked Perm Disabled (blacklist)`;
@@ -2425,6 +2452,244 @@ async function simulateCheckDetailed(card, ppsrUrl) {
 }
 
 
+// ── Paired login (experimental — Both tab) ─────────────────
+/**
+ * Renders the Paired credentials list and stats. Mirrors renderCredSite shape
+ * but each credential carries TWO status badges (Joe + Ignition).
+ */
+function renderPair() {
+  const creds     = state.pairCreds;
+  const filter    = state.pairFilter;
+  const selIds    = state.selectedPairIds;
+  const isRunning = state.pairRunning;
+
+  const total    = creds.length;
+  const both     = creds.filter(c => c.joeStatus === CredStatus.WORKING && c.ignStatus === CredStatus.WORKING).length;
+  const either   = creds.filter(c => (c.joeStatus === CredStatus.WORKING) !== (c.ignStatus === CredStatus.WORKING)).length;
+  const none     = creds.filter(c => c.joeStatus !== CredStatus.WORKING && c.ignStatus !== CredStatus.WORKING && (c.joeStatus !== CredStatus.UNTESTED || c.ignStatus !== CredStatus.UNTESTED)).length;
+  const untested = creds.filter(c => c.joeStatus === CredStatus.UNTESTED && c.ignStatus === CredStatus.UNTESTED).length;
+
+  $('pairStatTotal').textContent  = total;
+  $('pairStatBoth').textContent   = both;
+  $('pairStatEither').textContent = either;
+  $('pairStatNone').textContent   = none;
+  updateBadge('pairBadge', both);
+
+  $('pairStatusDot').className = 'status-dot' + (isRunning ? ' running' : '');
+  $('pairStatusLabel').textContent = isRunning ? 'Running…' : 'Idle';
+  $('pairRunBtn').classList.toggle('hidden', isRunning || untested === 0);
+  $('pairStopBtn').classList.toggle('hidden', !isRunning);
+  $('pairCredsTitle').textContent = `Credentials (${total})`;
+
+  let visible = creds;
+  if (filter === 'untested')   visible = creds.filter(c => c.joeStatus === CredStatus.UNTESTED && c.ignStatus === CredStatus.UNTESTED);
+  else if (filter === 'both')  visible = creds.filter(c => c.joeStatus === CredStatus.WORKING && c.ignStatus === CredStatus.WORKING);
+  else if (filter === 'either')visible = creds.filter(c => (c.joeStatus === CredStatus.WORKING) !== (c.ignStatus === CredStatus.WORKING));
+  else if (filter === 'none')  visible = creds.filter(c => c.joeStatus !== CredStatus.WORKING && c.ignStatus !== CredStatus.WORKING && (c.joeStatus !== CredStatus.UNTESTED || c.ignStatus !== CredStatus.UNTESTED));
+
+  const listEl  = $('pairCredList');
+  const emptyEl = $('pairEmpty');
+  const batchEl = $('pairBatchBar');
+
+  if (total === 0) {
+    emptyEl.classList.remove('hidden');
+    listEl.innerHTML = '';
+    batchEl.classList.add('hidden');
+    return;
+  }
+  emptyEl.classList.add('hidden');
+
+  if (visible.length === 0) {
+    const li = document.createElement('li');
+    li.className = 'cred-empty-filter';
+    li.textContent = `No credentials match the "${filter}" filter.`;
+    listEl.replaceChildren(li);
+    const n = selIds.size;
+    batchEl.classList.toggle('hidden', n === 0);
+    $('pairSelectedCount').textContent = n > 0 ? `${n} selected` : '';
+    $('pairCheckSelectedBtn').textContent = `▶ Check Selected (${n})`;
+    return;
+  }
+
+  listEl.innerHTML = visible.map(c => {
+    const sel = selIds.has(c.id);
+    const checking = c.joeStatus === CredStatus.TESTING || c.ignStatus === CredStatus.TESTING;
+    const lbl = (s) => credStatusLabel(s);
+    return `
+    <li class="card-item cred-item${sel ? ' selected' : ''}${checking ? ' checking' : ''}" data-id="${c.id}" data-site="pair">
+      <div class="card-checkbox" data-check="${c.id}">${sel ? '✓' : ''}</div>
+      <div class="card-info">
+        <div class="card-number cred-username">${c.username}</div>
+        <div class="card-meta">
+          <span>••••••••</span>
+          ${c.testHistory.length > 0 ? `<span>${c.testHistory.length} test${c.testHistory.length !== 1 ? 's' : ''}</span>` : ''}
+        </div>
+        <div class="pair-status-row">
+          <span class="pair-status-pill ${c.joeStatus}">🎰 ${lbl(c.joeStatus)}</span>
+          <span class="pair-status-pill ${c.ignStatus}">🔥 ${lbl(c.ignStatus)}</span>
+        </div>
+      </div>
+    </li>`;
+  }).join('');
+
+  const n = selIds.size;
+  batchEl.classList.toggle('hidden', n === 0);
+  $('pairSelectedCount').textContent = n > 0 ? `${n} selected` : '';
+  $('pairCheckSelectedBtn').textContent = `▶ Check Selected (${n})`;
+}
+
+/**
+ * Calls /api/login-check-pair for one credential and saves debug shots from
+ * both sides into state.debugShots.
+ */
+async function simulatePairedLogin(cred) {
+  const start = Date.now();
+  const joeUrl = state.settings.joeLoginUrl || JOE_LOGIN_URL;
+  const ignUrl = state.settings.ignitionLoginUrl || IGNITION_LOGIN_URL;
+  try {
+    const resp = await fetch('/api/login-check-pair', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: cred.username, password: cred.password,
+        joeUrl, ignUrl,
+        timeout: (state.settings.loginTimeout || 60) * 1000,
+        postSubmitWait: state.settings.postSubmitWait || 3000,
+      }),
+    });
+    if (!resp.ok) throw new Error(`API ${resp.status}`);
+    const data = await resp.json();
+    const statusMap = {
+      working: CredStatus.WORKING,
+      noAcc: CredStatus.NO_ACC,
+      permDisabled: CredStatus.PERM_DISABLED,
+      tempDisabled: CredStatus.TEMP_DISABLED,
+    };
+    const tag = `pair_${sanitizeFilenamePart(cred.username.slice(0, 20))}`;
+    for (const sideKey of ['joe', 'ign']) {
+      const side = data[sideKey] || {};
+      const shots = side.shots || ['', '', '', ''];
+      const urls  = side.shotUrls || ['', '', '', ''];
+      for (let i = 0; i < 4; i++) {
+        const du = shots[i]; const u = urls[i];
+        if (du || u) saveDebugShot(du, `${tag}_${sideKey}_${i + 1}`, `Pair (${sideKey}) — ${cred.username} — ${i + 1}/4`, tag, u);
+      }
+    }
+    return {
+      joeStatus: statusMap[data.joe?.outcome] || CredStatus.NO_ACC,
+      ignStatus: statusMap[data.ign?.outcome] || CredStatus.NO_ACC,
+      joeDetail: data.joe?.note || data.joe?.outcome || '',
+      ignDetail: data.ign?.note || data.ign?.outcome || '',
+      durationMs: Date.now() - start,
+    };
+  } catch (err) {
+    return {
+      joeStatus: CredStatus.NO_ACC, ignStatus: CredStatus.NO_ACC,
+      joeDetail: `Server error: ${err.message}`, ignDetail: `Server error: ${err.message}`,
+      durationMs: Date.now() - start,
+    };
+  }
+}
+
+/**
+ * Sequentially tests each paired credential against Joe + Ignition in parallel
+ * (within one credential). Concurrency is intentionally 1 — the server runs
+ * two browser windows side-by-side per credential.
+ */
+async function runPairedLoginChecks(credIds = null) {
+  if (state.pairRunning) return;
+  const targets = credIds
+    ? state.pairCreds.filter(c => credIds.includes(c.id) && c.joeStatus !== CredStatus.TESTING && c.ignStatus !== CredStatus.TESTING)
+    : state.pairCreds.filter(c => c.joeStatus === CredStatus.UNTESTED && c.ignStatus === CredStatus.UNTESTED);
+  if (targets.length === 0) { toast('No untested paired credentials', 'info'); return; }
+
+  const abortCtrl = new AbortController();
+  state.pairRunning = true;
+  state.pairAbortController = abortCtrl;
+  const signal = abortCtrl.signal;
+
+  showProgress('Running Paired Login Checks (Joe + Ignition)…', 'pair');
+  renderAll();
+
+  let done = 0, both = 0, either = 0, none = 0;
+  for (const cred of targets) {
+    if (signal.aborted) break;
+    const idx = state.pairCreds.findIndex(c => c.id === cred.id);
+    if (idx === -1) continue;
+    state.pairCreds[idx].joeStatus = CredStatus.TESTING;
+    state.pairCreds[idx].ignStatus = CredStatus.TESTING;
+    scheduleRender();
+
+    try {
+      const res = await simulatePairedLogin(cred);
+      if (signal.aborted) break;
+      state.pairCreds[idx].joeStatus = res.joeStatus;
+      state.pairCreds[idx].ignStatus = res.ignStatus;
+      state.pairCreds[idx].joeDetail = res.joeDetail;
+      state.pairCreds[idx].ignDetail = res.ignDetail;
+      state.pairCreds[idx].testHistory = state.pairCreds[idx].testHistory || [];
+      state.pairCreds[idx].testHistory.unshift({
+        ts: Date.now(),
+        joeStatus: res.joeStatus, joeDetail: res.joeDetail,
+        ignStatus: res.ignStatus, ignDetail: res.ignDetail,
+        durationMs: res.durationMs,
+      });
+      if (state.pairCreds[idx].testHistory.length > 50) state.pairCreds[idx].testHistory = state.pairCreds[idx].testHistory.slice(0, 50);
+
+      const isJoeOk = res.joeStatus === CredStatus.WORKING;
+      const isIgnOk = res.ignStatus === CredStatus.WORKING;
+      if (isJoeOk && isIgnOk) both++;
+      else if (isJoeOk || isIgnOk) either++;
+      else none++;
+
+      state.sessions.unshift({
+        id: crypto.randomUUID(), type: 'pair', username: cred.username,
+        result: (isJoeOk || isIgnOk) ? 'working' : 'dead',
+        detail: `Joe: ${res.joeDetail} | Ign: ${res.ignDetail}`,
+        ts: Date.now(), durationMs: res.durationMs,
+      });
+      const icon = (isJoeOk && isIgnOk) ? '✅' : (isJoeOk || isIgnOk) ? '◐' : '❌';
+      state.activity.unshift({ icon, label: cred.username, detail: `Pair: 🎰 ${credStatusLabel(res.joeStatus)} · 🔥 ${credStatusLabel(res.ignStatus)}`, ts: Date.now() });
+      if (state.activity.length > 100) state.activity = state.activity.slice(0, 100);
+      saveActivity();
+
+      done++;
+      savePairCreds(); saveSessions();
+      updateProgress(done, targets.length, `${both} both · ${either} either · ${none} neither`);
+      scheduleRender();
+    } catch {
+      state.pairCreds[idx].joeStatus = CredStatus.UNTESTED;
+      state.pairCreds[idx].ignStatus = CredStatus.UNTESTED;
+      savePairCreds();
+      done++;
+      updateProgress(done, targets.length);
+    }
+  }
+
+  state.pairRunning = false;
+  state.pairAbortController = null;
+  hideProgress();
+  toast(`Paired: ${both} both · ${either} either · ${none} neither (of ${done})`, both > 0 ? 'success' : 'info', 4000);
+  renderAll();
+}
+
+/**
+ * Aborts any active paired login run. Resets TESTING entries to UNTESTED.
+ */
+async function stopPairedLoginChecks() {
+  if (state.pairAbortController) state.pairAbortController.abort();
+  state.pairRunning = false;
+  state.pairAbortController = null;
+  state.pairCreds.forEach(c => {
+    if (c.joeStatus === CredStatus.TESTING) c.joeStatus = CredStatus.UNTESTED;
+    if (c.ignStatus === CredStatus.TESTING) c.ignStatus = CredStatus.UNTESTED;
+  });
+  savePairCreds();
+  hideProgress();
+  renderAll();
+  toast('Stopped', 'info');
+}
+
 // ── Run login checks ──────────────────────────────────────
 /**
  * Starts a batched virtual headless login check run for a specific site.
@@ -3155,6 +3420,52 @@ function wireEvents() {
   });
   $('ignCheckSelectedBtn').addEventListener('click', () => {
     const ids = [...state.selectedIgnIds]; state.selectedIgnIds.clear(); runLoginChecks('ign', ids);
+  });
+
+  // Paired (Both) handlers
+  $all('#tab-pair .filter-chip').forEach(btn => {
+    btn.addEventListener('click', () => {
+      $all('#tab-pair .filter-chip').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active'); state.pairFilter = btn.dataset.filter; renderPair();
+    });
+  });
+  $('importPairBtn')?.addEventListener('click',  () => openImportCred('pair'));
+  $('importPairBtn2')?.addEventListener('click', () => openImportCred('pair'));
+  $('pairRunBtn')?.addEventListener('click',  () => runPairedLoginChecks());
+  $('pairStopBtn')?.addEventListener('click', () => stopPairedLoginChecks());
+  $('clearPairBtn')?.addEventListener('click', () => {
+    if (state.pairCreds.length === 0) return;
+    openConfirm('Clear Paired Credentials', `Remove all ${state.pairCreds.length} paired credential(s)?`, () => {
+      state.pairCreds = []; state.selectedPairIds.clear(); savePairCreds(); renderAll(); toast('Paired credentials cleared', 'info');
+    });
+  });
+  $('pairExportBtn')?.addEventListener('click', () => {
+    const w = state.pairCreds.filter(c => c.joeStatus === CredStatus.WORKING && c.ignStatus === CredStatus.WORKING);
+    if (w.length === 0) { toast('No paired credentials with both sides working', 'info'); return; }
+    const text = w.map(c => `${c.username}:${c.password}`).join('\n');
+    const blob = new Blob([text], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `sitchomatic_pair_${Date.now()}.txt`; a.click();
+    URL.revokeObjectURL(url);
+    toast(`Exported ${w.length} paired credential(s)`, 'success');
+  });
+  $('pairCredList')?.addEventListener('click', e => {
+    const checkEl = e.target.closest('[data-check]');
+    const itemEl  = e.target.closest('.card-item');
+    if (!itemEl) return;
+    const id = itemEl.dataset.id;
+    if (checkEl) {
+      if (state.selectedPairIds.has(id)) state.selectedPairIds.delete(id);
+      else state.selectedPairIds.add(id);
+      renderPair();
+    } else {
+      // Re-test single paired cred on click (simple UX)
+      runPairedLoginChecks([id]);
+    }
+  });
+  $('pairCheckSelectedBtn')?.addEventListener('click', () => {
+    const ids = [...state.selectedPairIds]; state.selectedPairIds.clear(); runPairedLoginChecks(ids);
   });
 
   $('closeImportCredModal').addEventListener('click', closeImportCred);
