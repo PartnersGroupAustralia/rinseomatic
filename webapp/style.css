@@ -240,6 +240,11 @@ ul { list-style: none; }
 }
 .panel-scroll::-webkit-scrollbar { width: 4px; }
 .panel-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+/* Prevent direct flex children of panel-scroll (which uses display:flex) from
+   shrinking to 0 height. Children with overflow:hidden (activity-list,
+   card-list, session-list, etc.) otherwise collapse and their content gets
+   clipped, making the panel appear unscrollable. */
+.panel-scroll > * { flex-shrink: 0; }
 
 /* ── Stat Grid ── */
 .stat-grid {
