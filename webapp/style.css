@@ -1054,13 +1054,15 @@ ul { list-style: none; }
 /* ── Progress Overlay ── */
 .progress-overlay {
   position: fixed; inset: 0;
-  background: rgba(0,0,0,0.75);
-  backdrop-filter: blur(12px) saturate(150%);
-  -webkit-backdrop-filter: blur(12px) saturate(150%);
-  z-index: 2000;
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: blur(8px) saturate(150%);
+  -webkit-backdrop-filter: blur(8px) saturate(150%);
+  z-index: 50;
   display: flex; align-items: center; justify-content: center;
   padding: 24px;
+  pointer-events: none;
 }
+.progress-overlay > .progress-card { pointer-events: auto; }
 .progress-card {
   background: var(--bg2);
   border-radius: calc(var(--radius) + 4px);
