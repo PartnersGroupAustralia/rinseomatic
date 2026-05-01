@@ -1,0 +1,43 @@
+[build]
+  publish = "dist"
+  functions = "netlify/functions"
+
+[build.environment]
+  NODE_VERSION = "18"
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/shots/*"
+  to = "/.netlify/functions/shots/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/api/events"
+  to = "/.netlify/functions/sse"
+  status = 200
+
+[[headers]]
+  for = "/api/events"
+  [headers.values]
+    Content-Type = "text/event-stream"
+    Cache-Control = "no-cache"
+    Connection = "keep-alive"
+
+[[headers]]
+  for = "/shots/*"
+  [headers.values]
+    Cache-Control = "public, max-age=3600"
+
+[[headers]]
+  for = "/*.js"
+  [headers.values]
+    Cache-Control = "public, max-age=300"
+
+[[headers]]
+  for = "/*.css"
+  [headers.values]
+    Cache-Control = "public, max-age=300"
