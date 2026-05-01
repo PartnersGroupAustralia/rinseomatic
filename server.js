@@ -1417,92 +1417,124 @@ app.post('/api/login-check', async (req, res) => {
         shotUrls, htmlUrls,
       });
     }
-    // Ignition takes longer to paint the login overlay + cookie banner.
-    // Wait 6000ms for Ignition, 2000ms for all other sites.
+    // ── Step 1: Confirm page is ready ────────────────────────────────────
+    // Ignition paints its login overlay slower than Joe. For Joe, we also
+    // probe for "WELCOME BACK!" as a ready signal rather than waiting blind.
     const initialLoadWait = site === 'ign' ? 6000 : 2000;
     await page.waitForTimeout(initialLoadWait);
+    if (site === 'joe') {
+      // Best-effort ready probe — non-fatal, just helps stabilise slow renders.
+      await page.waitForFunction(
+        () => /welcome back/i.test(document.body.innerText || ''),
+        null, { timeout: 4000 }
+      ).catch(() => {});
+    }
+
+    // ── Step 2: Dismiss cookie banner (Accept All / Got It / I Agree) ───
     await dismissCookiePopup(page);
 
+    // ── Steps 3-4: Fill email + password ────────────────────────────────
     const filled = await fillLoginForm(page, username, password);
     if (!filled) note = 'Could not locate login form fields on page';
 
-    // SCR 1/4 — 0.7s after the last field click (both fields now filled)
-    await page.waitForTimeout(700);
-    bail();
-    await persist(await captureShotBuf(page, 'SCR 1/4'), 0, page);
-
-    // ── Step 2: First submit → SCR 2/4 (2000ms fixed) → poll outcome ─────
-    // Screenshot timing is hardcoded: 2000ms after first submit click so the
-    // page has time to render the immediate response before we capture it.
-    // After the screenshot we poll to confirm the outcome (fast if already visible).
     let respType = RESP.UNKNOWN;
     const siteName = site === 'ign' ? 'Ignition' : 'Joe Fortune';
 
+    /** Apply outcome from a polled respType — no-op for UNKNOWN / WRONG_PASS_1. */
+    const applyRespOutcome = (rt, attemptLabel) => {
+      if (rt === RESP.SUCCESS) {
+        outcome = 'working';
+        note = `${siteName} — login successful (${attemptLabel})`;
+      } else if (rt === RESP.PERM_DISABLED) {
+        outcome = 'permDisabled';
+        note = `${siteName} — account permanently disabled (contact Customer Service)`;
+      } else if (rt === RESP.TEMP_DISABLED) {
+        outcome = 'tempDisabled';
+        note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
+      } else if (rt === RESP.WRONG_PASS_2) {
+        outcome = 'noAcc';
+        note = `${siteName} — incorrect credentials, further attempts may block account (${attemptLabel})`;
+      }
+    };
+
+    /** Terminal outcomes never warrant another submit click. */
+    const hasTerminalOutcome = () =>
+      outcome === 'working' || outcome === 'permDisabled' || outcome === 'tempDisabled';
+
+    /** True while we're still on a login URL (no off-page redirect yet). */
+    const stillOnLoginPage = () => {
+      try {
+        const u = (page.url() || '').toLowerCase();
+        return u.includes('/login') || u.includes('/sign-in') || u.includes('/signin')
+          || u.includes('overlay=login') || u.includes('modal=login') || u.includes('action=login');
+      } catch { return false; }
+    };
+
+    // ── Step 5: First submit ────────────────────────────────────────────
     const clicked1 = await clickSubmit(page);
     if (!clicked1) await page.keyboard.press('Enter');
 
-    await page.waitForTimeout(2000); // hardcoded: 2000ms after 1st submit
+    // ── Step 6: Wait 1500ms → SCR 1/4 (01_after_login_click) ───────────
+    await page.waitForTimeout(1500);
     await dismissCookiePopup(page);
     bail();
-    await persist(await captureShotBuf(page, 'SCR 2/4'), 1, page);
-
-    // Poll for outcome — returns immediately if the response is already visible
+    await persist(await captureShotBuf(page, 'SCR 1/4'), 0, page);
     respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
+    applyRespOutcome(respType, 'attempt 1');
 
-    // Evaluate result after first attempt
-    if (respType === RESP.SUCCESS) {
-      outcome = 'working';
-      note = `${siteName} — login successful`;
-    } else if (respType === RESP.PERM_DISABLED) {
-      outcome = 'permDisabled';
-      note = `${siteName} — account permanently disabled (contact Customer Service)`;
-    } else if (respType === RESP.TEMP_DISABLED) {
-      outcome = 'tempDisabled';
-      note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
-    }
-
-    // ── Step 3: Retry submit → SCR 3/4 (2500ms fixed) → poll outcome ─────
-    // Screenshot taken 2500ms after the second submit click.
-    if (respType === RESP.WRONG_PASS_1 || respType === RESP.WRONG_PASS_2 || respType === RESP.UNKNOWN) {
+    // ── Step 7: Conditional 2nd submit (resilience re-click) ────────────
+    // Only re-click if the first attempt didn't resolve AND we're still on
+    // the login page. Skip on WRONG_PASS_2 so we don't risk blocking the
+    // account with an unnecessary retry.
+    let attempt2Fired = false;
+    if (!hasTerminalOutcome() && respType !== RESP.WRONG_PASS_2 && stillOnLoginPage()) {
       await fillLoginForm(page, username, password);
       const clicked2 = await clickSubmit(page);
       if (!clicked2) await page.keyboard.press('Enter');
-
-      await page.waitForTimeout(2500); // hardcoded: 2500ms after 2nd submit
-      await dismissCookiePopup(page);
-      bail();
-      await persist(await captureShotBuf(page, 'SCR 3/4'), 2, page);
-
-      respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
-
-      if (respType === RESP.SUCCESS) {
-        outcome = 'working';
-        note = `${siteName} — login successful (attempt 2)`;
-      } else if (respType === RESP.PERM_DISABLED) {
-        outcome = 'permDisabled';
-        note = `${siteName} — account permanently disabled (contact Customer Service)`;
-      } else if (respType === RESP.TEMP_DISABLED) {
-        outcome = 'tempDisabled';
-        note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
-      } else if (respType === RESP.WRONG_PASS_2) {
-        outcome = 'noAcc';
-        note = `${siteName} — incorrect credentials on retry (account does not exist or wrong password)`;
-      }
-    } else {
-      // Outcome already determined after attempt 1 — capture current state for SCR 3/4
-      await persist(await captureShotBuf(page, 'SCR 3/4'), 2, page);
+      attempt2Fired = true;
     }
 
-    // ── Step 4: In-place final state → SCR 4/4 (2000ms settle) ─────────────
-    // DO NOT navigate — we want the exact page state resulting from the user's
-    // submits, with cookies/localStorage/JS state intact. This gives a clean
-    // visual timeline across SCR 1–4 on a single URL. We only read signals
-    // from the current page.
+    // ── Step 8: Wait 1450ms → SCR 2/4 (02_after_retry_click) ───────────
+    await page.waitForTimeout(1450);
+    await dismissCookiePopup(page);
+    bail();
+    await persist(await captureShotBuf(page, 'SCR 2/4'), 1, page);
+    if (attempt2Fired) {
+      respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
+      applyRespOutcome(respType, 'attempt 2');
+    }
+
+    // ── Step 9: Conditional 3rd submit (final re-click) ────────────────
+    // Same gating: skip on terminal outcome, WRONG_PASS_2, or if we've
+    // already navigated off the login URL (success redirect).
+    let attempt3Fired = false;
+    if (!hasTerminalOutcome() && respType !== RESP.WRONG_PASS_2 && stillOnLoginPage()) {
+      await fillLoginForm(page, username, password);
+      const clicked3 = await clickSubmit(page);
+      if (!clicked3) await page.keyboard.press('Enter');
+      attempt3Fired = true;
+    }
+
+    // ── Step 10: Wait 1450ms → SCR 3/4 (03_final_click) ────────────────
+    await page.waitForTimeout(1450);
+    await dismissCookiePopup(page);
+    bail();
+    await persist(await captureShotBuf(page, 'SCR 3/4'), 2, page);
+    if (attempt3Fired) {
+      respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
+      applyRespOutcome(respType, 'attempt 3');
+    }
+
+    // ── Steps 11-12: Confirm login success → SCR 4/4 ─────────────────────
+    // Wait for the post-login page to settle, then read the final state for
+    // any outcome still ambiguous after the three submit attempts. DO NOT
+    // navigate away — we preserve the exact post-submit state so SCR 1–4
+    // form a coherent visual timeline on a single URL.
     const needsFallback = outcome !== 'working' && outcome !== 'permDisabled' && outcome !== 'tempDisabled';
 
-    // Freeze page navigation so any post-submit redirect (Ignition jumps to
-    // the lobby after the 4th click) doesn't pull us off the response page
-    // before we capture SCR 4/4. Also block client-side reloads via JS.
+    // Freeze page navigation so any post-submit redirect (e.g. lobby jump
+    // on successful login) doesn't pull us off the response page before we
+    // capture SCR 4/4. Also block client-side reloads via JS.
     frozen = true;
     await page.evaluate(() => {
       try {
@@ -1514,7 +1546,10 @@ app.post('/api/login-check', async (req, res) => {
       } catch { /* ignore */ }
     }).catch(() => {});
 
-    await page.waitForTimeout(2000).catch(() => {}); // 2000ms settle before SCR 4/4
+    // Prefer networkidle over a blind wait so SCR 4/4 captures a fully-loaded
+    // post-login page (lobby, dashboard, etc.). 2000ms settle as fallback.
+    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(2000).catch(() => {}); // settle before SCR 4/4
     await dismissCookiePopup(page);
 
     if (needsFallback) {
