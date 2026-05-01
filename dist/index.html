@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sitchomatic v1.2</title>
+  <title>Sitchomatic v1.3</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -216,11 +216,6 @@
       <span class="tab-icon">🔥</span>
       <span class="tab-label">Ignition</span>
       <span id="ignitionBadge" class="badge hidden">0</span>
-    </button>
-    <button class="tab-btn" data-tab="pair">
-      <span class="tab-icon">⚡</span>
-      <span class="tab-label">Both</span>
-      <span id="pairBadge" class="badge hidden">0</span>
     </button>
     <button class="tab-btn" data-tab="sessions">
       <span class="tab-icon">📋</span><span class="tab-label">Sessions</span>
@@ -447,59 +442,6 @@
       </div>
     </section>
 
-    <!-- ═══════ BOTH (PAIRED) ═══════ -->
-    <section class="tab-panel" id="tab-pair">
-      <div class="panel-scroll">
-        <div class="toolbar">
-          <div class="site-tag pair">⚡ Both (Joe + Ignition)</div>
-          <div class="toolbar-actions">
-            <button class="icon-text-btn danger" id="clearPairBtn">🗑</button>
-            <button class="icon-text-btn" id="importPairBtn">＋ Import</button>
-          </div>
-        </div>
-        <div class="login-stat-row">
-          <div class="login-stat"><div class="login-stat-num" id="pairStatTotal">0</div><div class="login-stat-label">Total</div></div>
-          <div class="login-stat"><div class="login-stat-num green" id="pairStatBoth">0</div><div class="login-stat-label">Both Working</div></div>
-          <div class="login-stat"><div class="login-stat-num green" id="pairStatEither">0</div><div class="login-stat-label">Either Working</div></div>
-          <div class="login-stat"><div class="login-stat-num red" id="pairStatNone">0</div><div class="login-stat-label">Neither</div></div>
-        </div>
-        <div class="status-card">
-          <div class="status-left">
-            <span class="status-dot" id="pairStatusDot"></span>
-            <span id="pairStatusLabel">Idle</span>
-          </div>
-          <div class="status-right">
-            <button id="pairRunBtn" class="run-btn">▶ Run Both</button>
-            <button id="pairStopBtn" class="stop-btn hidden">■ Stop</button>
-          </div>
-        </div>
-        <div class="toolbar" style="padding-top:4px">
-          <span class="toolbar-title" id="pairCredsTitle">Credentials (0)</span>
-          <div class="toolbar-actions">
-            <button class="icon-text-btn" id="pairExportBtn">📤 Export</button>
-          </div>
-        </div>
-        <div class="filter-row" id="pairFilterRow">
-          <button class="filter-chip active" data-filter="all" data-site="pair">All</button>
-          <button class="filter-chip" data-filter="untested" data-site="pair">Untested</button>
-          <button class="filter-chip" data-filter="both" data-site="pair">✅ Both</button>
-          <button class="filter-chip" data-filter="either" data-site="pair">◐ Either</button>
-          <button class="filter-chip" data-filter="none" data-site="pair">❌ Neither</button>
-        </div>
-        <div id="pairEmpty" class="empty-state">
-          <div class="empty-icon">⚡</div>
-          <div class="empty-title">No Paired Credentials</div>
-          <div class="empty-sub">Import username:password pairs. Each will be tested against Joe AND Ignition simultaneously in two side-by-side windows.</div>
-          <button class="btn-primary" id="importPairBtn2">＋ Import Credentials</button>
-        </div>
-        <ul class="card-list" id="pairCredList"></ul>
-        <div class="batch-bar hidden" id="pairBatchBar">
-          <button class="btn-outline" id="pairCheckSelectedBtn">▶ Check Selected</button>
-          <span id="pairSelectedCount" class="selected-count"></span>
-        </div>
-      </div>
-    </section>
-
     <!-- ═══════ SESSIONS ═══════ -->
     <section class="tab-panel" id="tab-sessions">
       <div class="panel-scroll">
@@ -625,7 +567,7 @@
             </div>
             <div class="settings-row">
               <label>Max requeue count</label>
-              <input type="number" id="maxRequeueCount" class="setting-input short" min="0" max="10" value="3" />
+              <input type="number" id="maxRequeueCount" class="setting-input short" min="0" max="10" value="2" />
             </div>
           </div>
         </div>
@@ -636,7 +578,15 @@
           <div class="settings-card">
             <div class="settings-row">
               <label>Login Concurrency</label>
-              <input type="number" id="loginConcurrency" class="setting-input short" min="1" max="10" value="3" />
+              <input type="number" id="loginConcurrency" class="setting-input short" min="1" max="16" value="3" />
+            </div>
+            <div class="settings-row">
+              <label>Worker Pool Size <span class="settings-hint">(server-side headless contexts, 1–16)</span></label>
+              <input type="number" id="maxConcurrent" class="setting-input short" min="1" max="16" value="12" />
+            </div>
+            <div class="settings-row">
+              <label>Max Concurrent <span class="settings-hint">(browser pool cap, 1-16)</span></label>
+              <input type="number" id="maxConcurrent" class="setting-input short" min="1" max="16" value="12" />
             </div>
             <div class="settings-row">
               <label>Login Timeout (s)</label>
@@ -644,43 +594,19 @@
             </div>
             <div class="settings-row">
               <label>Page Load Timeout (s)</label>
-              <input type="number" id="pageLoadTimeout" class="setting-input short" min="10" max="300" value="180" />
+              <input type="number" id="pageLoadTimeout" class="setting-input short" min="10" max="300" value="30" />
             </div>
             <div class="settings-row">
               <label>Batch Start Delay (ms)</label>
-              <input type="number" id="batchDelay" class="setting-input short" min="0" max="5000" value="50" />
+              <input type="number" id="batchDelay" class="setting-input short" min="0" max="5000" value="500" />
             </div>
             <div class="settings-row">
               <label>Typing Speed Min (ms)</label>
-              <input type="number" id="typingSpeedMin" class="setting-input short" min="20" max="500" value="50" />
+              <input type="number" id="typingSpeedMin" class="setting-input short" min="20" max="500" value="80" />
             </div>
             <div class="settings-row">
               <label>Typing Speed Max (ms)</label>
-              <input type="number" id="typingSpeedMax" class="setting-input short" min="50" max="1000" value="150" />
-            </div>
-            <div class="settings-row">
-              <label>Post-Submit Wait (ms) <span class="settings-hint">(time to wait after every submit click before outcome check)</span></label>
-              <input type="number" id="postSubmitWait" class="setting-input short" min="500" max="15000" value="3000" />
-            </div>
-            <div class="settings-row">
-              <label>Max Submit Clicks <span class="settings-hint">(per credential, stops early on SUCCESS/DISABLED)</span></label>
-              <input type="number" id="maxSubmitClicks" class="setting-input short" min="1" max="12" value="6" />
-            </div>
-            <div class="settings-row">
-              <label>Joe Fortune — Post-Submit Wait (ms) <span class="settings-hint">(0 = use global)</span></label>
-              <input type="number" id="joePostSubmitWait" class="setting-input short" min="0" max="15000" value="0" />
-            </div>
-            <div class="settings-row">
-              <label>Joe Fortune — Max Submit Clicks <span class="settings-hint">(0 = use global)</span></label>
-              <input type="number" id="joeMaxSubmitClicks" class="setting-input short" min="0" max="12" value="0" />
-            </div>
-            <div class="settings-row">
-              <label>Ignition — Post-Submit Wait (ms) <span class="settings-hint">(0 = use global)</span></label>
-              <input type="number" id="ignPostSubmitWait" class="setting-input short" min="0" max="15000" value="0" />
-            </div>
-            <div class="settings-row">
-              <label>Ignition — Max Submit Clicks <span class="settings-hint">(0 = use global)</span></label>
-              <input type="number" id="ignMaxSubmitClicks" class="setting-input short" min="0" max="12" value="0" />
+              <input type="number" id="typingSpeedMax" class="setting-input short" min="50" max="1000" value="180" />
             </div>
             <div class="settings-row">
               <label>Test Email (rotation)</label>

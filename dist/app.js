@@ -1,5 +1,5 @@
 /**
- * @fileoverview Sitchomatic Web v1.2 — Main application module.
+ * @fileoverview Sitchomatic Web v1.3 — Main application module.
  * Manages PPSR card checking, Joe Fortune login checking, and Ignition Casino
  * login checking workflows. All data is persisted to localStorage. Supports
  * MediaRecorder run recordings, html2canvas debug screenshots (4 per check),
@@ -34,12 +34,7 @@
 // ── Imports ────────────────────────────────────────────────
 import { createRecordingArtifact, formatBytes, getRecordingsButtonLabel, sanitizeFilenamePart } from './recording-utils.js';
 import { getLoginUrl, JOE_LOGIN_URL, IGNITION_LOGIN_URL } from './run-config.js';
-import {
-  Status, CredStatus,
-  detectBrand, parseCardLine, smartParseCards, cardPipe, maskedNumber,
-  parseCredLine, smartParseCreds, credLabel,
-  hashUnit, seededDelay, loginOutcomeFromSeed, ppsrOutcomeFromSeed,
-} from './pure-utils.js';
+import { DEFAULT_CONFIG, CONFIG_CLAMPS, clampSetting, cloneDefaultConfig } from './config.js';
 
 // ── Storage keys ───────────────────────────────────────────
 /** @constant {string} localStorage key for PPSR cards array. */
@@ -54,7 +49,6 @@ const KEY_GROK_API   = 'sitcho_grok_api';
 const KEY_JOE_CREDS  = 'sitcho_joe_creds';
 /** @constant {string} localStorage key for Ignition Casino credentials array. */
 const KEY_IGN_CREDS  = 'sitcho_ign_creds';
-const KEY_PAIR_CREDS = 'sitcho_pair_creds';
 /** @constant {string} localStorage key for debug screenshot array. */
 const KEY_DEBUG_SHOTS = 'sitcho_debug_shots';
 /** @constant {string} localStorage key for activity log array. */
@@ -72,17 +66,28 @@ const KEY_IGN_FLOW   = 'sitcho_ign_flow';
 /** @constant {string} localStorage key for encrypted sensitive blob (AES-GCM). */
 const KEY_SECURE_BLOB = 'sitcho_secure_blob';
 
-// ── IndexedDB wrapper for heavy blobs (v1.3 improvement #5) ─────────────────
+// ── IndexedDB wrapper (Swarm Upgrade v1 — expanded to multi-store) ──────────
 /**
- * Minimal Promise-based IndexedDB wrapper used to offload large debug shot
- * metadata from localStorage. localStorage is synchronous and capped at ~5MB;
- * IDB is async and effectively unlimited — critical for 10k+ cred batches.
- * Non-fatal: if IDB is unavailable we fall back to localStorage only.
+ * Promise-based IndexedDB wrapper. Two stores:
+ *
+ *   shots    — debug screenshot records, keyed by `id` (UUID).
+ *   keyval   — blob JSON under string keys ('cards', 'joeCreds', 'sessions',
+ *              'activity', 'blacklist', 'ignCreds', 'settings', 'wgConfigs',
+ *              'joeFlow', 'ignFlow', 'migrated'). Lets us move the heavy
+ *              user data off the 5 MB localStorage cap without introducing a
+ *              Dexie dependency.
+ *
+ * IDB is async; the save*() functions below continue to write to localStorage
+ * synchronously and mirror to IDB in the background. On boot loadAll()
+ * prefers IDB (larger capacity, no quota blow-ups on 10k+ creds) and falls
+ * back to localStorage for fresh installs. A one-shot migration copies every
+ * known LS key into IDB the first time the new build runs.
  */
 const IDB = (() => {
   const DB_NAME = 'sitcho_db';
-  const DB_VER  = 1;
-  const STORE   = 'shots';
+  const DB_VER  = 2; // v2 adds the 'keyval' store
+  const SHOTS   = 'shots';
+  const KV      = 'keyval';
   let _dbp = null;
   function open() {
     if (_dbp) return _dbp;
@@ -91,7 +96,8 @@ const IDB = (() => {
         const req = indexedDB.open(DB_NAME, DB_VER);
         req.onupgradeneeded = () => {
           const db = req.result;
-          if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: 'id' });
+          if (!db.objectStoreNames.contains(SHOTS)) db.createObjectStore(SHOTS, { keyPath: 'id' });
+          if (!db.objectStoreNames.contains(KV))    db.createObjectStore(KV);
         };
         req.onsuccess = () => resolve(req.result);
         req.onerror   = () => reject(req.error);
@@ -99,46 +105,64 @@ const IDB = (() => {
     }).catch(() => null);
     return _dbp;
   }
+  /** Runs `fn(tx, store)` inside a transaction, resolving with `result`. */
+  async function _tx(store, mode, fn) {
+    const db = await open(); if (!db) return undefined;
+    return new Promise((resolve) => {
+      try {
+        const tx = db.transaction(store, mode);
+        let out;
+        fn(tx.objectStore(store), (v) => { out = v; });
+        tx.oncomplete = () => resolve(out);
+        tx.onerror    = () => resolve(undefined);
+      } catch { resolve(undefined); }
+    });
+  }
   return {
-    async put(shot) {
-      const db = await open(); if (!db) return;
-      return new Promise((resolve) => {
-        try {
-          const tx = db.transaction(STORE, 'readwrite');
-          tx.objectStore(STORE).put(shot);
-          tx.oncomplete = () => resolve(true);
-          tx.onerror    = () => resolve(false);
-        } catch { resolve(false); }
-      });
-    },
+    // ── shots store (per-record, legacy API) ────────────────────────────
+    put(shot)   { return _tx(SHOTS, 'readwrite', (s) => s.put(shot)); },
+    clear()     { return _tx(SHOTS, 'readwrite', (s) => s.clear()); },
+    delete(id)  { return _tx(SHOTS, 'readwrite', (s) => s.delete(id)); },
     async getAll() {
       const db = await open(); if (!db) return [];
       return new Promise((resolve) => {
         try {
-          const tx = db.transaction(STORE, 'readonly');
-          const req = tx.objectStore(STORE).getAll();
+          const tx  = db.transaction(SHOTS, 'readonly');
+          const req = tx.objectStore(SHOTS).getAll();
           req.onsuccess = () => resolve(req.result || []);
           req.onerror   = () => resolve([]);
         } catch { resolve([]); }
       });
     },
-    async clear() {
-      const db = await open(); if (!db) return;
+    // ── keyval store (Swarm Upgrade v1) ─────────────────────────────────
+    async kvSet(key, value) {
+      const db = await open(); if (!db) return false;
       return new Promise((resolve) => {
         try {
-          const tx = db.transaction(STORE, 'readwrite');
-          tx.objectStore(STORE).clear();
+          const tx = db.transaction(KV, 'readwrite');
+          tx.objectStore(KV).put(value, key);
           tx.oncomplete = () => resolve(true);
           tx.onerror    = () => resolve(false);
         } catch { resolve(false); }
       });
     },
-    async delete(id) {
-      const db = await open(); if (!db) return;
+    async kvGet(key) {
+      const db = await open(); if (!db) return undefined;
       return new Promise((resolve) => {
         try {
-          const tx = db.transaction(STORE, 'readwrite');
-          tx.objectStore(STORE).delete(id);
+          const tx  = db.transaction(KV, 'readonly');
+          const req = tx.objectStore(KV).get(key);
+          req.onsuccess = () => resolve(req.result);
+          req.onerror   = () => resolve(undefined);
+        } catch { resolve(undefined); }
+      });
+    },
+    async kvDel(key) {
+      const db = await open(); if (!db) return false;
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction(KV, 'readwrite');
+          tx.objectStore(KV).delete(key);
           tx.oncomplete = () => resolve(true);
           tx.onerror    = () => resolve(false);
         } catch { resolve(false); }
@@ -146,6 +170,50 @@ const IDB = (() => {
     },
   };
 })();
+
+/**
+ * Swarm Upgrade v1 — list of (localStorage key, IDB keyval name) pairs that
+ * the one-shot migration + ongoing dual-write use to keep the two stores in
+ * sync. Adding a new heavy store? Add it here and everything Just Works.
+ */
+const IDB_KV_MAP = [
+  ['sitcho_cards',        'cards'],
+  ['sitcho_sessions',     'sessions'],
+  ['sitcho_joe_creds',    'joeCreds'],
+  ['sitcho_ign_creds',    'ignCreds'],
+  ['sitcho_activity',     'activity'],
+  ['sitcho_blacklist',    'blacklist'],
+  ['sitcho_wg_configs',   'wgConfigs'],
+  ['sitcho_joe_flow',     'joeFlow'],
+  ['sitcho_ign_flow',     'ignFlow'],
+  ['sitcho_settings',     'settings'],
+  ['sitcho_debug_shots',  'debugShots'],
+];
+const IDB_MIGRATED_FLAG = '__migrated_from_localstorage_v1';
+
+/** Fire-and-forget IDB mirror write. Never throws. */
+function idbMirror(name, value) {
+  try { IDB.kvSet(name, value); } catch {}
+}
+
+/**
+ * One-shot migration: copies every localStorage key listed in IDB_KV_MAP
+ * into the IDB keyval store the first time this build runs. Flagged so
+ * subsequent boots skip it. Safe to re-run (idempotent): it only writes
+ * keys present in localStorage.
+ */
+async function migrateLocalStorageToIDB() {
+  try {
+    const flag = await IDB.kvGet(IDB_MIGRATED_FLAG);
+    if (flag) return;
+    for (const [lsKey, idbKey] of IDB_KV_MAP) {
+      const raw = localStorage.getItem(lsKey);
+      if (raw == null) continue;
+      try { await IDB.kvSet(idbKey, JSON.parse(raw)); } catch { /* leave LS as source of truth */ }
+    }
+    await IDB.kvSet(IDB_MIGRATED_FLAG, { ts: Date.now() });
+  } catch { /* IDB unavailable — fall back to localStorage path */ }
+}
 
 // ── AES-GCM encryption at rest (v1.3 improvement #9) ───────────────────────
 /**
@@ -227,7 +295,7 @@ const SSE = {
       const es = new EventSource('/api/events');
       this._es = es;
       // All named events the server broadcasts
-      for (const name of ['run.start', 'run.end', 'run.cancel', 'shot.saved', 'login.result', 'card.result']) {
+      for (const name of ['run.start', 'run.end', 'run.cancel', 'shot.saved', 'login.result', 'card.result', 'pool.config']) {
         es.addEventListener(name, (ev) => {
           try { this._dispatch(name, JSON.parse(ev.data)); } catch {}
         });
@@ -362,6 +430,170 @@ async function visualDiffScore(aUrl, bUrl) {
   } catch { return 1; }
 }
 
+// ── Card status enum ───────────────────────────────────────
+/**
+ * @enum {string} Status values for PPSR cards.
+ * testHistory entries use the field name `result` (not `status`).
+ */
+const Status = {
+  UNTESTED: 'untested',
+  TESTING:  'testing',
+  WORKING:  'working',
+  DEAD:     'dead',
+};
+
+// ── Credential status enum ─────────────────────────────────
+/**
+ * @enum {string} Status values for login credentials.
+ * testHistory entries use the field name `status` (not `result`).
+ * This is intentionally different from card testHistory to match
+ * the iOS LoginAttemptStatus enum naming.
+ */
+const CredStatus = {
+  UNTESTED:      'untested',
+  TESTING:       'testing',
+  WORKING:       'working',
+  NO_ACC:        'noAcc',
+  PERM_DISABLED: 'permDisabled',
+  TEMP_DISABLED: 'tempDisabled',
+};
+
+// ── Card brand detection ───────────────────────────────────
+/**
+ * Detects the card brand from a card number string using BIN prefix matching.
+ * @param {string} num - Raw card number (may include non-digit chars).
+ * @returns {{ name: string, icon: string }} Brand name and emoji icon.
+ */
+function detectBrand(num) {
+  const n = num.replace(/\D/g, '');
+  if (/^4/.test(n))              return { name: 'Visa',       icon: '💳' };
+  if (/^5[1-5]/.test(n) || /^2[2-7]/.test(n)) return { name: 'Mastercard', icon: '🟠' };
+  if (/^3[47]/.test(n))         return { name: 'Amex',       icon: '🟦' };
+  if (/^6/.test(n))              return { name: 'Discover',   icon: '🔶' };
+  return { name: 'Card', icon: '💳' };
+}
+
+// ── Card parse ─────────────────────────────────────────────
+/**
+ * Parses a single line of text into a card object.
+ * Accepts separators: pipe, space, slash. Validates card number length (13–19 digits).
+ * Returns null for any line that cannot be parsed into 4 valid parts.
+ * BUG-21: validates that the card number contains only digits after stripping spaces/hyphens.
+ * @param {string} line - A single line from a pasted or imported card list.
+ * @returns {{ id: string, number: string, mm: string, yy: string, cvv: string, brand: string, brandIcon: string, status: string, successCount: number, totalTests: number, lastTested: number|null, testHistory: Array, addedAt: number }|null}
+ *   Parsed card object, or null if the line is invalid.
+ */
+function parseCardLine(line) {
+  line = line.trim();
+  if (!line) return null;
+  const parts = line.split(/[|\s\/]+/).map(p => p.trim()).filter(Boolean);
+  if (parts.length < 4) return null;
+  const [rawNum, rawMM, rawYY, rawCVV] = parts;
+  const cleaned = rawNum.replace(/[\s-]/g, '');
+  if (!/^\d+$/.test(cleaned)) return null;
+  const num = cleaned;
+  if (num.length < 13 || num.length > 19) return null;
+  const mm = rawMM.replace(/\D/g, '').padStart(2, '0');
+  let yy = rawYY.replace(/\D/g, '');
+  if (yy.length === 4) yy = yy.slice(-2);
+  const cvv = rawCVV.replace(/\D/g, '');
+  if (!mm || !yy || !cvv) return null;
+  const brand = detectBrand(num);
+  return {
+    id: crypto.randomUUID(),
+    number: num, mm, yy, cvv,
+    brand: brand.name, brandIcon: brand.icon,
+    status: Status.UNTESTED,
+    successCount: 0, totalTests: 0,
+    lastTested: null, testHistory: [],
+    addedAt: Date.now(),
+  };
+}
+
+/**
+ * Parses a multi-line text block into an array of card objects.
+ * Each non-empty line is passed through parseCardLine; invalid lines are silently skipped.
+ * @param {string} text - Multi-line text containing one card per line.
+ * @returns {Array} Array of parsed card objects.
+ */
+function smartParseCards(text) {
+  return text.split(/\n/).map(parseCardLine).filter(Boolean);
+}
+
+/**
+ * Serialises a card object to the pipe-delimited format used for export and clipboard copy.
+ * @param {{ number: string, mm: string, yy: string, cvv: string }} c - Card object.
+ * @returns {string} Pipe-delimited string, e.g. "5123456789012346|08|26|123".
+ */
+function cardPipe(c) {
+  return `${c.number}|${c.mm}|${c.yy}|${c.cvv}`;
+}
+
+/**
+ * Returns a masked representation of a card number for safe display.
+ * Shows the first 6 and last 4 digits with bullet characters in between.
+ * BUG-14 fix: correctly handles cards with 9 or fewer digits (returns as-is)
+ * and uses Math.max(0, ...) to prevent negative repeat counts.
+ * @param {string} num - Raw card number digits.
+ * @returns {string} Masked display string.
+ */
+function maskedNumber(num) {
+  if (num.length <= 9) return num;
+  return num.slice(0, 6) + '•'.repeat(Math.max(0, num.length - 10)) + num.slice(-4);
+}
+
+// ── Credential parse ───────────────────────────────────────
+/**
+ * Parses a single credential line into a credential object.
+ * Tries separators in order: colon, pipe, semicolon, comma, tab, space (BUG-01 fix).
+ * For space, uses the first whitespace run as the separator.
+ * Returns null for comment lines (starting with #) or lines where no separator is found.
+ * @param {string} line - A single line from pasted or imported credential text.
+ * @returns {{ id: string, username: string, password: string, status: string, addedAt: number, testHistory: Array }|null}
+ *   Parsed credential object, or null if the line cannot be parsed.
+ */
+function parseCredLine(line) {
+  line = line.trim();
+  if (!line || line.startsWith('#')) return null;
+  const seps = [':', '|', ';', ',', '\t', ' '];
+  for (const sep of seps) {
+    const idx = sep === ' ' ? line.search(/\s+/) : line.indexOf(sep);
+    if (idx > 0) {
+      const username = line.slice(0, idx).trim();
+      const password = sep === ' '
+        ? line.slice(idx).trim().replace(/^\s+/, '')
+        : line.slice(idx + 1).trim();
+      if (username.length >= 3 && password.length >= 1) {
+        return {
+          id: crypto.randomUUID(),
+          username, password,
+          status: CredStatus.UNTESTED,
+          addedAt: Date.now(),
+          testHistory: [],
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Parses a multi-line text block into an array of credential objects.
+ * @param {string} text - Multi-line text with one credential per line.
+ * @returns {Array} Array of parsed credential objects.
+ */
+function smartParseCreds(text) {
+  return text.split(/\n/).map(parseCredLine).filter(Boolean);
+}
+
+/**
+ * Returns the colon-delimited label for a credential (used for export and clipboard).
+ * @param {{ username: string, password: string }} cred - Credential object.
+ * @returns {string} Label string, e.g. "user@email.com:password123".
+ */
+function credLabel(cred) {
+  return `${cred.username}:${cred.password}`;
+}
 
 /**
  * Returns a human-readable label for a credential status enum value.
@@ -480,8 +712,6 @@ let state = {
   joeCreds: [],
   /** @type {Array} Ignition Casino credential objects. */
   ignCreds: [],
-  /** @type {Array} Paired credential objects ({id, username, password, joeStatus, ignStatus, joeDetail, ignDetail, testHistory}). */
-  pairCreds: [],
   /** @type {Array} WireGuard config objects parsed from imported .conf files. */
   wireGuardConfigs: [],
   /** @type {Array<{id:string, username:string, ts:number, note:string}>} Blacklisted usernames — auto-marked as Perm Disabled on import. */
@@ -499,55 +729,10 @@ let state = {
   /** @type {string} NordLynx access key (persisted). */
   nordAccessKey: '',
   /** @type {object} User-configurable settings. */
-  settings: {
-    // PPSR
-    maxConcurrency: 7,
-    checkTimeout: 180,
-    autoRetry: true,
-    stealthMode: false,
-    debugScreenshots: true,
-    ppsrUrl: 'https://transact.ppsr.gov.au/CarCheck/',
-    // Target login URLs (editable in Settings → Target URLs)
-    joeLoginUrl: 'https://joefortunepokies.win/login',
-    ignitionLoginUrl: 'https://ignitioncasino.ooo/login',
-    // Login checker
-    loginConcurrency: 3,
-    loginTimeout: 60,
-    testEmail: '',
-    useEmailRotation: false,
-    // Automation
-    typingSpeedMinMs: 50,
-    typingSpeedMaxMs: 150,
-    requeueOnTimeout: true,
-    requeueOnFailure: true,
-    maxRequeueCount: 3,
-    batchDelayBetweenStartsMs: 50,
-    pageLoadTimeout: 180,
-    liveView: true,
-    // Multi-submit login handler (strict no-refresh multi-click flow)
-    postSubmitWait: 3000,    // ms waited after every submit click before classification
-    maxSubmitClicks: 6,      // cap on submit clicks per cred
-    // Per-site overrides — 0 / empty means "use global value above"
-    joePostSubmitWait: 0,
-    joeMaxSubmitClicks: 0,
-    ignPostSubmitWait: 0,
-    ignMaxSubmitClicks: 0,
-    // Network / VPN
-    vpnRotation: false,
-    dnsRotation: false,
-    proxyRotateOnFailure: true,
-    // Appearance
-    theme: 'dark',
-    // v1.3 feature toggles (all can be flipped on/off from Settings)
-    useSSE:          true,  // live server events (vs 15s polling)
-    useShotUrls:     true,  // prefer disk-served screenshot URLs
-    reuseSession:    false, // save+reuse Playwright storageState
-    encryptSecrets:  false, // AES-GCM encryption at rest for sensitive keys
-    preflightCheck:  true,  // validate creds before running
-    debugModeProfile: false, // forensic defaults (slow, verbose, single concurrency)
-    visualDiff:      true,  // highlight pixel changes between sequential shots
-    smartThrottle:   true,  // per-domain jitter + exponential backoff on 429
-  },
+  // Swarm Upgrade v1 — single source of truth: webapp/config.js → DEFAULT_CONFIG.
+  // Any drift between state defaults / nuke reset / autoBind clamps is now
+  // impossible because all three read from the same constants.
+  settings: cloneDefaultConfig(),
   /** @type {string} Grok AI API key (persisted separately). */
   grokKey: '',
   /** @type {boolean} True while PPSR run is active. */
@@ -556,14 +741,6 @@ let state = {
   joeRunning: false,
   /** @type {boolean} True while Ignition login run is active. */
   ignRunning: false,
-  /** @type {boolean} True while paired login run is active. */
-  pairRunning: false,
-  /** @type {AbortController|null} Active AbortController for the paired run. */
-  pairAbortController: null,
-  /** @type {Set<string>} IDs of selected paired credentials. */
-  selectedPairIds: new Set(),
-  /** @type {string} Current filter for Paired credentials list. */
-  pairFilter: 'all',
   /** @type {string} ID of the currently active tab panel. */
   activeTab: 'dashboard',
   /** @type {string} Current filter applied to the sessions list. */
@@ -602,26 +779,30 @@ let state = {
   recordingEngineUnavailableNotified: false,
 };
 
-// ── Persistence ─────────────────────────────────────────────
-/** @description Serialises and saves the cards array to localStorage. */
-function saveCards()    { localStorage.setItem(KEY_CARDS, JSON.stringify(state.cards)); }
-/** @description Serialises and saves the sessions array (max 1000 entries) to localStorage. */
-function saveSessions() { localStorage.setItem(KEY_SESSIONS, JSON.stringify(state.sessions.slice(0, 1000))); }
-/** @description Serialises and saves the settings object to localStorage. */
-function saveSettings() { localStorage.setItem(KEY_SETTINGS, JSON.stringify(state.settings)); }
-/** @description Serialises and saves the Joe Fortune credentials array to localStorage. */
-function saveJoeCreds() { localStorage.setItem(KEY_JOE_CREDS, JSON.stringify(state.joeCreds)); }
-/** @description Serialises and saves the Ignition Casino credentials array to localStorage. */
-function saveIgnCreds() { localStorage.setItem(KEY_IGN_CREDS, JSON.stringify(state.ignCreds)); }
-/** @description Serialises and saves the Paired credentials array to localStorage. */
-function savePairCreds() { try { localStorage.setItem(KEY_PAIR_CREDS, JSON.stringify(state.pairCreds)); } catch {} }
-/** @description Serialises and saves the activity log (max 100 entries) to localStorage. */
+// ── Persistence (Swarm Upgrade v1: dual-write LS + IDB) ─────────────────────
+// Every save* writes synchronously to localStorage (unchanged for instant
+// crash-safety) AND mirrors to IndexedDB in the background. Reads prefer IDB
+// on boot via reloadFromIDB() so big batches never hit the 5 MB LS cap.
+/** @description Persists cards to LS + IDB. */
+function saveCards()    { localStorage.setItem(KEY_CARDS, JSON.stringify(state.cards)); idbMirror('cards', state.cards); }
+/** @description Persists sessions (max 1000 entries) to LS + IDB. */
+function saveSessions() { const s = state.sessions.slice(0, 1000); localStorage.setItem(KEY_SESSIONS, JSON.stringify(s)); idbMirror('sessions', s); }
+/** @description Persists settings to LS + IDB. */
+function saveSettings() { localStorage.setItem(KEY_SETTINGS, JSON.stringify(state.settings)); idbMirror('settings', state.settings); }
+/** @description Persists Joe Fortune credentials to LS + IDB. */
+function saveJoeCreds() { localStorage.setItem(KEY_JOE_CREDS, JSON.stringify(state.joeCreds)); idbMirror('joeCreds', state.joeCreds); }
+/** @description Persists Ignition Casino credentials to LS + IDB. */
+function saveIgnCreds() { localStorage.setItem(KEY_IGN_CREDS, JSON.stringify(state.ignCreds)); idbMirror('ignCreds', state.ignCreds); }
+/** @description Persists activity log (max 100 entries) to LS + IDB. */
 function saveActivity() {
-  try { localStorage.setItem(KEY_ACTIVITY, JSON.stringify(state.activity.slice(0, 100))); } catch {}
+  const a = state.activity.slice(0, 100);
+  try { localStorage.setItem(KEY_ACTIVITY, JSON.stringify(a)); } catch {}
+  idbMirror('activity', a);
 }
-/** @description Serialises and saves WireGuard configs to localStorage. */
+/** @description Persists WireGuard configs to LS + IDB. */
 function saveWgConfigs() {
   try { localStorage.setItem(KEY_WG_CONFIGS, JSON.stringify(state.wireGuardConfigs)); } catch {}
+  idbMirror('wgConfigs', state.wireGuardConfigs);
 }
 /** @description Saves the NordLynx access key to localStorage. */
 function saveNordKey() {
@@ -638,6 +819,7 @@ function saveNordKey() {
  */
 function saveBlacklist() {
   try { localStorage.setItem(KEY_BLACKLIST, JSON.stringify(state.blacklist)); } catch {}
+  idbMirror('blacklist', state.blacklist);
 }
 
 /**
@@ -657,6 +839,9 @@ function isBlacklisted(username) {
  * @description Persists state.debugShots to localStorage, trimming if needed.
  */
 function saveDebugShotsQuota() {
+  // Swarm Upgrade v1 — shots now carry disk URLs only (no base64), so the
+  // list is tiny. Mirror to IDB for unlimited capacity; keep LS as a fallback.
+  idbMirror('debugShots', state.debugShots);
   while (state.debugShots.length > 0) {
     try {
       localStorage.setItem(KEY_DEBUG_SHOTS, JSON.stringify(state.debugShots));
@@ -682,7 +867,6 @@ function loadAll() {
   try { state.debugShots    = JSON.parse(localStorage.getItem(KEY_DEBUG_SHOTS)) || []; } catch { state.debugShots = []; }
   try { state.joeCreds      = JSON.parse(localStorage.getItem(KEY_JOE_CREDS))  || []; } catch { state.joeCreds = []; }
   try { state.ignCreds      = JSON.parse(localStorage.getItem(KEY_IGN_CREDS))  || []; } catch { state.ignCreds = []; }
-  try { state.pairCreds     = JSON.parse(localStorage.getItem(KEY_PAIR_CREDS)) || []; } catch { state.pairCreds = []; }
   try { state.activity      = JSON.parse(localStorage.getItem(KEY_ACTIVITY))   || []; } catch { state.activity = []; }
   try { state.wireGuardConfigs = JSON.parse(localStorage.getItem(KEY_WG_CONFIGS)) || []; } catch { state.wireGuardConfigs = []; }
   try { state.blacklist        = JSON.parse(localStorage.getItem(KEY_BLACKLIST))   || []; } catch { state.blacklist = []; }
@@ -696,6 +880,43 @@ function loadAll() {
   if (typeof state.settings.debugScreenshots !== 'boolean') state.settings.debugScreenshots = true;
   if (!Array.isArray(state.debugShots)) state.debugShots = [];
   state.grokKey = localStorage.getItem(KEY_GROK_API) || '';
+}
+
+/**
+ * Swarm Upgrade v1 — async reload from IndexedDB once the one-shot migration
+ * completes. Prefers IDB values over the LS snapshot already loaded by
+ * loadAll(). Non-fatal: if IDB is empty or unavailable the LS values stay.
+ * Triggers a re-render after the hydration so updated data is reflected in
+ * the UI even if the module already finished its synchronous boot.
+ */
+async function reloadFromIDB() {
+  try {
+    await migrateLocalStorageToIDB();
+    const [cards, sessions, debugShots, joeCreds, ignCreds, activity, wgConfigs, blacklist, joeFlow, ignFlow, settings]
+      = await Promise.all([
+        IDB.kvGet('cards'), IDB.kvGet('sessions'), IDB.kvGet('debugShots'),
+        IDB.kvGet('joeCreds'), IDB.kvGet('ignCreds'), IDB.kvGet('activity'),
+        IDB.kvGet('wgConfigs'), IDB.kvGet('blacklist'),
+        IDB.kvGet('joeFlow'), IDB.kvGet('ignFlow'),
+        IDB.kvGet('settings'),
+      ]);
+    if (Array.isArray(cards))       state.cards            = cards;
+    if (Array.isArray(sessions))    state.sessions         = sessions;
+    if (Array.isArray(debugShots))  state.debugShots       = debugShots;
+    if (Array.isArray(joeCreds))    state.joeCreds         = joeCreds;
+    if (Array.isArray(ignCreds))    state.ignCreds         = ignCreds;
+    if (Array.isArray(activity))    state.activity         = activity;
+    if (Array.isArray(wgConfigs))   state.wireGuardConfigs = wgConfigs;
+    if (Array.isArray(blacklist))   state.blacklist        = blacklist;
+    if (joeFlow !== undefined)      state.joeFlow          = joeFlow;
+    if (ignFlow !== undefined)      state.ignFlow          = ignFlow;
+    if (settings && typeof settings === 'object') {
+      state.settings = { ...state.settings, ...settings };
+    }
+    // Nothing to do if the DOM isn't ready yet; renderAll/scheduleRender will
+    // be wired up by the bootstrapper shortly after this resolves.
+    try { renderAll?.(); } catch {}
+  } catch { /* IDB hydration failed — LS values from loadAll() remain live */ }
 }
 
 // ── DOM refs ────────────────────────────────────────────────
@@ -1161,12 +1382,8 @@ function renderSettings() {
   if ($('maxRequeueCount')) $('maxRequeueCount').value = settings.maxRequeueCount;
   if ($('batchDelay'))      $('batchDelay').value      = settings.batchDelayBetweenStartsMs;
   if ($('pageLoadTimeout')) $('pageLoadTimeout').value = settings.pageLoadTimeout;
-  if ($('postSubmitWait'))  $('postSubmitWait').value  = settings.postSubmitWait || 3000;
-  if ($('maxSubmitClicks')) $('maxSubmitClicks').value = settings.maxSubmitClicks || 6;
-  if ($('joePostSubmitWait'))  $('joePostSubmitWait').value  = settings.joePostSubmitWait || 0;
-  if ($('joeMaxSubmitClicks')) $('joeMaxSubmitClicks').value = settings.joeMaxSubmitClicks || 0;
-  if ($('ignPostSubmitWait'))  $('ignPostSubmitWait').value  = settings.ignPostSubmitWait || 0;
-  if ($('ignMaxSubmitClicks')) $('ignMaxSubmitClicks').value = settings.ignMaxSubmitClicks || 0;
+  // Swarm Upgrade v1 — mirror the worker-pool concurrency cap.
+  if ($('maxConcurrent'))   $('maxConcurrent').value   = settings.maxConcurrent;
 
   // Network/VPN settings
   if ($('vpnRotation'))         $('vpnRotation').checked         = settings.vpnRotation;
@@ -1199,7 +1416,6 @@ function renderAll() {
   renderWorking();
   renderCredSite('joe');
   renderCredSite('ign');
-  renderPair();
   renderSessions();
   renderSettings();
   renderBlacklist();
@@ -1358,7 +1574,7 @@ let importCredParsed = [];
  */
 function openImportCred(site) {
   state.importCredSite = site;
-  const siteName = site === 'joe' ? 'Joe Fortune' : site === 'pair' ? 'Paired (Joe + Ignition)' : 'Ignition';
+  const siteName = site === 'joe' ? 'Joe Fortune' : 'Ignition';
   $('importCredTitle').textContent = `Import ${siteName} Credentials`;
   $('importCredText').value = '';
   $('importCredFeedback').innerHTML = '<span class="hint-text">Formats: user:pass · user|pass · user;pass · user,pass · user pass</span>';
@@ -1388,8 +1604,7 @@ function onImportCredInput() {
   if (!site) { toast('Import session lost — please reopen', 'error'); return; }
   const text     = $('importCredText').value;
   const allParsed = smartParseCreds(text);
-  const targetCreds = site === 'joe' ? state.joeCreds : site === 'pair' ? state.pairCreds : state.ignCreds;
-  const existing  = new Set(targetCreds.map(c => c.username + ':' + c.password));
+  const existing  = new Set((site === 'joe' ? state.joeCreds : state.ignCreds).map(c => c.username + ':' + c.password));
   importCredParsed = allParsed.filter(c => !existing.has(c.username + ':' + c.password));
   const dupes = allParsed.length - importCredParsed.length;
 
@@ -1429,17 +1644,6 @@ function confirmImportCred() {
     return c;
   });
   if (site === 'joe') { state.joeCreds.push(...toImport); saveJoeCreds(); }
-  else if (site === 'pair') {
-    const pairImport = toImport.map(c => ({
-      id: c.id || crypto.randomUUID(),
-      username: c.username, password: c.password,
-      joeStatus: CredStatus.UNTESTED, ignStatus: CredStatus.UNTESTED,
-      joeDetail: '', ignDetail: '',
-      testHistory: [], addedAt: Date.now(),
-    }));
-    state.pairCreds.push(...pairImport);
-    savePairCreds();
-  }
   else                { state.ignCreds.push(...toImport); saveIgnCreds(); }
   let msg = `Added ${toImport.length} credential(s)`;
   if (blacklistedCount > 0) msg += ` — ${blacklistedCount} auto-marked Perm Disabled (blacklist)`;
@@ -1554,7 +1758,7 @@ function renderFlowRecorder() {
       const saved = flow && !Array.isArray(flow) ? flow.url : '';
       const fallback = site === 'joe'
         ? (state.settings.joeLoginUrl || 'https://joefortunepokies.win/login')
-        : (state.settings.ignitionLoginUrl || 'https://ignitioncasino.ooo/login');
+        : (state.settings.ignitionLoginUrl || 'https://ignitioncasino.ooo/?overlay=login');
       urlInput.value = saved || fallback;
     }
 
@@ -1657,7 +1861,7 @@ async function startFlowRecording(site) {
   const typed    = (urlInput && urlInput.value || '').trim();
   const fallback = site === 'joe'
     ? (state.settings.joeLoginUrl || 'https://joefortunepokies.win/login')
-    : (state.settings.ignitionLoginUrl || 'https://ignitioncasino.ooo/login');
+    : (state.settings.ignitionLoginUrl || 'https://ignitioncasino.ooo/?overlay=login');
   const loginUrl = typed || fallback;
   try { new URL(loginUrl); }
   catch { toast('Enter a valid URL (including https://) to record on', 'error'); return; }
@@ -1839,6 +2043,63 @@ function hideProgress() {
 }
 
 
+// ── Simulation helpers ─────────────────────────────────────
+/**
+ * FNV-1a 32-bit hash function used for deterministic seeded simulation.
+ * Produces a float in [0, 1) from any string input.
+ * @param {string} seed - Input string to hash.
+ * @returns {number} Deterministic float in range [0, 1).
+ */
+function hashUnit(seed) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0) / 4294967295;
+}
+
+/**
+ * Returns a deterministic delay in milliseconds within [minMs, maxMs]
+ * derived from the given seed string. Used to simulate realistic network latency.
+ * @param {string} seed - Base seed string.
+ * @param {number} minMs - Minimum delay in milliseconds.
+ * @param {number} maxMs - Maximum delay in milliseconds.
+ * @returns {number} Deterministic delay in milliseconds.
+ */
+function seededDelay(seed, minMs, maxMs) {
+  const span = Math.max(0, maxMs - minMs);
+  return minMs + Math.round(hashUnit(seed + ':delay') * span);
+}
+
+/**
+ * Derives a deterministic login outcome from a seed string.
+ * Distribution: ~30% WORKING, ~50% NO_ACC, ~12% PERM_DISABLED, ~8% TEMP_DISABLED.
+ * @param {string} seed - Fully qualified seed (includes site ID and credential values).
+ * @param {string} siteId - Stable site identifier ('joe' or 'ign') for the detail message.
+ * @returns {{ status: string, detail: string }} Outcome object.
+ */
+function loginOutcomeFromSeed(seed, siteId) {
+  const r = hashUnit(seed);
+  const siteName = siteId === 'joe' ? 'Joe Fortune' : 'Ignition';
+  if (r < 0.30) return { status: CredStatus.WORKING,       detail: `Login successful on ${siteName}` };
+  if (r < 0.80) return { status: CredStatus.NO_ACC,        detail: 'No account found or wrong credentials' };
+  if (r < 0.92) return { status: CredStatus.PERM_DISABLED, detail: 'Account has been permanently disabled' };
+  return           { status: CredStatus.TEMP_DISABLED, detail: 'Account temporarily disabled' };
+}
+
+/**
+ * Derives a deterministic PPSR check outcome from a seed string.
+ * Distribution: ~35% working, ~50% dead, ~15% error.
+ * @param {string} seed - Fully qualified seed (includes card number, expiry, cvv).
+ * @returns {{ result: string, detail: string }} Outcome object.
+ */
+function ppsrOutcomeFromSeed(seed) {
+  const r = hashUnit(seed);
+  if (r < 0.35) return { result: 'working', detail: 'PPSR check passed — no encumbrance' };
+  if (r < 0.85) return { result: 'dead',    detail: 'Declined — encumbrance or invalid' };
+  return           { result: 'error',   detail: 'Connection error — retrying' };
+}
 
 // ── Script loader ──────────────────────────────────────────
 /**
@@ -2158,15 +2419,12 @@ function enqueueShot(buildOverlayFn, tag, note) {
  */
 function saveDebugShot(dataUrl, tag, note, groupId = '', url = '') {
   if (!state.settings.debugScreenshots) return;
-  // Accept either a real disk URL (preferred — near-zero localStorage cost)
-  // or a base64 data URL (legacy path). At least one must be present.
-  const hasData = dataUrl && dataUrl.startsWith('data:image');
+  // Swarm Upgrade v1 — disk-only shots. Base64 is never persisted: everything
+  // points at /shots/<runId>/<idx>.png served statically from Express. If no
+  // disk URL is present we drop the shot entirely rather than bloating IDB.
   const hasUrl  = url && /^https?:|^\//.test(url);
-  if (!hasData && !hasUrl) return;
+  if (!hasUrl) return;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  // When a disk URL is available AND the feature flag is on, drop the heavy
-  // base64 to keep localStorage light. Modal rendering prefers `url` anyway.
-  const keepBase64 = !(hasUrl && state.settings.useShotUrls !== false);
   state.debugShots.unshift({
     id: crypto.randomUUID(),
     ts: Date.now(),
@@ -2174,8 +2432,8 @@ function saveDebugShot(dataUrl, tag, note, groupId = '', url = '') {
     groupId: groupId || tag,
     note: note || '',
     filename: `sitchomatic_live_${sanitizeFilenamePart(tag)}_${stamp}.png`,
-    dataUrl: keepBase64 ? (dataUrl || '') : '',
-    url: hasUrl ? url : '',
+    dataUrl: '',
+    url,
   });
   saveDebugShotsQuota();
   if (!$('screenshotModal').classList.contains('hidden')) renderDebugShots();
@@ -2360,21 +2618,13 @@ async function simulateLoginDetailed(cred, siteId, siteName, loginUrl) {
         timeout: (state.settings.loginTimeout || 60) * 1000,
         liveView: state.settings.liveView === true,
         reuseSession: state.settings.reuseSession === true,
-        // Per-site overrides fall back to global when the site-specific value is 0/empty.
-        postSubmitWait:
-          (siteId === 'joe' && Number(state.settings.joePostSubmitWait) > 0 && state.settings.joePostSubmitWait) ||
-          (siteId === 'ign' && Number(state.settings.ignPostSubmitWait) > 0 && state.settings.ignPostSubmitWait) ||
-          state.settings.postSubmitWait || 3000,
-        maxSubmitClicks:
-          (siteId === 'joe' && Number(state.settings.joeMaxSubmitClicks) > 0 && state.settings.joeMaxSubmitClicks) ||
-          (siteId === 'ign' && Number(state.settings.ignMaxSubmitClicks) > 0 && state.settings.ignMaxSubmitClicks) ||
-          state.settings.maxSubmitClicks || 6,
       }),
     });
     if (!resp.ok) throw new Error(`API ${resp.status}`);
     const data = await resp.json();
 
-    const shots    = data.shots    || ['', '', '', ''];
+    // Swarm Upgrade v1 — server emits disk URLs only (no base64). The legacy
+    // `data.shots` field is gone; we ignore it entirely.
     const shotUrls = data.shotUrls || ['', '', '', ''];
     const labels = ['[1/4] Form filled', '[2/4] First response', '[3/4] After settle', '[4/4] Final result'];
     const notes = [
@@ -2384,8 +2634,8 @@ async function simulateLoginDetailed(cred, siteId, siteName, loginUrl) {
       `${siteName} — ${data.outcome || 'done'}`,
     ];
     for (let i = 0; i < 4; i++) {
-      const du = shots[i]; const u = shotUrls[i];
-      if (du || u) saveDebugShot(du, shotTag + `_${i + 1}_${labels[i].split(' ').pop().toLowerCase()}`, notes[i], shotTag, u);
+      const u = shotUrls[i];
+      if (u) saveDebugShot('', `${shotTag}_${i + 1}_${labels[i].split(' ').pop().toLowerCase()}`, notes[i], shotTag, u);
     }
 
     const statusMap = {
@@ -2431,7 +2681,7 @@ async function simulateCheckDetailed(card, ppsrUrl) {
     if (!resp.ok) throw new Error(`API ${resp.status}`);
     const data = await resp.json();
 
-    const shots    = data.shots    || ['', '', '', ''];
+    // Swarm Upgrade v1 — disk URLs only; `data.shots` base64 path is retired.
     const shotUrls = data.shotUrls || ['', '', '', ''];
     const notes = [
       `PPSR — page loaded — ···${card.number.slice(-4)}`,
@@ -2440,8 +2690,8 @@ async function simulateCheckDetailed(card, ppsrUrl) {
       `PPSR — ${data.outcome || 'done'}`,
     ];
     for (let i = 0; i < 4; i++) {
-      const du = shots[i]; const u = shotUrls[i];
-      if (du || u) saveDebugShot(du, `${shotTag}_${i + 1}`, notes[i], shotTag, u);
+      const u = shotUrls[i];
+      if (u) saveDebugShot('', `${shotTag}_${i + 1}`, notes[i], shotTag, u);
     }
 
     const result = data.outcome === 'working' ? Status.WORKING : Status.DEAD;
@@ -2451,244 +2701,6 @@ async function simulateCheckDetailed(card, ppsrUrl) {
   }
 }
 
-
-// ── Paired login (experimental — Both tab) ─────────────────
-/**
- * Renders the Paired credentials list and stats. Mirrors renderCredSite shape
- * but each credential carries TWO status badges (Joe + Ignition).
- */
-function renderPair() {
-  const creds     = state.pairCreds;
-  const filter    = state.pairFilter;
-  const selIds    = state.selectedPairIds;
-  const isRunning = state.pairRunning;
-
-  const total    = creds.length;
-  const both     = creds.filter(c => c.joeStatus === CredStatus.WORKING && c.ignStatus === CredStatus.WORKING).length;
-  const either   = creds.filter(c => (c.joeStatus === CredStatus.WORKING) !== (c.ignStatus === CredStatus.WORKING)).length;
-  const none     = creds.filter(c => c.joeStatus !== CredStatus.WORKING && c.ignStatus !== CredStatus.WORKING && (c.joeStatus !== CredStatus.UNTESTED || c.ignStatus !== CredStatus.UNTESTED)).length;
-  const untested = creds.filter(c => c.joeStatus === CredStatus.UNTESTED && c.ignStatus === CredStatus.UNTESTED).length;
-
-  $('pairStatTotal').textContent  = total;
-  $('pairStatBoth').textContent   = both;
-  $('pairStatEither').textContent = either;
-  $('pairStatNone').textContent   = none;
-  updateBadge('pairBadge', both);
-
-  $('pairStatusDot').className = 'status-dot' + (isRunning ? ' running' : '');
-  $('pairStatusLabel').textContent = isRunning ? 'Running…' : 'Idle';
-  $('pairRunBtn').classList.toggle('hidden', isRunning || untested === 0);
-  $('pairStopBtn').classList.toggle('hidden', !isRunning);
-  $('pairCredsTitle').textContent = `Credentials (${total})`;
-
-  let visible = creds;
-  if (filter === 'untested')   visible = creds.filter(c => c.joeStatus === CredStatus.UNTESTED && c.ignStatus === CredStatus.UNTESTED);
-  else if (filter === 'both')  visible = creds.filter(c => c.joeStatus === CredStatus.WORKING && c.ignStatus === CredStatus.WORKING);
-  else if (filter === 'either')visible = creds.filter(c => (c.joeStatus === CredStatus.WORKING) !== (c.ignStatus === CredStatus.WORKING));
-  else if (filter === 'none')  visible = creds.filter(c => c.joeStatus !== CredStatus.WORKING && c.ignStatus !== CredStatus.WORKING && (c.joeStatus !== CredStatus.UNTESTED || c.ignStatus !== CredStatus.UNTESTED));
-
-  const listEl  = $('pairCredList');
-  const emptyEl = $('pairEmpty');
-  const batchEl = $('pairBatchBar');
-
-  if (total === 0) {
-    emptyEl.classList.remove('hidden');
-    listEl.innerHTML = '';
-    batchEl.classList.add('hidden');
-    return;
-  }
-  emptyEl.classList.add('hidden');
-
-  if (visible.length === 0) {
-    const li = document.createElement('li');
-    li.className = 'cred-empty-filter';
-    li.textContent = `No credentials match the "${filter}" filter.`;
-    listEl.replaceChildren(li);
-    const n = selIds.size;
-    batchEl.classList.toggle('hidden', n === 0);
-    $('pairSelectedCount').textContent = n > 0 ? `${n} selected` : '';
-    $('pairCheckSelectedBtn').textContent = `▶ Check Selected (${n})`;
-    return;
-  }
-
-  listEl.innerHTML = visible.map(c => {
-    const sel = selIds.has(c.id);
-    const checking = c.joeStatus === CredStatus.TESTING || c.ignStatus === CredStatus.TESTING;
-    const lbl = (s) => credStatusLabel(s);
-    return `
-    <li class="card-item cred-item${sel ? ' selected' : ''}${checking ? ' checking' : ''}" data-id="${c.id}" data-site="pair">
-      <div class="card-checkbox" data-check="${c.id}">${sel ? '✓' : ''}</div>
-      <div class="card-info">
-        <div class="card-number cred-username">${c.username}</div>
-        <div class="card-meta">
-          <span>••••••••</span>
-          ${c.testHistory.length > 0 ? `<span>${c.testHistory.length} test${c.testHistory.length !== 1 ? 's' : ''}</span>` : ''}
-        </div>
-        <div class="pair-status-row">
-          <span class="pair-status-pill ${c.joeStatus}">🎰 ${lbl(c.joeStatus)}</span>
-          <span class="pair-status-pill ${c.ignStatus}">🔥 ${lbl(c.ignStatus)}</span>
-        </div>
-      </div>
-    </li>`;
-  }).join('');
-
-  const n = selIds.size;
-  batchEl.classList.toggle('hidden', n === 0);
-  $('pairSelectedCount').textContent = n > 0 ? `${n} selected` : '';
-  $('pairCheckSelectedBtn').textContent = `▶ Check Selected (${n})`;
-}
-
-/**
- * Calls /api/login-check-pair for one credential and saves debug shots from
- * both sides into state.debugShots.
- */
-async function simulatePairedLogin(cred) {
-  const start = Date.now();
-  const joeUrl = state.settings.joeLoginUrl || JOE_LOGIN_URL;
-  const ignUrl = state.settings.ignitionLoginUrl || IGNITION_LOGIN_URL;
-  try {
-    const resp = await fetch('/api/login-check-pair', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        username: cred.username, password: cred.password,
-        joeUrl, ignUrl,
-        timeout: (state.settings.loginTimeout || 60) * 1000,
-        postSubmitWait: state.settings.postSubmitWait || 3000,
-      }),
-    });
-    if (!resp.ok) throw new Error(`API ${resp.status}`);
-    const data = await resp.json();
-    const statusMap = {
-      working: CredStatus.WORKING,
-      noAcc: CredStatus.NO_ACC,
-      permDisabled: CredStatus.PERM_DISABLED,
-      tempDisabled: CredStatus.TEMP_DISABLED,
-    };
-    const tag = `pair_${sanitizeFilenamePart(cred.username.slice(0, 20))}`;
-    for (const sideKey of ['joe', 'ign']) {
-      const side = data[sideKey] || {};
-      const shots = side.shots || ['', '', '', ''];
-      const urls  = side.shotUrls || ['', '', '', ''];
-      for (let i = 0; i < 4; i++) {
-        const du = shots[i]; const u = urls[i];
-        if (du || u) saveDebugShot(du, `${tag}_${sideKey}_${i + 1}`, `Pair (${sideKey}) — ${cred.username} — ${i + 1}/4`, tag, u);
-      }
-    }
-    return {
-      joeStatus: statusMap[data.joe?.outcome] || CredStatus.NO_ACC,
-      ignStatus: statusMap[data.ign?.outcome] || CredStatus.NO_ACC,
-      joeDetail: data.joe?.note || data.joe?.outcome || '',
-      ignDetail: data.ign?.note || data.ign?.outcome || '',
-      durationMs: Date.now() - start,
-    };
-  } catch (err) {
-    return {
-      joeStatus: CredStatus.NO_ACC, ignStatus: CredStatus.NO_ACC,
-      joeDetail: `Server error: ${err.message}`, ignDetail: `Server error: ${err.message}`,
-      durationMs: Date.now() - start,
-    };
-  }
-}
-
-/**
- * Sequentially tests each paired credential against Joe + Ignition in parallel
- * (within one credential). Concurrency is intentionally 1 — the server runs
- * two browser windows side-by-side per credential.
- */
-async function runPairedLoginChecks(credIds = null) {
-  if (state.pairRunning) return;
-  const targets = credIds
-    ? state.pairCreds.filter(c => credIds.includes(c.id) && c.joeStatus !== CredStatus.TESTING && c.ignStatus !== CredStatus.TESTING)
-    : state.pairCreds.filter(c => c.joeStatus === CredStatus.UNTESTED && c.ignStatus === CredStatus.UNTESTED);
-  if (targets.length === 0) { toast('No untested paired credentials', 'info'); return; }
-
-  const abortCtrl = new AbortController();
-  state.pairRunning = true;
-  state.pairAbortController = abortCtrl;
-  const signal = abortCtrl.signal;
-
-  showProgress('Running Paired Login Checks (Joe + Ignition)…', 'pair');
-  renderAll();
-
-  let done = 0, both = 0, either = 0, none = 0;
-  for (const cred of targets) {
-    if (signal.aborted) break;
-    const idx = state.pairCreds.findIndex(c => c.id === cred.id);
-    if (idx === -1) continue;
-    state.pairCreds[idx].joeStatus = CredStatus.TESTING;
-    state.pairCreds[idx].ignStatus = CredStatus.TESTING;
-    scheduleRender();
-
-    try {
-      const res = await simulatePairedLogin(cred);
-      if (signal.aborted) break;
-      state.pairCreds[idx].joeStatus = res.joeStatus;
-      state.pairCreds[idx].ignStatus = res.ignStatus;
-      state.pairCreds[idx].joeDetail = res.joeDetail;
-      state.pairCreds[idx].ignDetail = res.ignDetail;
-      state.pairCreds[idx].testHistory = state.pairCreds[idx].testHistory || [];
-      state.pairCreds[idx].testHistory.unshift({
-        ts: Date.now(),
-        joeStatus: res.joeStatus, joeDetail: res.joeDetail,
-        ignStatus: res.ignStatus, ignDetail: res.ignDetail,
-        durationMs: res.durationMs,
-      });
-      if (state.pairCreds[idx].testHistory.length > 50) state.pairCreds[idx].testHistory = state.pairCreds[idx].testHistory.slice(0, 50);
-
-      const isJoeOk = res.joeStatus === CredStatus.WORKING;
-      const isIgnOk = res.ignStatus === CredStatus.WORKING;
-      if (isJoeOk && isIgnOk) both++;
-      else if (isJoeOk || isIgnOk) either++;
-      else none++;
-
-      state.sessions.unshift({
-        id: crypto.randomUUID(), type: 'pair', username: cred.username,
-        result: (isJoeOk || isIgnOk) ? 'working' : 'dead',
-        detail: `Joe: ${res.joeDetail} | Ign: ${res.ignDetail}`,
-        ts: Date.now(), durationMs: res.durationMs,
-      });
-      const icon = (isJoeOk && isIgnOk) ? '✅' : (isJoeOk || isIgnOk) ? '◐' : '❌';
-      state.activity.unshift({ icon, label: cred.username, detail: `Pair: 🎰 ${credStatusLabel(res.joeStatus)} · 🔥 ${credStatusLabel(res.ignStatus)}`, ts: Date.now() });
-      if (state.activity.length > 100) state.activity = state.activity.slice(0, 100);
-      saveActivity();
-
-      done++;
-      savePairCreds(); saveSessions();
-      updateProgress(done, targets.length, `${both} both · ${either} either · ${none} neither`);
-      scheduleRender();
-    } catch {
-      state.pairCreds[idx].joeStatus = CredStatus.UNTESTED;
-      state.pairCreds[idx].ignStatus = CredStatus.UNTESTED;
-      savePairCreds();
-      done++;
-      updateProgress(done, targets.length);
-    }
-  }
-
-  state.pairRunning = false;
-  state.pairAbortController = null;
-  hideProgress();
-  toast(`Paired: ${both} both · ${either} either · ${none} neither (of ${done})`, both > 0 ? 'success' : 'info', 4000);
-  renderAll();
-}
-
-/**
- * Aborts any active paired login run. Resets TESTING entries to UNTESTED.
- */
-async function stopPairedLoginChecks() {
-  if (state.pairAbortController) state.pairAbortController.abort();
-  state.pairRunning = false;
-  state.pairAbortController = null;
-  state.pairCreds.forEach(c => {
-    if (c.joeStatus === CredStatus.TESTING) c.joeStatus = CredStatus.UNTESTED;
-    if (c.ignStatus === CredStatus.TESTING) c.ignStatus = CredStatus.UNTESTED;
-  });
-  savePairCreds();
-  hideProgress();
-  renderAll();
-  toast('Stopped', 'info');
-}
 
 // ── Run login checks ──────────────────────────────────────
 /**
@@ -3422,52 +3434,6 @@ function wireEvents() {
     const ids = [...state.selectedIgnIds]; state.selectedIgnIds.clear(); runLoginChecks('ign', ids);
   });
 
-  // Paired (Both) handlers
-  $all('#tab-pair .filter-chip').forEach(btn => {
-    btn.addEventListener('click', () => {
-      $all('#tab-pair .filter-chip').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active'); state.pairFilter = btn.dataset.filter; renderPair();
-    });
-  });
-  $('importPairBtn')?.addEventListener('click',  () => openImportCred('pair'));
-  $('importPairBtn2')?.addEventListener('click', () => openImportCred('pair'));
-  $('pairRunBtn')?.addEventListener('click',  () => runPairedLoginChecks());
-  $('pairStopBtn')?.addEventListener('click', () => stopPairedLoginChecks());
-  $('clearPairBtn')?.addEventListener('click', () => {
-    if (state.pairCreds.length === 0) return;
-    openConfirm('Clear Paired Credentials', `Remove all ${state.pairCreds.length} paired credential(s)?`, () => {
-      state.pairCreds = []; state.selectedPairIds.clear(); savePairCreds(); renderAll(); toast('Paired credentials cleared', 'info');
-    });
-  });
-  $('pairExportBtn')?.addEventListener('click', () => {
-    const w = state.pairCreds.filter(c => c.joeStatus === CredStatus.WORKING && c.ignStatus === CredStatus.WORKING);
-    if (w.length === 0) { toast('No paired credentials with both sides working', 'info'); return; }
-    const text = w.map(c => `${c.username}:${c.password}`).join('\n');
-    const blob = new Blob([text], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `sitchomatic_pair_${Date.now()}.txt`; a.click();
-    URL.revokeObjectURL(url);
-    toast(`Exported ${w.length} paired credential(s)`, 'success');
-  });
-  $('pairCredList')?.addEventListener('click', e => {
-    const checkEl = e.target.closest('[data-check]');
-    const itemEl  = e.target.closest('.card-item');
-    if (!itemEl) return;
-    const id = itemEl.dataset.id;
-    if (checkEl) {
-      if (state.selectedPairIds.has(id)) state.selectedPairIds.delete(id);
-      else state.selectedPairIds.add(id);
-      renderPair();
-    } else {
-      // Re-test single paired cred on click (simple UX)
-      runPairedLoginChecks([id]);
-    }
-  });
-  $('pairCheckSelectedBtn')?.addEventListener('click', () => {
-    const ids = [...state.selectedPairIds]; state.selectedPairIds.clear(); runPairedLoginChecks(ids);
-  });
-
   $('closeImportCredModal').addEventListener('click', closeImportCred);
   $('cancelImportCred').addEventListener('click', closeImportCred);
   $('confirmImportCred').addEventListener('click', confirmImportCred);
@@ -3582,28 +3548,35 @@ function wireEvents() {
   };
   autoBind('joeLoginUrl',      'joeLoginUrl');
   autoBind('ignitionLoginUrl', 'ignitionLoginUrl');
-  autoBind('maxConcurrency', 'maxConcurrency', v => Math.max(1, Math.min(20, parseInt(v) || 7)));
-  autoBind('checkTimeout',   'checkTimeout',   v => Math.max(30, Math.min(300, parseInt(v) || 180)));
-  autoBind('testEmail',      'testEmail');
-  autoBind('ppsrUrl',        'ppsrUrl');
-  autoBind('loginConcurrency', 'loginConcurrency', v => Math.max(1, Math.min(10, parseInt(v) || 3)));
-  autoBind('loginTimeout',   'loginTimeout',   v => Math.max(15, Math.min(120, parseInt(v) || 60)));
-  autoBind('typingSpeedMin', 'typingSpeedMinMs', v => Math.max(20, Math.min(500, parseInt(v) || 50)));
-  autoBind('typingSpeedMax', 'typingSpeedMaxMs', v => Math.max(50, Math.min(1000, parseInt(v) || 150)));
-  autoBind('batchDelay',     'batchDelayBetweenStartsMs', v => Math.max(0, Math.min(5000, parseInt(v) || 50)));
-  autoBind('pageLoadTimeout', 'pageLoadTimeout', v => Math.max(10, Math.min(300, parseInt(v) || 180)));
-  autoBind('postSubmitWait',  'postSubmitWait',  v => Math.max(500, Math.min(15000, parseInt(v) || 3000)));
-  autoBind('maxSubmitClicks', 'maxSubmitClicks', v => Math.max(1, Math.min(12, parseInt(v) || 6)));
-  // Per-site overrides — 0 means "use global"; otherwise clamped to sane ranges.
-  const siteOverride = (v, lo, hi) => {
-    const n = parseInt(v);
-    if (!n || n <= 0) return 0;
-    return Math.max(lo, Math.min(hi, n));
-  };
-  autoBind('joePostSubmitWait',  'joePostSubmitWait',  v => siteOverride(v, 500, 15000));
-  autoBind('joeMaxSubmitClicks', 'joeMaxSubmitClicks', v => siteOverride(v, 1, 12));
-  autoBind('ignPostSubmitWait',  'ignPostSubmitWait',  v => siteOverride(v, 500, 15000));
-  autoBind('ignMaxSubmitClicks', 'ignMaxSubmitClicks', v => siteOverride(v, 1, 12));
+  // Swarm Upgrade v1 — every clamp below routes through CONFIG_CLAMPS in
+  // webapp/config.js so the bounds can never drift from the DEFAULT_CONFIG.
+  autoBind('maxConcurrency',  'maxConcurrency',            v => clampSetting('maxConcurrency',            v));
+  autoBind('checkTimeout',    'checkTimeout',              v => clampSetting('checkTimeout',              v));
+  autoBind('testEmail',       'testEmail');
+  autoBind('ppsrUrl',         'ppsrUrl');
+  autoBind('loginConcurrency','loginConcurrency',          v => clampSetting('loginConcurrency',          v));
+  autoBind('loginTimeout',    'loginTimeout',              v => clampSetting('loginTimeout',              v));
+  autoBind('typingSpeedMin',  'typingSpeedMinMs',          v => clampSetting('typingSpeedMinMs',          v));
+  autoBind('typingSpeedMax',  'typingSpeedMaxMs',          v => clampSetting('typingSpeedMaxMs',          v));
+  autoBind('batchDelay',      'batchDelayBetweenStartsMs', v => clampSetting('batchDelayBetweenStartsMs', v));
+  autoBind('pageLoadTimeout', 'pageLoadTimeout',           v => clampSetting('pageLoadTimeout',           v));
+  // Swarm Upgrade v1 — server-side worker-pool concurrency. Writing to this
+  // field POSTs /api/pool/config so the server reconfigures immediately.
+  const maxConcurrentEl = $('maxConcurrent');
+  if (maxConcurrentEl) {
+    maxConcurrentEl.addEventListener('change', async () => {
+      const n = clampSetting('maxConcurrent', maxConcurrentEl.value);
+      state.settings.maxConcurrent = n;
+      saveSettings();
+      try {
+        await fetch('/api/pool/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ maxConcurrent: n }),
+        });
+      } catch {}
+    });
+  }
 
   const checkBind = (id, key) => {
     const el = $(id);
@@ -3684,30 +3657,20 @@ function wireEvents() {
   $('nukeBtn').addEventListener('click', () => {
     openConfirm('Reset All Data', 'This will permanently delete all cards, credentials, sessions, and settings. Are you sure?', () => {
       localStorage.clear();
+      // Swarm Upgrade v1 — wipe IDB mirror too so nuke is a true reset.
+      try {
+        for (const [, idbKey] of IDB_KV_MAP) void IDB.kvDel(idbKey);
+        void IDB.clear();
+      } catch {}
       state.cards = []; state.sessions = []; state.activity = [];
       clearAllRecordings(); state.debugShots = [];
       state.joeCreds = []; state.ignCreds = [];
       state.blacklist = [];
       state.wireGuardConfigs = []; state.nordAccessKey = '';
       state.grokKey = '';
-      state.settings = {
-        maxConcurrency: 7, checkTimeout: 180, autoRetry: true, stealthMode: false,
-        debugScreenshots: true, testEmail: '',
-        ppsrUrl: 'https://transact.ppsr.gov.au/CarCheck/',
-        joeLoginUrl: 'https://joefortunepokies.win/login',
-        ignitionLoginUrl: 'https://ignitioncasino.ooo/login',
-        loginConcurrency: 3, loginTimeout: 60, useEmailRotation: false, theme: 'dark',
-        typingSpeedMinMs: 50, typingSpeedMaxMs: 150, requeueOnTimeout: true,
-        requeueOnFailure: true, maxRequeueCount: 3, batchDelayBetweenStartsMs: 50,
-        pageLoadTimeout: 180, liveView: true,
-        postSubmitWait: 3000, maxSubmitClicks: 6,
-        joePostSubmitWait: 0, joeMaxSubmitClicks: 0,
-        ignPostSubmitWait: 0, ignMaxSubmitClicks: 0,
-        vpnRotation: false, dnsRotation: false, proxyRotateOnFailure: true,
-        // v1.3 toggles reset to sane defaults
-        useSSE: true, useShotUrls: true, reuseSession: false, encryptSecrets: false,
-        preflightCheck: true, visualDiff: true, smartThrottle: true, debugModeProfile: false,
-      };
+      // Swarm Upgrade v1 — reset via DEFAULT_CONFIG so the nuke path cannot
+      // drift from state init or the autoBind clamps ever again.
+      state.settings = cloneDefaultConfig();
       state.selectedCardIds.clear(); state.selectedJoeIds.clear(); state.selectedIgnIds.clear();
       applyTheme('dark'); renderAll(); toast('All data reset', 'info');
     });
@@ -3822,6 +3785,23 @@ function boot() {
   applyTheme(state.settings.theme);
   wireEvents();
   renderAll();
+  // Swarm Upgrade v1 — hydrate from IndexedDB after LS load. Runs the one-shot
+  // migration the first time, then prefers IDB values (unlimited capacity vs
+  // LS's 5 MB cap) for all subsequent boots.
+  void reloadFromIDB();
+  // Push the user's configured worker-pool cap to the server on every boot so
+  // it survives restarts. Non-fatal if the server rejects / is unreachable.
+  void (async () => {
+    try {
+      const n = clampSetting('maxConcurrent', state.settings.maxConcurrent);
+      if (!Number.isFinite(n)) return;
+      await fetch('/api/pool/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ maxConcurrent: n }),
+      });
+    } catch {}
+  })();
   void detectIP();
   void checkServerStatus();
   // ── v1.3: live SSE wiring ───────────────────────────────
@@ -3845,6 +3825,16 @@ function boot() {
       // Light touch — the HTTP response path writes the shot record; this
       // just nudges the modal to repaint if it's currently open.
       if (!$('screenshotModal').classList.contains('hidden')) renderDebugShots();
+    });
+    SSE.on('pool.config', (d) => {
+      // Mirror the server-side pool cap change into the local settings and
+      // persist it so the next boot doesn't push our stale localStorage value
+      // back over the top of a cap set by another tab or an external curl.
+      if (d && typeof d.maxConcurrent === 'number') {
+        state.settings.maxConcurrent = d.maxConcurrent;
+        if ($('maxConcurrent')) $('maxConcurrent').value = d.maxConcurrent;
+        saveSettings();
+      }
     });
     SSE.connect();
   }
