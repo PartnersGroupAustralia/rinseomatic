@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sitchomatic v1.2</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ── HEADER ── -->
+  <header class="app-header">
+    <div class="header-inner">
+      <span class="app-logo">⚡ Sitchomatic</span>
+      <div class="header-right">
+        <span id="runStatus" class="status-pill idle">● Idle</span>
+        <button id="themeToggle" class="icon-btn" title="Toggle theme">☀️</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── IP BANNER ── -->
+  <div id="ipBanner" class="ip-banner hidden">
+    <span id="ipBannerText"></span>
+    <button id="closeBanner" class="banner-close">✕</button>
+  </div>
+
+  <!-- ── PROGRESS OVERLAY ── -->
+  <div class="progress-overlay hidden" id="progressOverlay">
+    <div class="progress-card">
+      <div class="progress-title" id="progressTitle">Running…</div>
+      <div class="progress-track"><div class="progress-bar-fill" id="progressBarFill"></div></div>
+      <div class="progress-stats-row">
+        <span id="progressStats">0 / 0</span>
+        <span class="progress-sep">·</span>
+        <span id="progressWorking" class="green">0 working</span>
+        <span class="progress-sep">·</span>
+        <span id="progressDead" class="red">0 dead</span>
+      </div>
+      <div id="progressSub" class="progress-sub"></div>
+      <button class="btn-danger" id="cancelRunBtn">Cancel</button>
+    </div>
+  </div>
+
+  <!-- ── RECORDINGS MODAL ── -->
+  <div class="modal-overlay hidden" id="recordingsModal">
+    <div class="modal modal-lg">
+      <div class="modal-header">
+        <span class="modal-title">Run Recordings</span>
+        <button class="modal-close" id="closeRecordingsModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="recordingsEmpty" class="empty-state">
+          <div class="empty-icon">🎥</div>
+          <div class="empty-title">No Recordings Yet</div>
+          <div class="empty-sub">Run a check and recordings will appear here.</div>
+        </div>
+        <div id="recordingsList" class="recording-grid"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-danger" id="clearRecordingsBtn">🗑 Clear</button>
+        <button class="btn-outline" id="closeRecordingsBtn">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── DEBUG SCREENSHOTS MODAL ── -->
+  <div class="modal-overlay hidden" id="screenshotModal">
+    <div class="modal modal-xl">
+      <div class="modal-header">
+        <span class="modal-title">Debug Screenshots</span>
+        <button class="modal-close" id="closeScreenshotModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="screenshotsEmpty" class="empty-state">
+          <div class="empty-icon">🖼</div>
+          <div class="empty-title">No Debug Screenshots</div>
+          <div class="empty-sub">Run a check with Debug Screenshots enabled. Each check produces 4 screenshots.</div>
+        </div>
+        <div id="screenshotList" class="shot-grid"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-danger" id="clearScreenshotsBtn">🗑 Clear</button>
+        <button class="btn-outline" id="closeScreenshotsBtn">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CARD IMPORT MODAL ── -->
+  <div class="modal-overlay hidden" id="importModal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">Import Cards</span>
+        <button class="modal-close" id="closeImportModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="importFeedback" class="import-feedback"></div>
+        <textarea id="importText" class="import-textarea" placeholder="Paste cards here, one per line:&#10;4111111111111111|01|26|123&#10;5500005555555559 02 26 456&#10;378282246310005/03/26/789"></textarea>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-outline" id="cancelImport">Cancel</button>
+        <button class="btn-primary" id="confirmImport" disabled>Add 0 Cards</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CREDENTIAL IMPORT MODAL ── -->
+  <div class="modal-overlay hidden" id="importCredModal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title" id="importCredTitle">Import Credentials</span>
+        <button class="modal-close" id="closeImportCredModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="importCredFeedback" class="import-feedback"></div>
+        <textarea id="importCredText" class="import-textarea" placeholder="Paste credentials, one per line:&#10;user@email.com:password123&#10;user@email.com password123&#10;user@email.com|password123"></textarea>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-outline" id="cancelImportCred">Cancel</button>
+        <button class="btn-primary" id="confirmImportCred" disabled>Add 0 Credentials</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CARD DETAIL MODAL ── -->
+  <div class="modal-overlay hidden" id="cardDetailModal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title" id="detailTitle">Card Detail</span>
+        <button class="modal-close" id="closeDetailModal">✕</button>
+      </div>
+      <div class="modal-body" id="detailBody"></div>
+      <div class="modal-footer">
+        <button class="btn-danger" id="deleteCardBtn">🗑 Delete</button>
+        <button class="btn-primary" id="checkCardBtn">▶ Check</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CREDENTIAL DETAIL MODAL ── -->
+  <div class="modal-overlay hidden" id="credDetailModal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title" id="credDetailTitle">Credential Detail</span>
+        <button class="modal-close" id="closeCredDetailModal">✕</button>
+      </div>
+      <div class="modal-body" id="credDetailBody"></div>
+      <div class="modal-footer">
+        <button class="btn-outline" id="copyCredBtn">📋 Copy</button>
+        <button class="btn-danger" id="deleteCredBtn">🗑 Delete</button>
+        <button class="btn-primary" id="checkCredBtn">▶ Check</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CONFIRM MODAL ── -->
+  <div class="modal-overlay hidden" id="confirmModal">
+    <div class="modal modal-sm">
+      <div class="modal-header">
+        <span class="modal-title" id="confirmTitle">Confirm</span>
+      </div>
+      <div class="modal-body">
+        <p id="confirmMessage"></p>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-outline" id="confirmCancel">Cancel</button>
+        <button class="btn-danger" id="confirmOk">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── WIREGUARD PASTE MODAL ── -->
+  <div class="modal-overlay hidden" id="wgPasteModal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">Add WireGuard Config</span>
+        <button class="modal-close" id="closeWgPasteModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="settings-note">Paste the contents of a NordVPN WireGuard .conf file, or import the file directly.</p>
+        <div id="wgPasteFeedback" class="import-feedback"></div>
+        <textarea id="wgPasteText" class="import-textarea" placeholder="[Interface]&#10;PrivateKey = ...&#10;Address = ...&#10;&#10;[Peer]&#10;PublicKey = ...&#10;Endpoint = ..."></textarea>
+        <div style="margin-top:8px">
+          <button class="btn-outline" id="wgImportFileBtn">📁 Import .conf file</button>
+          <input type="file" id="wgFileInput" accept=".conf" style="display:none" />
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-outline" id="cancelWgPaste">Cancel</button>
+        <button class="btn-primary" id="confirmWgPaste">Add Config</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TABS ── -->
+  <nav class="tab-bar">
+    <button class="tab-btn active" data-tab="dashboard">
+      <span class="tab-icon">⚡</span><span class="tab-label">Dashboard</span>
+    </button>
+    <button class="tab-btn" data-tab="cards">
+      <span class="tab-icon">💳</span>
+      <span class="tab-label">Cards</span>
+      <span id="cardsBadge" class="badge hidden">0</span>
+    </button>
+    <button class="tab-btn" data-tab="working">
+      <span class="tab-icon">✅</span>
+      <span class="tab-label">Working</span>
+      <span id="workingBadge" class="badge hidden">0</span>
+    </button>
+    <button class="tab-btn" data-tab="joe">
+      <span class="tab-icon">🎰</span>
+      <span class="tab-label">Joe</span>
+      <span id="joeBadge" class="badge hidden">0</span>
+    </button>
+    <button class="tab-btn" data-tab="ignition">
+      <span class="tab-icon">🔥</span>
+      <span class="tab-label">Ignition</span>
+      <span id="ignitionBadge" class="badge hidden">0</span>
+    </button>
+    <button class="tab-btn" data-tab="pair">
+      <span class="tab-icon">⚡</span>
+      <span class="tab-label">Both</span>
+      <span id="pairBadge" class="badge hidden">0</span>
+    </button>
+    <button class="tab-btn" data-tab="sessions">
+      <span class="tab-icon">📋</span><span class="tab-label">Sessions</span>
+    </button>
+    <button class="tab-btn" data-tab="settings">
+      <span class="tab-icon">⚙️</span><span class="tab-label">Settings</span>
+    </button>
+  </nav>
+
+  <!-- ── MAIN CONTENT ── -->
+  <main class="main-content">
+
+    <!-- ═══════ DASHBOARD ═══════ -->
+    <section class="tab-panel active" id="tab-dashboard">
+      <div class="panel-scroll">
+        <div class="stat-grid" id="statGrid">
+          <div class="stat-card">
+            <div class="stat-top"><span class="stat-icon">💳</span><span class="stat-value" id="statTotal">0</span></div>
+            <div class="stat-label">Total Cards</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-top"><span class="stat-icon">✅</span><span class="stat-value" id="statWorking">0</span></div>
+            <div class="stat-label">Working</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-top"><span class="stat-icon">❌</span><span class="stat-value" id="statDead">0</span></div>
+            <div class="stat-label">Dead</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-top"><span class="stat-icon">❓</span><span class="stat-value" id="statUntested">0</span></div>
+            <div class="stat-label">Untested</div>
+          </div>
+        </div>
+
+        <div class="rate-card">
+          <div class="rate-header">
+            <span class="rate-title">PPSR Success Rate</span>
+            <span class="rate-pct" id="ratePct">0%</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-fill" id="progressFill" style="width:0%"></div>
+          </div>
+          <div class="rate-sub" id="rateSub">No cards tested yet</div>
+        </div>
+
+        <div class="login-stat-row">
+          <div class="login-stat"><div class="login-stat-num green" id="dashJoeWorking">0</div><div class="login-stat-label">Joe Working</div></div>
+          <div class="login-stat"><div class="login-stat-num green" id="dashIgnWorking">0</div><div class="login-stat-label">Ign Working</div></div>
+          <div class="login-stat"><div class="login-stat-num" id="dashJoeTotal">0</div><div class="login-stat-label">Joe Total</div></div>
+          <div class="login-stat"><div class="login-stat-num" id="dashIgnTotal">0</div><div class="login-stat-label">Ign Total</div></div>
+        </div>
+
+        <div class="status-card">
+          <div class="status-left">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusLabel">Idle</span>
+            <span id="testingCount" class="testing-count hidden"></span>
+          </div>
+          <div class="status-right">
+            <button id="runBtn" class="run-btn">▶ Run PPSR</button>
+            <button id="stopBtn" class="stop-btn hidden">■ Stop</button>
+          </div>
+        </div>
+
+        <div id="emptyDash" class="empty-state hidden">
+          <div class="empty-icon">💳</div>
+          <div class="empty-title">No Cards Added</div>
+          <div class="empty-sub">Go to the Cards tab to import, or use Joe/Ignition tabs for login checks.</div>
+        </div>
+
+        <div class="section-header">Recent Activity</div>
+        <div id="recentActivity" class="activity-list">
+          <div class="empty-row">No activity yet</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════ CARDS ═══════ -->
+    <section class="tab-panel" id="tab-cards">
+      <div class="panel-scroll">
+        <div class="toolbar">
+          <span class="toolbar-title" id="cardsTitle">Cards (0)</span>
+          <div class="toolbar-actions">
+            <button class="icon-text-btn danger" id="clearCardsBtn">🗑 Clear</button>
+            <button class="icon-text-btn" id="importBtn">＋ Import</button>
+          </div>
+        </div>
+        <div id="cardListEmpty" class="empty-state">
+          <div class="empty-icon">💳</div>
+          <div class="empty-title">No Cards</div>
+          <div class="empty-sub">Tap + Import to add cards. Supported formats: NUM|MM|YY|CVV · NUM MM YY CVV · NUM/MM/YY/CVV</div>
+          <button class="btn-primary" id="importBtn2">＋ Import Cards</button>
+        </div>
+        <ul class="card-list" id="cardList"></ul>
+        <div class="batch-bar hidden" id="batchBar">
+          <button class="btn-outline" id="checkSelectedBtn">▶ Check Selected</button>
+          <button class="btn-outline" id="exportSelectedBtn">📋 Export</button>
+          <span id="selectedCount" class="selected-count"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════ WORKING (PPSR) ═══════ -->
+    <section class="tab-panel" id="tab-working">
+      <div class="panel-scroll">
+        <div class="toolbar">
+          <span class="toolbar-title" id="workingTitle">Working (0)</span>
+          <button class="icon-text-btn" id="copyAllBtn">📋 Copy All</button>
+        </div>
+        <div id="workingEmpty" class="empty-state">
+          <div class="empty-icon">✅</div>
+          <div class="empty-title">No Working Cards</div>
+          <div class="empty-sub">Cards that pass PPSR checks will appear here. Tap to copy.</div>
+        </div>
+        <ul class="card-list" id="workingList"></ul>
+      </div>
+    </section>
+
+    <!-- ═══════ JOE FORTUNE ═══════ -->
+    <section class="tab-panel" id="tab-joe">
+      <div class="panel-scroll">
+        <div class="toolbar">
+          <div class="site-tag joe">🎰 Joe Fortune</div>
+          <div class="toolbar-actions">
+            <button class="icon-text-btn danger" id="clearJoeBtn">🗑</button>
+            <button class="icon-text-btn" id="importJoeBtn">＋ Import</button>
+          </div>
+        </div>
+        <div class="login-stat-row" id="joeStatRow">
+          <div class="login-stat"><div class="login-stat-num" id="joeStatTotal">0</div><div class="login-stat-label">Total</div></div>
+          <div class="login-stat"><div class="login-stat-num green" id="joeStatWorking">0</div><div class="login-stat-label">Working</div></div>
+          <div class="login-stat"><div class="login-stat-num red" id="joeStatNoAcc">0</div><div class="login-stat-label">No Acc/Banned</div></div>
+          <div class="login-stat"><div class="login-stat-num orange" id="joeStatDisabled">0</div><div class="login-stat-label">Temp Disabled</div></div>
+        </div>
+        <div class="status-card">
+          <div class="status-left">
+            <span class="status-dot" id="joeStatusDot"></span>
+            <span id="joeStatusLabel">Idle</span>
+          </div>
+          <div class="status-right">
+            <button id="joeRunBtn" class="run-btn">▶ Run</button>
+            <button id="joeStopBtn" class="stop-btn hidden">■ Stop</button>
+          </div>
+        </div>
+        <div class="toolbar" style="padding-top:4px">
+          <span class="toolbar-title" id="joeCredsTitle">Credentials (0)</span>
+          <div class="toolbar-actions">
+            <button class="icon-text-btn" id="joeCopyWorkingBtn">📋 Copy Working</button>
+            <button class="icon-text-btn" id="joeExportBtn">📤 Export</button>
+          </div>
+        </div>
+        <div class="filter-row" id="joeFilterRow">
+          <button class="filter-chip active" data-filter="all" data-site="joe">All</button>
+          <button class="filter-chip" data-filter="untested" data-site="joe">Untested</button>
+          <button class="filter-chip" data-filter="working" data-site="joe">✅ Working</button>
+          <button class="filter-chip" data-filter="noAcc" data-site="joe">❌ No Acc / Banned</button>
+          <button class="filter-chip" data-filter="disabled" data-site="joe">⏸ Temp Disabled</button>
+        </div>
+        <div id="joeEmpty" class="empty-state">
+          <div class="empty-icon">🎰</div>
+          <div class="empty-title">No Joe Fortune Credentials</div>
+          <div class="empty-sub">Import username:password pairs. Formats: user:pass · user|pass · user pass</div>
+          <button class="btn-primary" id="importJoeBtn2">＋ Import Credentials</button>
+        </div>
+        <ul class="card-list" id="joeCredList"></ul>
+        <div class="batch-bar hidden" id="joeBatchBar">
+          <button class="btn-outline" id="joeCheckSelectedBtn">▶ Check Selected</button>
+          <span id="joeSelectedCount" class="selected-count"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════ IGNITION ═══════ -->
+    <section class="tab-panel" id="tab-ignition">
+      <div class="panel-scroll">
+        <div class="toolbar">
+          <div class="site-tag ignition">🔥 Ignition</div>
+          <div class="toolbar-actions">
+            <button class="icon-text-btn danger" id="clearIgnBtn">🗑</button>
+            <button class="icon-text-btn" id="importIgnBtn">＋ Import</button>
+          </div>
+        </div>
+        <div class="login-stat-row">
+          <div class="login-stat"><div class="login-stat-num" id="ignStatTotal">0</div><div class="login-stat-label">Total</div></div>
+          <div class="login-stat"><div class="login-stat-num green" id="ignStatWorking">0</div><div class="login-stat-label">Working</div></div>
+          <div class="login-stat"><div class="login-stat-num red" id="ignStatNoAcc">0</div><div class="login-stat-label">No Acc/Banned</div></div>
+          <div class="login-stat"><div class="login-stat-num orange" id="ignStatDisabled">0</div><div class="login-stat-label">Temp Disabled</div></div>
+        </div>
+        <div class="status-card">
+          <div class="status-left">
+            <span class="status-dot" id="ignStatusDot"></span>
+            <span id="ignStatusLabel">Idle</span>
+          </div>
+          <div class="status-right">
+            <button id="ignRunBtn" class="run-btn">▶ Run</button>
+            <button id="ignStopBtn" class="stop-btn hidden">■ Stop</button>
+          </div>
+        </div>
+        <div class="toolbar" style="padding-top:4px">
+          <span class="toolbar-title" id="ignCredsTitle">Credentials (0)</span>
+          <div class="toolbar-actions">
+            <button class="icon-text-btn" id="ignCopyWorkingBtn">📋 Copy Working</button>
+            <button class="icon-text-btn" id="ignExportBtn">📤 Export</button>
+          </div>
+        </div>
+        <div class="filter-row" id="ignFilterRow">
+          <button class="filter-chip active" data-filter="all" data-site="ignition">All</button>
+          <button class="filter-chip" data-filter="untested" data-site="ignition">Untested</button>
+          <button class="filter-chip" data-filter="working" data-site="ignition">✅ Working</button>
+          <button class="filter-chip" data-filter="noAcc" data-site="ignition">❌ No Acc / Banned</button>
+          <button class="filter-chip" data-filter="disabled" data-site="ignition">⏸ Temp Disabled</button>
+        </div>
+        <div id="ignEmpty" class="empty-state">
+          <div class="empty-icon">🔥</div>
+          <div class="empty-title">No Ignition Credentials</div>
+          <div class="empty-sub">Import username:password pairs. Formats: user:pass · user|pass · user pass</div>
+          <button class="btn-primary" id="importIgnBtn2">＋ Import Credentials</button>
+        </div>
+        <ul class="card-list" id="ignCredList"></ul>
+        <div class="batch-bar hidden" id="ignBatchBar">
+          <button class="btn-outline" id="ignCheckSelectedBtn">▶ Check Selected</button>
+          <span id="ignSelectedCount" class="selected-count"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════ BOTH (PAIRED) ═══════ -->
+    <section class="tab-panel" id="tab-pair">
+      <div class="panel-scroll">
+        <div class="toolbar">
+          <div class="site-tag pair">⚡ Both (Joe + Ignition)</div>
+          <div class="toolbar-actions">
+            <button class="icon-text-btn danger" id="clearPairBtn">🗑</button>
+            <button class="icon-text-btn" id="importPairBtn">＋ Import</button>
+          </div>
+        </div>
+        <div class="login-stat-row">
+          <div class="login-stat"><div class="login-stat-num" id="pairStatTotal">0</div><div class="login-stat-label">Total</div></div>
+          <div class="login-stat"><div class="login-stat-num green" id="pairStatBoth">0</div><div class="login-stat-label">Both Working</div></div>
+          <div class="login-stat"><div class="login-stat-num green" id="pairStatEither">0</div><div class="login-stat-label">Either Working</div></div>
+          <div class="login-stat"><div class="login-stat-num red" id="pairStatNone">0</div><div class="login-stat-label">Neither</div></div>
+        </div>
+        <div class="status-card">
+          <div class="status-left">
+            <span class="status-dot" id="pairStatusDot"></span>
+            <span id="pairStatusLabel">Idle</span>
+          </div>
+          <div class="status-right">
+            <button id="pairRunBtn" class="run-btn">▶ Run Both</button>
+            <button id="pairStopBtn" class="stop-btn hidden">■ Stop</button>
+          </div>
+        </div>
+        <div class="toolbar" style="padding-top:4px">
+          <span class="toolbar-title" id="pairCredsTitle">Credentials (0)</span>
+          <div class="toolbar-actions">
+            <button class="icon-text-btn" id="pairExportBtn">📤 Export</button>
+          </div>
+        </div>
+        <div class="filter-row" id="pairFilterRow">
+          <button class="filter-chip active" data-filter="all" data-site="pair">All</button>
+          <button class="filter-chip" data-filter="untested" data-site="pair">Untested</button>
+          <button class="filter-chip" data-filter="both" data-site="pair">✅ Both</button>
+          <button class="filter-chip" data-filter="either" data-site="pair">◐ Either</button>
+          <button class="filter-chip" data-filter="none" data-site="pair">❌ Neither</button>
+        </div>
+        <div id="pairEmpty" class="empty-state">
+          <div class="empty-icon">⚡</div>
+          <div class="empty-title">No Paired Credentials</div>
+          <div class="empty-sub">Import username:password pairs. Each will be tested against Joe AND Ignition simultaneously in two side-by-side windows.</div>
+          <button class="btn-primary" id="importPairBtn2">＋ Import Credentials</button>
+        </div>
+        <ul class="card-list" id="pairCredList"></ul>
+        <div class="batch-bar hidden" id="pairBatchBar">
+          <button class="btn-outline" id="pairCheckSelectedBtn">▶ Check Selected</button>
+          <span id="pairSelectedCount" class="selected-count"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════ SESSIONS ═══════ -->
+    <section class="tab-panel" id="tab-sessions">
+      <div class="panel-scroll">
+        <div class="toolbar">
+          <span class="toolbar-title" id="sessionsTitle">Sessions (0)</span>
+          <div class="toolbar-actions">
+            <button class="icon-text-btn" id="openRecordingsBtn">🎥 Recordings (0)</button>
+            <button class="icon-text-btn" id="openScreenshotsBtn">🖼 Screenshots (0)</button>
+            <button class="icon-text-btn danger" id="clearSessionsBtn">🗑 Clear</button>
+            <button class="icon-text-btn" id="exportSessionsBtn">📤 Export</button>
+          </div>
+        </div>
+        <div class="filter-row">
+          <button class="filter-chip active" data-filter="all">All</button>
+          <button class="filter-chip" data-filter="ppsr">💳 PPSR</button>
+          <button class="filter-chip" data-filter="joe">🎰 Joe</button>
+          <button class="filter-chip" data-filter="ignition">🔥 Ignition</button>
+          <button class="filter-chip" data-filter="working">✅ Working</button>
+          <button class="filter-chip" data-filter="dead">❌ Dead/No Acc</button>
+        </div>
+        <div id="sessionsEmpty" class="empty-state">
+          <div class="empty-icon">📋</div>
+          <div class="empty-title">No Session History</div>
+          <div class="empty-sub">Results from PPSR and login checks will appear here.</div>
+        </div>
+        <ul class="session-list" id="sessionList"></ul>
+      </div>
+    </section>
+
+    <!-- ═══════ SETTINGS ═══════ -->
+    <section class="tab-panel" id="tab-settings">
+      <div class="panel-scroll">
+
+        <!-- Grok AI -->
+        <div class="settings-section">
+          <div class="settings-section-header">AI Vision (Grok)</div>
+          <div class="settings-card">
+            <div class="ai-status-row">
+              <span class="ai-icon" id="aiIcon">🔒</span>
+              <div>
+                <div class="ai-title">Grok AI</div>
+                <div class="ai-sub" id="aiSub">Not configured</div>
+              </div>
+            </div>
+            <div class="key-wrap">
+              <div class="key-input-row">
+                <input type="password" id="apiKeyInput" class="key-input" placeholder="Paste xai-... key here" autocomplete="off" spellcheck="false" />
+                <button class="show-hide-btn" id="showKeyBtn">👁</button>
+              </div>
+              <div class="key-actions">
+                <button class="btn-primary full-width" id="saveKeyBtn">🔑 Save Key</button>
+                <button class="btn-danger" id="deleteKeyBtn" style="display:none">🗑</button>
+              </div>
+              <div class="settings-note">Your xai- key is stored in localStorage and never leaves this browser.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Target URLs -->
+        <div class="settings-section">
+          <div class="settings-section-header">Target URLs</div>
+          <div class="settings-card">
+            <div class="settings-row">
+              <label>Joe Fortune Login URL</label>
+            </div>
+            <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:4px">
+              <input type="url" id="joeLoginUrl" class="setting-input" value="https://joefortunepokies.win/login" placeholder="https://..." />
+              <div class="settings-note">URL of the Joe Fortune login page. Update if the site changes domains.</div>
+            </div>
+            <div class="settings-row" style="margin-top:8px">
+              <label>Ignition Login URL</label>
+            </div>
+            <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:4px">
+              <input type="url" id="ignitionLoginUrl" class="setting-input" value="https://ignitioncasino.ooo/login" placeholder="https://..." />
+              <div class="settings-note">URL of the Ignition Casino login page. Update if the site changes domains.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PPSR Automation -->
+        <div class="settings-section">
+          <div class="settings-section-header">PPSR Automation</div>
+          <div class="settings-card">
+            <div class="settings-row">
+              <label>Max Concurrency</label>
+              <input type="number" id="maxConcurrency" class="setting-input short" min="1" max="20" value="7" />
+            </div>
+            <div class="settings-row">
+              <label>Check Timeout (s)</label>
+              <input type="number" id="checkTimeout" class="setting-input short" min="30" max="300" value="180" />
+            </div>
+            <div class="settings-row">
+              <label>PPSR URL</label>
+              <input type="text" id="ppsrUrl" class="setting-input" value="https://transact.ppsr.gov.au/CarCheck/" placeholder="https://..." />
+            </div>
+            <div class="settings-row">
+              <label>Auto-retry on failure</label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="autoRetry" checked />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label>Stealth mode</label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="stealthMode" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label>Requeue on timeout</label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="requeueOnTimeout" checked />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label>Requeue on failure</label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="requeueOnFailure" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label>Max requeue count</label>
+              <input type="number" id="maxRequeueCount" class="setting-input short" min="0" max="10" value="3" />
+            </div>
+          </div>
+        </div>
+
+        <!-- Login Checker Automation -->
+        <div class="settings-section">
+          <div class="settings-section-header">Login Checker Automation</div>
+          <div class="settings-card">
+            <div class="settings-row">
+              <label>Login Concurrency</label>
+              <input type="number" id="loginConcurrency" class="setting-input short" min="1" max="10" value="3" />
+            </div>
+            <div class="settings-row">
+              <label>Login Timeout (s)</label>
+              <input type="number" id="loginTimeout" class="setting-input short" min="15" max="120" value="60" />
+            </div>
+            <div class="settings-row">
+              <label>Page Load Timeout (s)</label>
+              <input type="number" id="pageLoadTimeout" class="setting-input short" min="10" max="300" value="180" />
+            </div>
+            <div class="settings-row">
+              <label>Batch Start Delay (ms)</label>
+              <input type="number" id="batchDelay" class="setting-input short" min="0" max="5000" value="50" />
+            </div>
+            <div class="settings-row">
+              <label>Typing Speed Min (ms)</label>
+              <input type="number" id="typingSpeedMin" class="setting-input short" min="20" max="500" value="50" />
+            </div>
+            <div class="settings-row">
+              <label>Typing Speed Max (ms)</label>
+              <input type="number" id="typingSpeedMax" class="setting-input short" min="50" max="1000" value="150" />
+            </div>
+            <div class="settings-row">
+              <label>Post-Submit Wait (ms) <span class="settings-hint">(time to wait after every submit click before outcome check)</span></label>
+              <input type="number" id="postSubmitWait" class="setting-input short" min="500" max="15000" value="3000" />
+            </div>
+            <div class="settings-row">
+              <label>Max Submit Clicks <span class="settings-hint">(per credential, stops early on SUCCESS/DISABLED)</span></label>
+              <input type="number" id="maxSubmitClicks" class="setting-input short" min="1" max="12" value="6" />
+            </div>
+            <div class="settings-row">
+              <label>Joe Fortune — Post-Submit Wait (ms) <span class="settings-hint">(0 = use global)</span></label>
+              <input type="number" id="joePostSubmitWait" class="setting-input short" min="0" max="15000" value="0" />
+            </div>
+            <div class="settings-row">
+              <label>Joe Fortune — Max Submit Clicks <span class="settings-hint">(0 = use global)</span></label>
+              <input type="number" id="joeMaxSubmitClicks" class="setting-input short" min="0" max="12" value="0" />
+            </div>
+            <div class="settings-row">
+              <label>Ignition — Post-Submit Wait (ms) <span class="settings-hint">(0 = use global)</span></label>
+              <input type="number" id="ignPostSubmitWait" class="setting-input short" min="0" max="15000" value="0" />
+            </div>
+            <div class="settings-row">
+              <label>Ignition — Max Submit Clicks <span class="settings-hint">(0 = use global)</span></label>
+              <input type="number" id="ignMaxSubmitClicks" class="setting-input short" min="0" max="12" value="0" />
+            </div>
+            <div class="settings-row">
+              <label>Test Email (rotation)</label>
+              <input type="email" id="testEmail" class="setting-input" placeholder="test@email.com" />
+            </div>
+            <div class="settings-row">
+              <label>Email Rotation</label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="useEmailRotation" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label>Debug Screenshots (4 per check)</label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="debugScreenshots" checked />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label>Live Web View <span class="settings-hint">(tiny visible browser — slower, lets you watch each step)</span></label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="liveView" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- Network / VPN -->
+        <div class="settings-section">
+          <div class="settings-section-header">Network / VPN</div>
+          <div class="settings-card">
+            <div class="settings-row">
+              <label>VPN Rotation</label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="vpnRotation" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label>DNS Rotation</label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="dnsRotation" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <label>Rotate Proxy on Failure</label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="proxyRotateOnFail" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- NordVPN / WireGuard -->
+        <div class="settings-section">
+          <div class="settings-section-header">NordVPN WireGuard</div>
+          <div class="settings-card">
+            <div class="settings-row">
+              <label>NordLynx Access Key</label>
+              <div class="key-actions-inline">
+                <span id="nordKeyStatus" class="settings-note">Not saved</span>
+                <button class="btn-danger btn-sm" id="deleteNordKeyBtn" style="display:none">🗑</button>
+              </div>
+            </div>
+            <div class="key-input-row">
+              <input type="password" id="nordKeyInput" class="key-input" placeholder="Paste NordLynx access key…" autocomplete="off" spellcheck="false" />
+            </div>
+            <div class="key-actions">
+              <button class="btn-primary full-width" id="saveNordKeyBtn">🔑 Save NordLynx Key</button>
+            </div>
+            <div class="settings-note">NordLynx key is stored locally and never transmitted outside your browser.</div>
+
+            <div class="settings-row" style="margin-top:14px">
+              <label>WireGuard Configs</label>
+              <button class="btn-outline btn-sm" id="wgAddBtn">＋ Add Config</button>
+            </div>
+            <div id="wgConfigList" class="wg-list"></div>
+            <div class="settings-note">Import NordVPN .conf files or paste config text. Only one config can be active at a time.</div>
+          </div>
+        </div>
+
+        <!-- Flow Recorder -->
+        <div class="settings-section">
+          <div class="settings-section-header">Flow Recorder</div>
+          <div class="settings-card">
+            <div class="settings-note" style="margin-bottom:10px">Record exactly which elements to click for each site. A real browser opens — you click: <strong>1) Cookie dismiss → 2) Email field → 3) Password field → 4) Submit button</strong>. The selectors are saved and used by the automation instead of generic guesses.</div>
+
+            <!-- Joe Fortune row -->
+            <div class="flow-site-row">
+              <div class="flow-site-header">
+                <span class="site-tag joe" style="font-size:0.72rem;padding:2px 8px">🎰 Joe Fortune</span>
+                <span id="joeFlowStatus" class="flow-status">Not recorded</span>
+                <div class="flow-actions">
+                  <button class="btn-primary btn-sm" id="joeFlowRecordBtn">🎬 Record</button>
+                  <button class="btn-danger btn-sm hidden" id="joeFlowClearBtn">🗑</button>
+                </div>
+              </div>
+              <div class="flow-url-row">
+                <label class="flow-url-label">URL to record on</label>
+                <input type="url" id="joeFlowUrl" class="flow-url-input" placeholder="https://joefortunepokies.win/login" />
+              </div>
+              <div id="joeFlowDetail" class="flow-detail">
+                <div class="settings-note" style="padding:4px 0">No flow recorded yet.</div>
+              </div>
+            </div>
+
+            <div class="flow-divider"></div>
+
+            <!-- Ignition row -->
+            <div class="flow-site-row">
+              <div class="flow-site-header">
+                <span class="site-tag ignition" style="font-size:0.72rem;padding:2px 8px">🔥 Ignition</span>
+                <span id="ignFlowStatus" class="flow-status">Not recorded</span>
+                <div class="flow-actions">
+                  <button class="btn-primary btn-sm" id="ignFlowRecordBtn">🎬 Record</button>
+                  <button class="btn-danger btn-sm hidden" id="ignFlowClearBtn">🗑</button>
+                </div>
+              </div>
+              <div class="flow-url-row">
+                <label class="flow-url-label">URL to record on</label>
+                <input type="url" id="ignFlowUrl" class="flow-url-input" placeholder="https://ignitioncasino.ooo/?overlay=login" />
+              </div>
+              <div id="ignFlowDetail" class="flow-detail">
+                <div class="settings-note" style="padding:4px 0">No flow recorded yet.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- v1.3 Feature Toggles -->
+        <div class="settings-section">
+          <div class="settings-section-header">Advanced (v1.3)</div>
+          <div class="settings-card">
+            <div class="settings-row">
+              <label>Use live server events (SSE) <span class="settings-hint">(instant UI updates instead of polling)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="useSSE" checked /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Disk-served screenshots <span class="settings-hint">(keeps localStorage light)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="useShotUrls" checked /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Reuse logged-in session <span class="settings-hint">(skip login on repeat runs)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="reuseSession" /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Encrypt secrets at rest (AES-GCM) <span class="settings-hint">(opt-in; requires passphrase)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="encryptSecrets" /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Pre-flight credential validator <span class="settings-hint">(skip obvious bad creds before run)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="preflightCheck" checked /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Visual diff between shots <span class="settings-hint">(highlight changes SCR→SCR)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="visualDiff" checked /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Smart per-domain throttling <span class="settings-hint">(jitter + backoff on 429/captcha)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="smartThrottle" checked /><span class="toggle-slider"></span></label>
+            </div>
+            <div class="settings-row">
+              <label>Debug Mode profile <span class="settings-hint">(single concurrency, live view, verbose)</span></label>
+              <label class="toggle-switch"><input type="checkbox" id="debugModeProfile" /><span class="toggle-slider"></span></label>
+            </div>
+          </div>
+        </div>
+
+        <!-- Blacklist -->
+        <div class="settings-section">
+          <div class="settings-section-header">Blacklist</div>
+          <div class="settings-card">
+            <div class="settings-row">
+              <span>Known disabled / no-account usernames</span>
+              <span id="blacklistCount" class="settings-note">0 entries</span>
+            </div>
+            <div class="settings-note">Paste usernames or user:pass pairs. When credentials are imported, any matching username is automatically marked as Perm Disabled — skipping the check entirely.</div>
+            <textarea id="blacklistImportText" class="import-textarea" placeholder="email@example.com&#10;user:pass&#10;anotheruser@email.com" style="min-height:110px;margin-top:8px"></textarea>
+            <div class="settings-row" style="margin-top:8px;gap:8px">
+              <button class="btn-primary" id="blacklistImportBtn">➕ Add to Blacklist</button>
+              <button class="btn-danger" id="blacklistClearBtn">🗑 Clear All</button>
+            </div>
+            <div id="blacklistList" class="blacklist-list"></div>
+          </div>
+        </div>
+
+        <!-- Appearance -->
+        <div class="settings-section">
+          <div class="settings-section-header">Appearance</div>
+          <div class="settings-card">
+            <div class="settings-row">
+              <label>Theme</label>
+              <div class="seg-control">
+                <button class="seg-btn" data-theme="light">Light</button>
+                <button class="seg-btn active" data-theme="dark">Dark</button>
+                <button class="seg-btn" data-theme="system">System</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Data -->
+        <div class="settings-section">
+          <div class="settings-section-header">Data</div>
+          <div class="settings-card">
+            <div class="settings-row" style="flex-wrap:wrap;gap:8px">
+              <button class="btn-outline" id="exportAllBtn">📤 Export PPSR Cards</button>
+              <button class="btn-outline" id="exportAllCredsBtn">📤 Export Working Logins</button>
+            </div>
+            <div class="settings-row">
+              <button class="btn-outline" id="importFileBtn">📥 Import File</button>
+              <input type="file" id="fileInput" accept=".txt,.csv" style="display:none" />
+            </div>
+            <div class="settings-row">
+              <button class="btn-danger" id="nukeBtn">💣 Reset All Data</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="app-version">Sitchomatic Web v1.3 · Joe Fortune + Ignition · WireGuard · SSE · Browser Pool</div>
+      </div>
+    </section>
+
+  </main>
+
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
