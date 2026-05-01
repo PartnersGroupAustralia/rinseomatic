@@ -1,0 +1,35 @@
+Resolved Issues Summary
+Date: 2026-05-01
+
+1) Invalid navigation URLs causing page.goto failures
+- Added centralized URL normalization/validation in server-utils.js.
+- Applied to:
+  - POST /api/login-check (loginUrl)
+  - POST /api/card-check (ppsrUrl)
+  - POST /api/record-flow (loginUrl)
+- Behavior:
+  - Scheme-less URLs are normalized (https by default, http for localhost-style hosts).
+  - Unsupported schemes are rejected with HTTP 400.
+
+2) Backoff regression (no-op backoff bumps)
+- Replaced no-op backoff logic with bounded exponential backoff.
+- Implemented via nextBackoffMs(...) and used by bumpDomainBackoff(...).
+- Backoff reset on successful outcomes remains in place.
+
+3) Run lifecycle reliability (hung/orphaned run risk)
+- Added per-run watchdog timeout for login/card runs (RUN_TIMEOUT_MS, default 180000ms).
+- On timeout, runs are aborted and a run.timeout event is logged.
+- Added graceful shutdown behavior to abort active runs and close browser pool cleanly.
+- Hardened endRun(...) to avoid duplicate run.end emissions.
+
+Test Coverage Added/Updated
+- Added: webapp/tests/server-utils.test.mjs
+  - URL normalization/validation cases
+  - Backoff behavior and caps
+- Updated: webapp/tests/server-api.test.mjs
+  - Invalid scheme rejection for login/card/record endpoints
+  - Existing endpoint and error-handling checks preserved
+
+Verification
+- Command: npm --prefix /Users/jake/Desktop/Sitchomatic_Backup_20260502_015455 test
+- Result: 107 tests passed, 0 failed.

