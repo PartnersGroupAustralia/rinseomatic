@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "rm -rf dist && mkdir -p dist && cp -R webapp/. dist/",
     "start": "node server.js",
     "dev": "node server.js",
     "test": "node --test webapp/tests/*.test.mjs"
