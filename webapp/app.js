@@ -1,5 +1,5 @@
 /**
- * @fileoverview Sitchomatic Web v1.3 — Main application module.
+ * @fileoverview Sitchomatic Web v1.2 — Main application module.
  * Manages PPSR card checking, Joe Fortune login checking, and Ignition Casino
  * login checking workflows. All data is persisted to localStorage. Supports
  * MediaRecorder run recordings, html2canvas debug screenshots (4 per check),
@@ -295,7 +295,7 @@ const SSE = {
       const es = new EventSource('/api/events');
       this._es = es;
       // All named events the server broadcasts
-      for (const name of ['run.start', 'run.end', 'run.cancel', 'shot.saved', 'login.result', 'card.result', 'pool.config']) {
+      for (const name of ['run.start', 'run.end', 'run.cancel', 'shot.saved', 'login.result', 'card.result']) {
         es.addEventListener(name, (ev) => {
           try { this._dispatch(name, JSON.parse(ev.data)); } catch {}
         });
@@ -1382,7 +1382,6 @@ function renderSettings() {
   if ($('maxRequeueCount')) $('maxRequeueCount').value = settings.maxRequeueCount;
   if ($('batchDelay'))      $('batchDelay').value      = settings.batchDelayBetweenStartsMs;
   if ($('pageLoadTimeout')) $('pageLoadTimeout').value = settings.pageLoadTimeout;
-  // Swarm Upgrade v1 — mirror the worker-pool concurrency cap.
   if ($('maxConcurrent'))   $('maxConcurrent').value   = settings.maxConcurrent;
 
   // Network/VPN settings
@@ -2419,11 +2418,13 @@ function enqueueShot(buildOverlayFn, tag, note) {
  */
 function saveDebugShot(dataUrl, tag, note, groupId = '', url = '') {
   if (!state.settings.debugScreenshots) return;
-  // Swarm Upgrade v1 — disk-only shots. Base64 is never persisted: everything
-  // points at /shots/<runId>/<idx>.png served statically from Express. If no
-  // disk URL is present we drop the shot entirely rather than bloating IDB.
+  // Swarm Upgrade v1 — disk-only shots. Base64 is accepted for one-off legacy
+  // callers but never persisted in the frontend state: everything now points
+  // at /shots/<runId>/<idx>.png served statically from Express. If no disk
+  // URL is present we drop the shot entirely rather than bloating IDB.
   const hasUrl  = url && /^https?:|^\//.test(url);
-  if (!hasUrl) return;
+  const hasData = dataUrl && dataUrl.startsWith('data:image');
+  if (!hasUrl && !hasData) return;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   state.debugShots.unshift({
     id: crypto.randomUUID(),
@@ -2432,8 +2433,11 @@ function saveDebugShot(dataUrl, tag, note, groupId = '', url = '') {
     groupId: groupId || tag,
     note: note || '',
     filename: `sitchomatic_live_${sanitizeFilenamePart(tag)}_${stamp}.png`,
-    dataUrl: '',
-    url,
+    // Prefer disk-served URL; fall back to base64 only when no URL is available.
+    // `openDebugShot` routes `dataUrl` through fetch→blob to sidestep top-level
+    // data-URL navigation blocks, so base64 must land in `dataUrl`, not `url`.
+    dataUrl: hasUrl ? '' : (hasData ? dataUrl : ''),
+    url: hasUrl ? url : '',
   });
   saveDebugShotsQuota();
   if (!$('screenshotModal').classList.contains('hidden')) renderDebugShots();
@@ -3825,16 +3829,6 @@ function boot() {
       // Light touch — the HTTP response path writes the shot record; this
       // just nudges the modal to repaint if it's currently open.
       if (!$('screenshotModal').classList.contains('hidden')) renderDebugShots();
-    });
-    SSE.on('pool.config', (d) => {
-      // Mirror the server-side pool cap change into the local settings and
-      // persist it so the next boot doesn't push our stale localStorage value
-      // back over the top of a cap set by another tab or an external curl.
-      if (d && typeof d.maxConcurrent === 'number') {
-        state.settings.maxConcurrent = d.maxConcurrent;
-        if ($('maxConcurrent')) $('maxConcurrent').value = d.maxConcurrent;
-        saveSettings();
-      }
     });
     SSE.connect();
   }
